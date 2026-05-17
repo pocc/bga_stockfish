@@ -1,0 +1,6 @@
+.env.local
+node_modules/
+recon/*.har
+recon/*.json
+recon/screenshots/
+auth-state.json

@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Local env / secrets (never commit)
+.env
+.env.local
+.env.*.local
+*.env.local
+
+# Wrangler local state
+worker/.wrangler/
+worker/.dev.vars
+
+# BGA recon artefacts (cookies, HARs, captured game pages)
+bga/recon/
+bga/.env.local
+chessgame.har
+*.har
+
+# Build output / caches
+dist/
+build/
+.tsbuildinfo
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

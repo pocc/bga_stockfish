@@ -1,0 +1,48 @@
+name = "stockfish-worker"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# account_id and API token are read from env vars (CLOUDFLARE_ACCOUNT_ID,
+# CLOUDFLARE_API_TOKEN). Wrangler v4 auto-loads worker/.env.local at
+# deploy time, so paste them there once and `npx wrangler deploy` just works.
+
+# Custom domain. Cloudflare provisions DNS and cert automatically.
+routes = [
+  { pattern = "stockfish.ross.gg", custom_domain = true }
+]
+
+[[durable_objects.bindings]]
+name = "ENGINE"
+class_name = "StockfishEngine"
+
+[[durable_objects.bindings]]
+name = "BOT"
+class_name = "BotDriver"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StockfishEngine"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["BotDriver"]
+
+# Cron watchdog — pokes the bot once a minute to re-arm its 5s alarm
+# loop in case it ever drops (deploys, evictions). The DO does the real
+# polling itself on a 5-second cadence via storage.setAlarm.
+[triggers]
+crons = ["*/1 * * * *"]
+
+# Bundle the wasm as a pre-compiled WebAssembly.Module. CF Workers disallow
+# runtime compilation (WebAssembly.instantiate(bytes)), but accept
+# instantiation of an already-compiled Module — so we hand emscripten the
+# pre-compiled module via Module.instantiateWasm rather than wasmBinary.
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = true
+
+# Observability
+[observability]
+enabled = true

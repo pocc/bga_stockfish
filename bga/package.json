@@ -1,0 +1,25 @@
+{
+  "name": "bga-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "recon:login": "tsx scripts/recon-login.ts",
+    "recon:lobby": "tsx scripts/recon-lobby.ts",
+    "recon:ongoing": "tsx scripts/recon-ongoing.ts",
+    "recon:game": "tsx scripts/recon-game.ts",
+    "recon:hotseat": "tsx scripts/recon-hotseat.ts",
+    "recon:createnew": "tsx scripts/recon-createnew.ts",
+    "smoke": "tsx scripts/smoke-client.ts",
+    "bot": "tsx scripts/bot-daemon.ts",
+    "poll": "tsx scripts/poll-loop.ts",
+    "snap": "tsx scripts/snap-tables.ts",
+    "quit:all": "tsx scripts/quit-all-tables.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "playwright": "^1.49.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
