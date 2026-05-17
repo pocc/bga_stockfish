@@ -728,6 +728,14 @@ export class BotDriver extends DurableObject<Env> {
         slot.createdAt = null;
       }
 
+      // BGA caps one realtime game per game type per account. If we're
+      // already mid-game on a realtime table, createTable(realtime) is
+      // guaranteed to fail with code=100 ("game in progress at another
+      // table"). Skip until that game finishes. Async has no such cap.
+      if (mode === "realtime" && tables.some((t) => t.status === "play")) {
+        continue;
+      }
+
       // Cooldown after a recent failed attempt.
       if (slot.lastAttempt && now - slot.lastAttempt < OPEN_INVITE_RETRY_MS) continue;
       slot.lastAttempt = now;
