@@ -114,6 +114,46 @@ export function parseGameHtml(html: string): GameStateParsed | null {
 }
 
 /**
+ * Pull the opponent's id, display name, and BGA interface-language code out
+ * of the live game page. Each player block embeds them as
+ * `"user_id":"<id>",…,"language":"xx","player_name":"Name"`. We return the
+ * first player block whose id is NOT the bot's — the game page is
+ * authoritative, so this corrects a stale name/id cached from an earlier
+ * lobby snapshot. That snapshot can be the WRONG player entirely: an open
+ * invite may have one player join (and get cached) before that game falls
+ * through, then a different player joins the same table id and actually
+ * plays. Returns null when no opponent block is found. Non-ASCII names that
+ * BGA \\u-escapes won't decode here but still yield a usable id + language.
+ */
+export function parseOpponent(
+  html: string, botUserId: string | undefined,
+): { id: string; name: string; language?: string } | null {
+  const re = /"user_id":"(\d+)"[^{}]*?"language":"([a-z]{2})"[^{}]*?"player_name":"([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const [, id, language, name] = m;
+    if (botUserId && id === botUserId) continue;
+    return { id, name: decodeBgaName(name), language };
+  }
+  return null;
+}
+
+/**
+ * Decode the \\u-escaped JSON string escapes BGA leaves in player names that
+ * we pull straight out of the page HTML by regex (e.g. "laglo\\u00efre" →
+ * "lagloïre"). The captured text came from a JSON string literal, so we
+ * re-wrap and JSON.parse it; on any oddity we keep the raw text.
+ */
+function decodeBgaName(name: string): string {
+  if (!name.includes("\\")) return name;
+  try {
+    return JSON.parse(`"${name.replace(/"/g, "")}"`) as string;
+  } catch {
+    return name;
+  }
+}
+
+/**
  * Build a FEN from the live pieces table. Coordinates: BGA uses x=file
  * (0..7 = a..h) and y rows from black's perspective (white pieces start
  * at y=6/7 → ranks 2/1, so rank = 8 - y).
@@ -127,7 +167,9 @@ export function parseGameHtml(html: string): GameStateParsed | null {
  * understate rights on turns where castling is blocked by check or
  * intermediate attacks, but the engine never proposes an illegal castle.
  *
- * En passant target is left as '-'. Halfmove clock = 0, fullmove = 1.
+ * En passant target is derived from BGA's legal-move table (see below).
+ * Halfmove clock = 0, fullmove = 1 (BGA doesn't expose move history here, so
+ * the engine can't reason about the 50-move rule — acceptable for play).
  */
 export function buildFen(
   pieces: Record<string, Piece>,
@@ -170,7 +212,31 @@ export function buildFen(
   }
   if (!castling) castling = "-";
 
-  return `${placement} ${turn} ${castling} - 0 1`;
+  // En passant target, derived from BGA's own legal-move table: an en-passant
+  // capture is a pawn destination whose `captured` piece sits on a DIFFERENT
+  // square than the destination (the enemy pawn is behind the target square,
+  // not on it). The FEN en-passant target is that destination square. Because
+  // it comes straight from a move BGA already deems legal, chess.js / the
+  // engines always accept it — so the engine can actually find en-passant
+  // captures instead of overlooking them (and falling back to a random move).
+  // destinationsByPiece only ever holds the side-to-move's moves, matching
+  // FEN semantics (ep target is for the player to move).
+  let enPassant = "-";
+  outer:
+  for (const [pid, dests] of Object.entries(destinationsByPiece)) {
+    const p = pieces[pid];
+    if (!p || p.piece_type !== "pawn" || p.piece_captured === "1") continue;
+    for (const d of dests ?? []) {
+      for (const cap of d.captured ?? []) {
+        if (Number(cap.piece_x) !== d.dest_x || Number(cap.piece_y) !== d.dest_y) {
+          enPassant = xyToSq(d.dest_x, d.dest_y);
+          break outer;
+        }
+      }
+    }
+  }
+
+  return `${placement} ${turn} ${castling} ${enPassant} 0 1`;
 }
 
 function pieceLetter(p: Piece): string {

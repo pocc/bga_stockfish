@@ -71,10 +71,47 @@ async function main() {
     });
   });
 
-  // 1. Load the lobby — the cheapest page that opens a Centrifuge connection.
-  console.log("loading /lobby");
-  await page.goto("https://boardgamearena.com/lobby", { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(10_000);
+  // 1. Open a page that actually establishes the Centrifuge connection.
+  //    The lobby alone didn't reliably open the WS in the time window, so
+  //    prefer a live TABLE page (set TABLE=<id>) — a game page always opens
+  //    the connection and subscribes to /table/t<id>. Falls back to lobby.
+  //    Wait until we see the `connect` frame (up to 45s) instead of a fixed
+  //    sleep, so we don't miss a slow handshake.
+  // The /table? page is just the management page — it loads centrifuge.js
+  // but never opens the game socket or fetches the token. The realtime
+  // connection only opens on the actual GAME page: /<gs>/chess?table=<id>.
+  // Provide TABLE and GS (gameserver number) to hit it directly.
+  const table = process.env.TABLE;
+  const gs = process.env.GS;
+  const startUrl = table && gs
+    ? `https://boardgamearena.com/${gs}/chess?table=${table}`
+    : table
+      ? `https://boardgamearena.com/table?table=${table}`
+      : "https://boardgamearena.com/lobby";
+  // Capture worker-opened websockets too: BGA may open the socket from a
+  // web worker, which page-level websocket events miss. A CDP session with
+  // Network.enable surfaces Network.webSocketCreated / frame events for the
+  // whole target, including workers.
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Network.enable").catch(() => {});
+  const wsUrls: string[] = [];
+  cdp.on("Network.webSocketCreated", (e: { url: string }) => { wsUrls.push(e.url); console.log("WS created:", e.url); });
+  cdp.on("Network.webSocketFrameSent", (e: { response?: { payloadData?: string } }) => {
+    const p = e.response?.payloadData; if (p) frames.push({ url: "cdp", dir: "send", payload: p, t: Date.now() - t0 });
+  });
+  cdp.on("Network.webSocketFrameReceived", (e: { response?: { payloadData?: string } }) => {
+    const p = e.response?.payloadData; if (p) frames.push({ url: "cdp", dir: "recv", payload: p, t: Date.now() - t0 });
+  });
+  console.log(`loading ${startUrl}`);
+  await page.goto(startUrl, { waitUntil: "domcontentloaded" }).catch((e) => console.log("goto:", String(e).slice(0, 120)));
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    if (frames.some((f) => f.dir === "send" && /"connect"/.test(f.payload))) break;
+    await page.waitForTimeout(1_000);
+  }
+  // Dump the loaded document HTML too — if the token is inlined in the page
+  // rather than fetched, it'll be in here.
+  await page.content().then((html) => fs.writeFileSync(path.join(outDir, "page.html"), html)).catch(() => {});
 
   // 2. Read every global that mentions centrifuge / credential / token
   const inlineJS = `(() => {
@@ -102,13 +139,27 @@ async function main() {
     console.log("no connect frame captured — WS may not have opened");
   }
 
-  const matches: Array<{ url: string; where: number }> = [];
+  // Trace the token to its delivery: scan every captured response body,
+  // request body, and the inline document HTML. Whichever contains the
+  // exact credentials string is where the browser got it (the endpoint we
+  // need to replicate from the Worker).
+  const matches: Array<{ url: string; where: "response" | "request" | "page-html"; at: number }> = [];
   if (cred) {
     for (const r of reqs) {
-      if (!r.respBody) continue;
-      const idx = r.respBody.indexOf(cred);
-      if (idx >= 0) matches.push({ url: r.url, where: idx });
+      if (r.respBody) {
+        const i = r.respBody.indexOf(cred);
+        if (i >= 0) matches.push({ url: r.url, where: "response", at: i });
+      }
+      if (r.reqBody) {
+        const i = r.reqBody.indexOf(cred);
+        if (i >= 0) matches.push({ url: r.url, where: "request", at: i });
+      }
     }
+    try {
+      const pageHtml = fs.readFileSync(path.join(outDir, "page.html"), "utf8");
+      const i = pageHtml.indexOf(cred);
+      if (i >= 0) matches.push({ url: startUrl, where: "page-html", at: i });
+    } catch {}
   }
 
   fs.writeFileSync(path.join(outDir, "requests.json"), JSON.stringify(reqs, null, 2));
@@ -119,11 +170,11 @@ async function main() {
   lines.push(`WS sent connect: ${firstConnect ? "yes" : "no"}`);
   lines.push(`Credentials value (HMAC): \`${cred ?? "(none)"}\``);
   lines.push("");
-  lines.push(`## Responses containing that credentials string`);
+  lines.push(`## Where the credentials string was delivered`);
   if (matches.length === 0) {
-    lines.push("- (none — credentials probably arrived via HttpOnly cookie or hashed differently)");
+    lines.push("- (none — token fetch may not have been captured; check ws.json for the connect frame and requests.json for an XHR fired just before it)");
   } else {
-    for (const m of matches) lines.push(`- ${m.url} (offset ${m.where})`);
+    for (const m of matches) lines.push(`- [${m.where}] ${m.url} (offset ${m.at})`);
   }
   lines.push("");
   lines.push(`## Inline globals matching /centrifug|cred|token|bgaConfig/`);

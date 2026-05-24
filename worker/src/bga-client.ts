@@ -415,6 +415,24 @@ export class BGAClient {
   }
 
   /**
+   * POST /table/table/startgame.html — the table host launches the game.
+   * acceptGameStart only marks a player ready; a realtime friendly table
+   * stays "Open for joining" until the creator actually launches it with
+   * this call. Idempotent-ish: a no-op once the table has started.
+   */
+  async startTable(tableId: number | string): Promise<BGAEnvelope<unknown>> {
+    const resp = await this.request(
+      "POST",
+      "https://boardgamearena.com/table/table/startgame.html",
+      `table=${tableId}`,
+      { referer: "https://boardgamearena.com/lobby" },
+    );
+    const text = await resp.text();
+    try { return JSON.parse(text) as BGAEnvelope<unknown>; }
+    catch { return { status: 1, data: `http=${resp.status}` } as BGAEnvelope<unknown>; }
+  }
+
+  /**
    * POST /table/table/createnew.html — creates an open lobby table. By
    * default BGA marks new tables as ranked; pair this with changeOption
    * (id=201, value=1) to flip to "Training mode" (friendly, no ELO).
@@ -630,6 +648,26 @@ export class BGAClient {
     const url = `https://boardgamearena.com/${gameserverNum}/chess/chess/wakeup.html?myturnack=true&table=${tableId}&noerrortracking=true&dojo.preventCache=${Date.now()}`;
     const resp = await this.request("GET", url);
     return (await resp.json()) as BGAEnvelope<unknown>;
+  }
+
+  /**
+   * GET /<gs>/chess/chess/proposeDraw.html — the chess draw action. It both
+   * proposes a draw and, when the opponent already has one pending (the
+   * game sits in gamestate=5 `playerAgreeToDraw`), agrees to it. The bot
+   * calls this to accept an opponent's draw offer. Mirrors selectCell's
+   * lock/token handling.
+   */
+  async proposeDraw(gameserverNum: number | string, tableId: number | string): Promise<BGAEnvelope<unknown>> {
+    const lock = randomUuid();
+    const url =
+      `https://boardgamearena.com/${gameserverNum}/chess/chess/proposeDraw.html` +
+      `?lock=${lock}&table=${tableId}&noerrortracking=true&dojo.preventCache=${Date.now()}`;
+    const resp = await this.request("GET", url);
+    const env = (await resp.json()) as BGAEnvelope<unknown> & { error?: string };
+    if (env && Number(env.status) !== 1) {
+      throw new Error(`proposeDraw rejected: ${JSON.stringify(env).slice(0, 200)}`);
+    }
+    return env;
   }
 
   async resolveGameserver(tableId: number | string): Promise<number | null> {

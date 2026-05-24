@@ -1,0 +1,51 @@
+/**
+ * Split a chat message into chunks that each fit BGA's say.html length cap,
+ * breaking only at sentence/line boundaries so a chunk never cuts off
+ * mid-sentence. BGA drops chats fired too fast (the caller staggers them by
+ * ~2s), so keeping each chunk a coherent sentence/paragraph makes the
+ * staggered delivery read naturally.
+ *
+ * Boundary strength, strongest first:
+ *   1. Newlines — list items and paragraphs stay on their own lines.
+ *   2. Whole lines are greedily packed into a chunk up to `limit`, rejoined
+ *      with their original newline.
+ *   3. A line longer than `limit` is split at sentence ends (. ! ? followed
+ *      by whitespace, so URLs like "ross.gg/" never split).
+ *   4. A sentence longer than `limit` is split on word boundaries.
+ */
+export function chunkChat(msg: string, limit = 220): string[] {
+  const chunks: string[] = [];
+  let cur = "";
+  const flush = () => { const t = cur.trim(); if (t) chunks.push(t); cur = ""; };
+
+  const addLine = (line: string) => {
+    const candidate = cur === "" ? line : `${cur}\n${line}`;
+    if (candidate.length <= limit) { cur = candidate; return; }
+    flush();
+    if (line.length <= limit) { cur = line; return; }
+    // Line too long on its own: fall back to sentence- then word-splitting.
+    for (const seg of splitLongLine(line, limit)) {
+      if (cur && cur.length + 1 + seg.length > limit) flush();
+      cur = cur ? `${cur} ${seg}` : seg;
+    }
+  };
+
+  for (const line of msg.split("\n")) addLine(line);
+  flush();
+  return chunks;
+}
+
+/** Split an over-long line into <=limit pieces at sentence then word breaks. */
+function splitLongLine(line: string, limit: number): string[] {
+  const out: string[] = [];
+  for (const sentence of line.split(/(?<=[.!?])\s+/)) {
+    if (sentence.length <= limit) { out.push(sentence); continue; }
+    let cur = "";
+    for (const word of sentence.split(" ")) {
+      if (cur && cur.length + 1 + word.length > limit) { out.push(cur); cur = word; }
+      else cur = cur ? `${cur} ${word}` : word;
+    }
+    if (cur) out.push(cur);
+  }
+  return out;
+}

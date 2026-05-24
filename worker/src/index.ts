@@ -30,6 +30,19 @@ function botStub(env: Env) {
   return env.BOT.get(env.BOT.idFromName("singleton"));
 }
 
+/** Constant-time string comparison so admin-secret checks don't leak the
+ *  secret's contents through response-time differences. A length mismatch is
+ *  allowed to short-circuit; the byte comparison always scans the full buffer. */
+function safeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}
+
 /** Returns true when the request carries the admin secret (header or query). */
 function isAdmin(req: Request, env: Env): boolean {
   const expected = env.BOT_ADMIN_SECRET;
@@ -37,7 +50,10 @@ function isAdmin(req: Request, env: Env): boolean {
   const url = new URL(req.url);
   const fromHeader = req.headers.get("x-admin-secret");
   const fromQuery = url.searchParams.get("secret");
-  return fromHeader === expected || fromQuery === expected;
+  return (
+    (fromHeader != null && safeEqual(fromHeader, expected)) ||
+    (fromQuery != null && safeEqual(fromQuery, expected))
+  );
 }
 
 function unauthorized(): Response {
@@ -112,10 +128,14 @@ export default {
     if (url.pathname === "/bot/status" && req.method === "GET") {
       return botStub(env).fetch("https://do/status");
     }
-    // Read-only debug: dump parsed game state for a tracked table id.
+    // Debug: dump parsed game state for a tracked table id. Gated behind the
+    // admin secret — it triggers a BGA login + game-page fetch, so leaving it
+    // open lets anonymous callers drive bot-side work (and leaks game state).
     if (url.pathname === "/bot/inspect" && req.method === "GET") {
-      const qs = new URLSearchParams(url.search).toString();
-      return botStub(env).fetch(`https://do/inspect?${qs}`);
+      if (!isAdmin(req, env)) return unauthorized();
+      const forwarded = new URLSearchParams(url.search);
+      forwarded.delete("secret");
+      return botStub(env).fetch(`https://do/inspect?${forwarded.toString()}`);
     }
 
     // Mutating bot endpoints require the admin secret. The internal cron
@@ -124,12 +144,14 @@ export default {
     const mutatingBot = new Set([
       "/bot/start", "/bot/stop", "/bot/tick", "/bot/cleanup",
       "/bot/probe", "/bot/wipe", "/bot/fix-result", "/bot/reconcile-results",
-      "/bot/resync-stats", "/bot/resync-engine-uses",
+      "/bot/resync-stats", "/bot/resync-engine-uses", "/bot/ws-probe",
     ]);
     if (mutatingBot.has(url.pathname)) {
       if (!isAdmin(req, env)) return unauthorized();
       const subpath = url.pathname.replace(/^\/bot/, "");
-      const method = url.pathname === "/bot/status" ? "GET" : "POST";
+      // Every entry in mutatingBot is a POST on the DO side. (/bot/status is
+      // handled earlier and never reaches here.)
+      const method = "POST";
       // Forward query params (e.g. ?only=4 for /bot/probe) but drop the
       // admin secret so it doesn't show up in DO-side logs.
       const forwarded = new URLSearchParams(url.search);
@@ -229,8 +251,20 @@ function landingHtml(): string {
   .pill.btn.on { border-color: var(--accent); color: var(--accent); }
   /* Gallery of mini boards */
   .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }
-  .gcard { display: block; text-decoration: none; color: inherit; background: var(--code-bg); border-radius: 8px; padding: 10px; transition: transform 0.08s ease; }
+  .gcard { display: block; text-decoration: none; color: inherit; background: var(--code-bg); border-radius: 8px; padding: 10px; transition: transform 0.08s ease; border-left: 3px solid transparent; }
   .gcard:hover { transform: translateY(-1px); }
+  /* Gamemode accent: realtime games get a live/electric stripe, turn-based a calm one. */
+  .gcard.rt { border-left-color: #f59e0b; }
+  .gcard.tb { border-left-color: #6b7fd7; }
+  .gmode { font-weight: 600; padding: 1px 6px; border-radius: 8px; font-size: 10px; white-space: nowrap; flex-shrink: 0; }
+  /* Past-games Live column: orange dot marks a realtime game. */
+  .livedot { color: #f59e0b; font-size: 13px; line-height: 1; }
+  .gmode.rt { background: rgba(245, 158, 11, 0.18); color: #b45309; }
+  .gmode.tb { background: rgba(107, 127, 215, 0.18); color: #4356a8; }
+  @media (prefers-color-scheme: dark) {
+    .gmode.rt { color: #fbbf24; }
+    .gmode.tb { color: #a9b6ee; }
+  }
   .gboard { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); aspect-ratio: 1 / 1; border-radius: 4px; overflow: hidden; box-shadow: 0 0 0 1px var(--rule) inset; }
   .gsq { display: flex; align-items: center; justify-content: center; font-size: 17px; line-height: 1; }
   .gsq.l { background: #ebe1c4; }
@@ -247,6 +281,8 @@ function landingHtml(): string {
   .gsq .pw { color: #fafafa; text-shadow: 0 0 1px #000, 0 0 1px #000; }
   .gsq .pb { color: #111; text-shadow: 0 0 1px #fff, 0 0 1px #fff; }
   .gmeta { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; }
+  /* Header row above the board: mode badge (left) + started time (right). */
+  .gmeta.ghead { margin-top: 0; margin-bottom: 8px; }
   .gmeta .mono { font-size: 11px; }
   .gmeta .grow { flex: 1; }
   .gev { font-weight: 600; }
@@ -318,7 +354,9 @@ function landingHtml(): string {
     <li>Friendly games only. Ranked invites declined.</li>
     <li>Maintains one open invite per gamemode (realtime + turn-based).</li>
     <li>Always accepts draw offers and collective-abandon proposals.</li>
-    <li>Replies <span class="mono">"I'm not sure."</span> to every opponent chat message (chat treated as untrusted).</li>
+    <li>Default strength is gamemode-dependent: <span class="mono">expert</span> (~1800, instant local engine) for realtime, full <span class="mono">grandmaster</span> Stockfish for turn-based. Before your first move, send one word — <span class="mono">beginner</span> / <span class="mono">easy</span> / <span class="mono">intermediate</span> / <span class="mono">advanced</span> / <span class="mono">expert</span> / <span class="mono">grandmaster</span> — to set my level.</li>
+    <li>Replies <span class="mono">"I'm not sure."</span> to every opponent chat message except those exact difficulty keywords (chat otherwise treated as untrusted).</li>
+    <li>Speaks to each opponent in their BGA interface language (41 supported, English fallback).</li>
     <li>After 3 consecutive errors on a table, sends a polite concession message and resigns.</li>
   </ul>
 
@@ -336,6 +374,7 @@ function landingHtml(): string {
   <div id="engines" class="muted">…</div>
 
   <h2>Recent moves</h2>
+  <p class="sub" style="margin: -2px 0 10px;">Parallel engine race, winner picked by precedence: lichess-cloud-eval · stockfish.online · chess-api.com · rapidapi-stockfish-16 · stockfish-container · js-chess-engine (local DO) · random legal move.</p>
   <div id="moves" class="muted">…</div>
 
   <h2>Past Games</h2>
@@ -532,7 +571,7 @@ function landingHtml(): string {
   </details>
 
   <footer>
-    Worker + Durable Objects on Cloudflare. Parallel engine race: lichess-cloud-eval · chess-api.com · stockfish.online · rapidapi-stockfish-16 · stockfish-container · js-chess-engine (local DO) · random legal move.
+    Worker + Durable Objects on Cloudflare.
   </footer>
 </main>
 <script>
@@ -552,6 +591,22 @@ const fmtUtc = (ts) => {
   return d.toISOString().replace(/\\.\\d{3}Z$/, "Z") + " UTC";
 };
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// Decode player names BGA leaves encoded into their real unicode form.
+// Two encodings show up: JS string escapes from page JS blobs (laglo + u-esc)
+// and HTML entities (&#239; / &iuml;) from HTML contexts. Run both: re-quote
+// + JSON.parse handles the JS escapes (escape lives in the data, not this
+// source, so the template literal can't mangle it), then the browser's own
+// parser via a textarea handles any HTML entities. Keep raw on any error.
+function decodeName(s) {
+  if (!s) return s;
+  var out = String(s);
+  try { out = JSON.parse('"' + out.replace(/"/g, "") + '"'); } catch (e) {}
+  if (out.indexOf("&") >= 0) {
+    try { var el = document.createElement("textarea"); el.innerHTML = out; out = el.value; }
+    catch (e) {}
+  }
+  return out;
+}
 
 async function load() {
   document.getElementById("state").textContent = "loading…";
@@ -758,8 +813,13 @@ function renderGamesTable(s) {
       : '<span class="muted">—</span>';
     const started = m.startedAt ? fmtTime(m.startedAt) : '<span class="muted">—</span>';
     const errBadge = m.errorCount ? ' <span class="warn">·err' + m.errorCount + '</span>' : "";
+    const isRt = t.status === "play";
+    const modeCls = isRt ? "rt" : "tb";
+    const modeBadge = '<span class="gmode ' + modeCls + '" title="' + (isRt ? 'Realtime game' : 'Turn-based (async) game') + '">'
+      + (isRt ? '⚡ live' : '✉ turn-based') + '</span>';
     return '<tr>'
       + '<td>' + tableLink(id) + '</td>'
+      + '<td>' + modeBadge + '</td>'
       + '<td>' + clocks + '</td>'
       + '<td>' + lastMove + '</td>'
       + '<td>' + ev + '</td>'
@@ -768,7 +828,7 @@ function renderGamesTable(s) {
       + '</tr>';
   }).join("");
   return '<table><thead><tr>'
-    + '<th>Table</th><th>Players (👉 = to move)</th><th>Last</th><th>Eval</th><th>Recent</th><th>Started</th>'
+    + '<th>Table</th><th>Mode</th><th>Players (👉 = to move)</th><th>Last</th><th>Eval</th><th>Recent</th><th>Started</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, perPage, gamesPage, "setGamesPage", "games");
 }
@@ -794,7 +854,16 @@ function renderGamesGallery(s) {
     const lastMv = (m.lastMoveFrom && m.lastMoveTo)
       ? '<span class="mono muted" style="font-size: 11px;">last: ' + esc(m.lastMoveFrom) + esc(m.lastMoveTo) + '</span>'
       : '';
-    return '<a class="gcard" href="' + url + '" target="_blank" rel="noopener" title="' + esc(id) + ' · ' + esc(t.status || "?") + '">'
+    const isRt = t.status === "play";
+    const modeCls = isRt ? "rt" : "tb";
+    const modeBadge = '<span class="gmode ' + modeCls + '" title="' + (isRt ? 'Realtime game' : 'Turn-based (async) game') + '">'
+      + (isRt ? '⚡ live' : '✉ turn-based') + '</span>';
+    return '<a class="gcard ' + modeCls + '" href="' + url + '" target="_blank" rel="noopener" title="' + esc(id) + ' · ' + esc(t.status || "?") + '">'
+      + '<div class="gmeta ghead">'
+      +   modeBadge
+      +   '<span class="grow"></span>'
+      +   '<span class="muted">' + (m.startedAt ? fmtTime(m.startedAt) : "—") + '</span>'
+      + '</div>'
       + board
       + '<div class="gmeta">'
       +   lastMv
@@ -805,7 +874,6 @@ function renderGamesGallery(s) {
       + (hist ? '<div class="ghist">' + hist + '</div>' : '')
       + '<div class="gmeta">'
       +   '<span class="mono muted grow">' + esc(id) + '</span>'
-      +   '<span class="muted">' + (m.startedAt ? fmtTime(m.startedAt) : "—") + '</span>'
       + '</div>'
       + '</a>';
   }).join("");
@@ -895,7 +963,7 @@ function clocksHtml(m, oppName) {
     spent: botSpent, remaining: m.botClock, isLive: botLive,
   });
   const opp = sideLine({
-    isBot: false, color: oppColor, label: oppName || "opponent",
+    isBot: false, color: oppColor, label: decodeName(oppName) || "opponent",
     spent: oppSpent, remaining: m.oppClock, isLive: oppLive,
   });
   // White always on top to match the board's natural orientation, no
@@ -954,16 +1022,22 @@ function boardHtml(fen, fromSq, toSq) {
 }
 
 function evalPill(ev) {
+  // Eval is stored from the bot's perspective (positive = bot winning), so
+  // every tooltip is framed around the bot rather than White.
   if (!ev) return '<span class="muted">?</span>';
   if (ev.mate != null && ev.mate !== 0) {
+    const n = Math.abs(ev.mate);
     const cls = ev.mate > 0 ? "plus" : "minus";
-    return '<span class="gev ' + cls + '">M' + Math.abs(ev.mate) + '</span>';
+    const tip = ev.mate > 0 ? "bot mates in " + n : "bot gets mated in " + n;
+    return '<span class="gev ' + cls + '" title="' + tip + '">M' + n + '</span>';
   }
   if (ev.cp == null) return '<span class="muted">?</span>';
   const cp = Number(ev.cp);
   const cls = cp > 0.2 ? "plus" : (cp < -0.2 ? "minus" : "even");
   const sign = cp > 0 ? "+" : "";
-  return '<span class="gev ' + cls + '">' + sign + cp.toFixed(1) + '</span>';
+  const tip = cp > 0.2 ? "bot ahead by " + cp.toFixed(1) + " pawns"
+    : (cp < -0.2 ? "bot behind by " + Math.abs(cp).toFixed(1) + " pawns" : "roughly even");
+  return '<span class="gev ' + cls + '" title="' + tip + '">' + sign + cp.toFixed(1) + '</span>';
 }
 
 function gamesMode() {
@@ -995,8 +1069,8 @@ function syncGamesModeButtons() {
 // dropped from the race after exhausting the 128MB DO budget on every call.
 const MOVE_ENGINE_COLUMNS = [
   "lichess-cloud-eval",
-  "chess-api.com",
   "stockfish.online",
+  "chess-api.com",
   "rapidapi-stockfish-16",
   "stockfish-container",
   "js-chess-engine (local DO)",
@@ -1005,11 +1079,28 @@ const MOVE_ENGINE_COLUMNS = [
 const ENGINE_LABELS = {
   "lichess-cloud-eval": "lichess",
   "rapidapi-stockfish-16": "rapidapi",
-  "js-chess-engine (local DO)": "local chess.js",
+  "js-chess-engine (local DO)": "js-chess-engine",
 };
 function shortEngine(e) {
   return ENGINE_LABELS[e] || e.replace(/\\s*\\(.*\\)\\s*$/, "");
 }
+
+// Past-games "Lang" column: BGA interface-language code → flag + name. The
+// flag is a representative country (languages aren't 1:1 with flags), good
+// enough for an at-a-glance column.
+const LANG_DISPLAY = {
+  ar: "🇸🇦 Arabic", be: "🇧🇾 Belarusian", bg: "🇧🇬 Bulgarian", br: "🇫🇷 Breton",
+  ca: "🇪🇸 Catalan", cs: "🇨🇿 Czech", da: "🇩🇰 Danish", de: "🇩🇪 German",
+  el: "🇬🇷 Greek", en: "🇬🇧 English", es: "🇪🇸 Spanish", et: "🇪🇪 Estonian",
+  fa: "🇮🇷 Persian", fi: "🇫🇮 Finnish", fr: "🇫🇷 French", gl: "🇪🇸 Galician",
+  he: "🇮🇱 Hebrew", hr: "🇭🇷 Croatian", hu: "🇭🇺 Hungarian", id: "🇮🇩 Indonesian",
+  it: "🇮🇹 Italian", ja: "🇯🇵 Japanese", ko: "🇰🇷 Korean", lt: "🇱🇹 Lithuanian",
+  lv: "🇱🇻 Latvian", ms: "🇲🇾 Malay", nl: "🇳🇱 Dutch", no: "🇳🇴 Norwegian",
+  pl: "🇵🇱 Polish", pt: "🇵🇹 Portuguese", ro: "🇷🇴 Romanian", ru: "🇷🇺 Russian",
+  sk: "🇸🇰 Slovak", sl: "🇸🇮 Slovenian", sr: "🇷🇸 Serbian", sv: "🇸🇪 Swedish",
+  th: "🇹🇭 Thai", tr: "🇹🇷 Turkish", uk: "🇺🇦 Ukrainian", vi: "🇻🇳 Vietnamese",
+  zh: "🇨🇳 Chinese",
+};
 
 function renderMoves(moves) {
   if (!moves || moves.length === 0) return "<span class='muted'>no moves yet</span>";
@@ -1018,17 +1109,30 @@ function renderMoves(moves) {
   const all = moves.slice().reverse().filter(m => (m.ts || 0) >= cutoff);
   if (all.length === 0) return "<span class='muted'>no moves in the last 24h</span>";
   const recent = paginate(all, MOVES_PAGE_SIZE, movesPage);
-  // Only show columns for engines we actually observed in this window.
+  // Track which engines actually appeared in this window (from a live race
+  // or as a cache-hit source) so dormant engines can stay hidden.
   const seen = new Set();
-  recent.forEach(m => (m.engineResults || []).forEach(r => seen.add(r.engine)));
-  const cols = MOVE_ENGINE_COLUMNS.filter(e => seen.has(e));
+  recent.forEach(m => {
+    (m.engineResults || []).forEach(r => seen.add(r.engine));
+    if (typeof m.engine === "string" && m.engine.startsWith("cache:")) {
+      seen.add(m.engine.slice("cache:".length));
+    }
+  });
+  // Always show the standard (non-dormant) race engines so the table stays
+  // consistent — otherwise a window of only realtime moves (which use just
+  // the local js-chess-engine) collapses every other column. Engines not
+  // consulted for a given move render "—". The dormant stockfish-container
+  // only appears if it was actually seen.
+  const cols = MOVE_ENGINE_COLUMNS.filter(e =>
+    e === "stockfish-container" ? seen.has(e) : true,
+  );
   const headers = cols.map(e =>
-    '<th class="mono" title="' + esc(e) + '">' + esc(shortEngine(e)) + '</th>'
+    '<th class="mono" style="font-size: 10px" title="' + esc(e) + '">' + esc(shortEngine(e)) + '</th>'
   ).join("");
   const legend = '<div class="legend">'
     + '<span class="sw winner">👉 e2e4</span> chosen move · '
     + '<span class="sw">⊘ <span class="rejected">e2e4</span></span> engine move BGA refused · '
-    + 'bot fails over left-to-right until a move is accepted, then a random valid move.'
+    + '<span class="sw">💾 e2e4</span> served from that engine\\'s cached verdict'
     + '</div>';
   const rows = recent.map(m => {
     const byEngine = new Map((m.engineResults || []).map(r => [r.engine, r]));
@@ -1040,15 +1144,24 @@ function renderMoves(moves) {
     }
     const chosenIsListed = cols.includes(m.engine);
     const fellThrough = chosenIsListed && raceWinner && raceWinner !== m.engine;
+    // Cache hits carry engine = "cache:<name>" and no engineResults. Mark
+    // the move in that engine's own column rather than leaving the whole
+    // row blank.
+    const cacheEngine = typeof m.engine === "string" && m.engine.startsWith("cache:")
+      ? m.engine.slice("cache:".length) : null;
     const cells = cols.map(e => {
       const r = byEngine.get(e);
+      if (cacheEngine && e === cacheEngine && !r) {
+        return '<td title="served from cache (prior ' + esc(e) + ' verdict)">'
+          + '<span class="mono muted">💾 ' + esc(m.from + m.to) + '</span></td>';
+      }
       const isChosen = m.engine === e;
       const isRejectedWinner = fellThrough && e === raceWinner;
       return renderEngineCell(r, isChosen, isRejectedWinner);
     });
     const movePill = m.engine === "random-fallback"
-      ? ' <span class="pill warn" title="no engine produced a usable move">random</span>'
-      : (fellThrough ? ' <span class="pill warn" title="fell through left-to-right">fellthrough</span>' : "");
+      ? ' <span class="pill warn" title="no engine produced a usable move">🎲 Random</span>'
+      : "";
     return '<tr>'
       + '<td class="muted">' + fmtTime(m.ts) + '</td>'
       + '<td>' + tableLink(m.tableId) + '</td>'
@@ -1072,24 +1185,51 @@ function renderResults(results) {
   // bot-do.ts).
   const all = results.slice().reverse();
   const page = paginate(all, RESULTS_PAGE_SIZE, resultsPage);
+  const dash = '<span class="muted">—</span>';
   const rows = page.map(r => {
     const tallyClass = r.tally === "win" ? "ok"
       : r.tally === "loss" ? "err"
       : r.tally === "draw" ? "" : "warn";
+    // Fold the old Status / Raw score / Parsed columns into the tally
+    // pill's hover so they stay auditable without three dedicated columns.
+    const tip = 'status: ' + (r.status || "?")
+      + ' · raw: ' + (r.rawScore == null ? "null" : r.rawScore)
+      + ' · parsed: ' + (r.parsedScore == null ? "null" : r.parsedScore);
     const tallyLabel = r.tally === "none"
-      ? '<span class="pill warn" title="parsedScore did not match 0 / 0.5 / 1">uncounted</span>'
-      : '<span class="pill ' + tallyClass + '">' + esc(r.tally) + '</span>';
+      ? '<span class="pill warn" title="' + esc(tip) + ' (did not match 0 / 0.5 / 1)">uncounted</span>'
+      : '<span class="pill ' + tallyClass + '" title="' + esc(tip) + '">' + esc(r.tally) + '</span>';
+    const oppNameDec = decodeName(r.oppName);
+    const opp = r.oppName
+      ? (r.oppId
+        ? '<a href="https://boardgamearena.com/player?id=' + esc(r.oppId) + '" target="_blank" rel="noopener">' + esc(oppNameDec) + '</a>'
+        : esc(oppNameDec))
+      : dash;
+    const lang = r.oppLanguage ? (LANG_DISPLAY[r.oppLanguage] || ('🏳️ ' + esc(r.oppLanguage))) : dash;
+    const color = r.botColor ? '<span class="mono muted">' + esc(r.botColor) + '</span>' : dash;
+    // Entries predating the difficulty feature are grandmaster by default.
+    const diff = '<span class="mono">' + esc(r.difficulty || "grandmaster") + '</span>';
+    const moves = r.moveCount == null ? dash : '<span class="mono">' + esc(r.moveCount) + '</span>';
+    const dur = r.durationMs == null ? dash : '<span class="mono">' + esc(fmtClock(r.durationMs / 1000)) + '</span>';
+    // Live = realtime game (orange dot); blank for turn-based; dash if the
+    // entry predates the field / status was ambiguous.
+    const live = r.realtime === true
+      ? '<span class="livedot" title="Realtime game">●</span>'
+      : r.realtime === false ? '' : dash;
     return '<tr>'
       + '<td class="muted">' + fmtTime(r.ts) + '</td>'
       + '<td>' + tableLink(r.tableId) + '</td>'
-      + '<td class="mono">' + esc(r.status) + '</td>'
-      + '<td class="mono">' + (r.rawScore == null ? '<span class="muted">null</span>' : esc(r.rawScore)) + '</td>'
-      + '<td class="mono">' + (r.parsedScore == null ? '<span class="muted">null</span>' : esc(r.parsedScore)) + '</td>'
+      + '<td style="text-align:center">' + live + '</td>'
+      + '<td>' + opp + '</td>'
+      + '<td>' + lang + '</td>'
+      + '<td>' + color + '</td>'
+      + '<td>' + diff + '</td>'
+      + '<td>' + moves + '</td>'
+      + '<td>' + dur + '</td>'
       + '<td>' + tallyLabel + '</td>'
       + '</tr>';
   }).join("");
   return '<table><thead><tr>'
-    + '<th>When</th><th>Table</th><th>Status</th><th>Raw score</th><th>Parsed</th><th>Tally</th>'
+    + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Lang</th><th>Color</th><th>Difficulty</th><th>Moves</th><th>Duration</th><th>Tally</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, RESULTS_PAGE_SIZE, resultsPage, "setResultsPage", "games");
 }

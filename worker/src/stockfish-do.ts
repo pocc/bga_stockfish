@@ -11,6 +11,9 @@ interface BestMoveRequest {
   localOnly?: boolean;
   /** if true, skip the local JS engine and use only chess-api.com */
   remoteOnly?: boolean;
+  /** js-chess-engine difficulty level (1-5) for the local engine. Used by
+   *  difficulty-limited games; defaults to 3 when omitted. */
+  level?: number;
 }
 
 export interface EngineAlt {
@@ -66,12 +69,15 @@ const RAPIDAPI_STOCKFISH_TIMEOUT_MS = 5_000;
  *  lichess-cloud-eval sits at #0 because when it hits it returns
  *  community-cached evals at very deep nominal depths (typically 30-75+);
  *  it misses for most non-opening positions, in which case the next engine
- *  wins. stockfish-container is dormant (binding is commented out in
+ *  wins. stockfish.online ranks above chess-api.com because move-log data
+ *  showed it both more available (~100% vs ~74% — chess-api intermittently
+ *  blows the 5s ceiling) and deeper on average (always depth 15 vs ~13-15).
+ *  stockfish-container is dormant (binding is commented out in
  *  wrangler.toml) but kept here so re-enabling is just an uncomment. */
 export const ENGINE_PRECEDENCE = [
   "lichess-cloud-eval",
-  "chess-api.com",
   "stockfish.online",
+  "chess-api.com",
   "rapidapi-stockfish-16",
   "stockfish-container",
   "js-chess-engine (local DO)",
@@ -246,13 +252,15 @@ async function callStockfishOnline(fen: string, depth: number, signal: AbortSign
  * the promotion piece if the move is a pawn-to-back-rank push.
  *
  * Level 3 keeps per-call CPU well under the DO's 30s budget on early-game
- * positions while still playing several hundred ELO above random. The
- * randomness=20 cp threshold keeps it from playing the same opening every
- * game without sacrificing real moves.
+ * positions while still playing several hundred ELO above random. We run
+ * with randomness=0 (deterministic best move): the engine's eval is shallow
+ * enough that even a small centipawn threshold buckets dozens of opening
+ * moves as "near-equal", so any randomness made it pick junk like a3/Nh3/h4
+ * at random — exactly the flank-pawn garbage that looked like a random bot.
  */
 function localBestMove(fen: string, level: number): string {
   const game = new Game(fen);
-  const result = game.ai({ level, play: false, randomness: 20 });
+  const result = game.ai({ level, play: false, randomness: 0 });
   const move = result.move;
   const from = Object.keys(move)[0];
   const to = move[from];
@@ -463,8 +471,9 @@ export class StockfishEngine extends DurableObject<Env> {
     }
 
     if (!req.remoteOnly) {
+      const level = Math.min(Math.max(req.level ?? 3, 1), 5);
       tasks.push(makeTask("js-chess-engine (local DO)", start, async () => {
-        const uci = localBestMove(req.fen, 3);
+        const uci = localBestMove(req.fen, level);
         return { move: uci };
       }));
     }

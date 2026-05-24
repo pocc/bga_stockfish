@@ -19,9 +19,15 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { BGAClient, type Cookie, type RawTableInfo } from "./bga-client";
 import {
-  parseGameHtml, buildFen, lookupUciMove, anyLegalMove, xyToSq,
+  parseGameHtml, parseOpponent, buildFen, lookupUciMove, anyLegalMove, xyToSq,
   type Destination,
 } from "./bot-move";
+import { t as tr } from "./i18n";
+import { chunkChat } from "./chat";
+import {
+  extractCentrifugeAuth, isVisitorId, channelsFor, probeCentrifuge,
+  openCentrifugeSocket, parseFrames,
+} from "./centrifuge";
 import {
   isJoinableStatus, isLivePlayStatus, isFinishedStatus,
   gamemodeOf, GAMEMODES, type Gamemode,
@@ -29,23 +35,40 @@ import {
 import { enginePrecedenceRank } from "./stockfish-do";
 
 const TICK_MS = 5_000;
-const OPENING_CHAT = "I am a nerfed version of stockfish, https://stockfishchess.org/ . I'm a work in progress and could be buggy. Good luck!";
-const CLOSING_CHAT = "Good Game!";
-const RANDOM_FALLBACK_CHAT = "Engine lookup failed - choosing random valid move.";
-const CHAT_REPLY = "I'm not sure.";
-const CONCEDE_CHAT = "I'm hitting too many errors playing this game and need to concede. Sorry!";
-const OPPONENT_TIMEOUT_CHAT = "You've been on your turn for over 15 minutes without moving. I can only play one realtime game at a time, so I'm conceding so my next opponent can play. If you want to take your time, please play me asynchronously instead (start an async game against the bot).";
-/** Sent when BGA has already marked the opponent zombie / neutralized
- *  (i.e. they bailed and BGA flipped the forfeit flag). We concede so
- *  the realtime slot doesn't sit pinned on a dead table, even though
- *  BGA would technically award us the win on its own clock. */
-const OPP_QUIT_CHAT = "Looks like my opponent left the game. Conceding so the realtime slot frees up for the next player.";
-/** Concede a realtime game once the opponent has been on their turn for
- *  this long (wall-clock, not BGA's chess clock). BGA "friendly" games
- *  often grant absurd starting clocks (~90 days), so the chess-clock
- *  value never approaches zero — wall-clock is the only signal that
- *  catches an opponent who closed their tab mid-game. 15 min is generous
- *  for a slow human but always trips a ghoster. */
+/** Faster tick used ONLY while a realtime invite is open and still waiting
+ *  for an opponent — so a join is detected (and the game launched) in ~1s
+ *  instead of up to 5s. Reverts to TICK_MS the moment someone sits down (the
+ *  invite slot clears) or a game goes live. We can't push-detect the join
+ *  (an open invite has no game page → no centrifuge token), so this is the
+ *  only way to cut the start latency. */
+const INVITE_FAST_TICK_MS = 1_000;
+// All opponent-facing chat lives in src/i18n.ts (localized per the
+// opponent's BGA interface language). See the `t()` calls below.
+/** Sub-grandmaster difficulty tiers map to js-chess-engine levels 1-5.
+ *  Selected by an opponent chat command before their first move; absence
+ *  means grandmaster (the full remote Stockfish race). The keyword match
+ *  is exact (trim + lowercase) so chat stays a closed enum, not a free
+ *  injection surface — see pollAndReplyChat. */
+const DIFFICULTY_LEVELS: Record<string, number> = {
+  beginner: 1,
+  easy: 2,
+  intermediate: 3,
+  advanced: 4,
+  expert: 5,
+};
+const DIFFICULTY_ELO: Record<string, string> = {
+  beginner: "~700",
+  easy: "~1000",
+  intermediate: "~1300",
+  advanced: "~1600",
+  expert: "~1800",
+};
+/** Concede a realtime game when the opponent has sat on THEIR CURRENT TURN
+ *  this long without moving (i.e. measured from when we handed them the move
+ *  / their last move — opponentTurnSince resets every time they move, so it
+ *  is never "time since the game was created"). Friendly clocks are ~90 days
+ *  so wall-clock is the only ghost signal, and realtime caps one game per
+ *  type, so a truly-abandoned table must be freed. Realtime only. */
 const OPPONENT_INACTIVITY_LIMIT_MS = 15 * 60 * 1000;
 /** Force-clear awaitingOppMove after this long. Guards against the case
  *  where the opponent replies in between two of our 5s ticks: we never
@@ -61,8 +84,12 @@ const AWAITING_OPP_TTL_MS = 10 * 1000;
  *  occupies a slot for new opponents. 30 days is generous for any real
  *  back-and-forth but always sweeps abandoned month-old turns. */
 const MAX_TABLE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-const OLD_GAME_CONCEDE_CHAT = "This game has been going for over a month. Conceding to free up the slot for a new game — feel free to start another any time.";
-const ENGINE_DEPTH = 14;
+// Requested search depth, fed to every engine and clamped per-API:
+// chess-api.com caps the param at 18 (but is time-budget limited, so it
+// realistically returns ~13-15), stockfish.online caps at 15, rapidapi
+// ignores it (fixed 12), lichess serves whatever depth it cached. We ask
+// for the max each honors; all return well under the 5s race ceiling.
+const ENGINE_DEPTH = 18;
 const ENGINE_MOVETIME_MS = 4_000;
 /** Don't retry createnew more often than this when BGA rejects it. */
 const OPEN_INVITE_RETRY_MS = 60_000;
@@ -96,6 +123,15 @@ const RECENT_RESULTS_CAP = 500;
  *  by buildFen(), which is deterministic for a given position (halfmove
  *  and fullmove are zeroed), so identical positions across games collide. */
 const MOVE_CACHE_PREFIX = "mc:";
+/** Cap on the number of per-FEN move-cache entries kept in DO storage. The
+ *  cache writes one key per unique position seen across all games and never
+ *  expired entries, so it grew without bound. When a GC pass finds more than
+ *  this, the oldest entries (by ts) are evicted back down to the cap. */
+const MOVE_CACHE_CAP = 5_000;
+/** Don't run the move-cache GC more often than this. The pass lists every
+ *  `mc:` key, so it isn't free; hourly keeps it negligible while still
+ *  bounding growth. In-memory throttle — resets on eviction, which is fine. */
+const MOVE_CACHE_GC_INTERVAL_MS = 60 * 60 * 1000;
 /** Backoff schedule (ms) applied after consecutive tick failures. Index is
  *  consecutiveFailures - 1; clamped to the last entry. Resets on success. */
 const TICK_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
@@ -138,9 +174,36 @@ interface TableMemo {
    *  Cleared whenever it flips back to our turn. Used to detect
    *  ghosting on realtime tables — see OPPONENT_INACTIVITY_LIMIT_MS. */
   opponentTurnSince?: number | null;
+  /** Wall-clock ms we first saw the opponent flagged zombie/neutralized.
+   *  We require the flag to persist (see OPP_QUIT_CONFIRM_MS) before
+   *  conceding, so a transient realtime blip doesn't throw a live game.
+   *  Cleared when the flag clears. */
+  oppQuitSince?: number | null;
   /** Wall-clock ms we first created the memo for this table (i.e. first
    *  tick where we saw it). Used for "started" column in the dashboard. */
   startedAt?: number;
+  /** Count of moves the bot has played on this table. Incremented each
+   *  time we record a move; snapshotted onto the ResultEntry at finish so
+   *  the past-games table can show game length without re-deriving from
+   *  the (rolling, capped) recentMoves log. */
+  moveCount?: number;
+  /** Opponent-selected difficulty: a DIFFICULTY_LEVELS key, "grandmaster",
+   *  or unset (= use the gamemode default: realtime→expert, async→
+   *  grandmaster). Settable only until the human's first move (oppHasMoved). */
+  difficulty?: string;
+  /** The difficulty actually used on the last move (after applying the
+   *  gamemode default). Recorded onto the ResultEntry so past-games shows
+   *  what was really played, not the raw (possibly unset) choice. */
+  effectiveDifficulty?: string;
+  /** True once we've observed the human play a move on this table. Locks
+   *  difficulty selection. Set on the bot's turn: immediately when the bot
+   *  is Black (the human moved first to give us the turn), or once the bot
+   *  has already played at least one move when it's White. */
+  oppHasMoved?: boolean;
+  /** Opponent's BGA interface-language code (2-letter), parsed from the
+   *  game page. Drives which language the bot's chat is sent in. Unset =
+   *  not yet detected / unknown → English. */
+  oppLanguage?: string;
   /** Wall-clock ms we marked the table finished. Set wherever
    *  `finished = true` is set. */
   finishedAt?: number;
@@ -173,6 +236,9 @@ interface TableMemo {
   /** Display name of the opponent (BGA player fullname). Captured the
    *  first tick we see them seated, used in the dashboard's turn chip. */
   oppName?: string;
+  /** Opponent's BGA player id (the players-map key), captured alongside
+   *  oppName. Powers the profile link (player?id=…) in past games. */
+  oppId?: string;
   /** BGA's reflexion clock in seconds, last observation. Per side. */
   botClock?: number | null;
   oppClock?: number | null;
@@ -217,6 +283,8 @@ interface TableMemo {
     result:
       | "played"
       | "promoted"
+      | "agreed-draw"
+      | "agree-draw-failed"
       | "no-parse"
       | "opp-turn"
       | "no-dests"
@@ -334,6 +402,25 @@ interface ResultEntry {
   parsedScore: number | null;
   /** Which counter we incremented: "win" / "loss" / "draw" / "none". */
   tally: "win" | "loss" | "draw" | "none";
+  /** Snapshot of game stats at finish, for the past-games table. All
+   *  optional — entries written before these fields existed leave them
+   *  undefined, and the dashboard renders a dash. */
+  durationMs?: number;
+  moveCount?: number;
+  botColor?: "white" | "black";
+  oppName?: string;
+  /** Opponent's BGA player id, for the profile link in past games. */
+  oppId?: string;
+  /** Difficulty the game was played at. Unset on entries written before
+   *  this field existed → the dashboard treats those as "grandmaster". */
+  difficulty?: string;
+  /** Opponent's BGA interface-language code, for the past-games flag. */
+  oppLanguage?: string;
+  /** True if the game was realtime, false if turn-based (async). Derived
+   *  from the terminal status ("finished" = realtime, "asyncfinished" =
+   *  async). Undefined when the status didn't disambiguate ("archive") or
+   *  the entry predates this field. */
+  realtime?: boolean;
   /** Opponent's raw score at finalization. Captured to disambiguate the
    *  BGA-friendly draw quirk (some draws come back as 0/0 instead of
    *  0.5/0.5); kept on the record so retroactive triage doesn't need to
@@ -383,6 +470,19 @@ export class BotDriver extends DurableObject<Env> {
     nextTickEarliest: null,
   };
   private booted = false;
+  /** Persistent Centrifugo websocket for realtime PRESENCE. BGA neutralizes
+   *  a player it doesn't see connected, so a poll-only bot loses realtime
+   *  games. We hold this socket open and subscribed to each live realtime
+   *  table so BGA sees the bot present. The poll loop still drives moves;
+   *  this is purely the presence/keepalive layer (phase 2a). Null when no
+   *  realtime game is live or the socket dropped (reconnected next tick). */
+  private ws: WebSocket | null = null;
+  /** Channels currently subscribed on `ws`, so we only sub new ones. */
+  private wsChannels = new Set<string>();
+  /** Monotonic Centrifugo command id. */
+  private wsCmdId = 1;
+  /** Unix ms of the last move-cache GC pass. Throttles gcMoveCache(). */
+  private lastCacheGcAt = 0;
   /** Re-entrancy guard for tick(). DO fetch handlers run concurrently, so
    *  the 1-min cron's POST /tick can overlap an in-flight alarm-driven tick.
    *  Two ticks both seeing "our turn" and racing selectCell is one of the
@@ -442,6 +542,52 @@ export class BotDriver extends DurableObject<Env> {
         activePlayer: parsed?.activePlayer ?? null,
         reflexion: parsed?.reflexion ?? null,
         destCount: parsed ? Object.keys(parsed.destinationsByPiece).length : -1,
+      });
+    }
+    if (url.pathname === "/ws-probe") {
+      // Spike: verify the bot's authed centrifuge token actually connects and
+      // receives pushes. Read-only — does not touch the poll loop. Fetches a
+      // table's game page (for the inlined token + our uid), connects, subs to
+      // the player + table channels, answers pings, and returns raw frames.
+      await this.boot();
+      const id = url.searchParams.get("id");
+      if (!id) return Response.json({ error: "missing id (table id)" }, { status: 400 });
+      if (!this.client) return Response.json({ error: "no client" });
+      try { await this.client.login(); } catch (e) {
+        return Response.json({ error: "login failed: " + String(e).slice(0, 200) });
+      }
+      let gs = this.status.tables[id]?.gameserver ?? null;
+      if (gs == null) gs = await this.client.resolveGameserver(id).catch(() => null);
+      if (gs == null) return Response.json({ error: "could not resolve gameserver for table " + id });
+      const html = await this.client.fetchGamePage(gs, id);
+      const auth = extractCentrifugeAuth(html);
+      if (!auth) {
+        return Response.json({ error: "no centrifuge token found in game page", htmlLen: html.length });
+      }
+      if (isVisitorId(auth.userId)) {
+        return Response.json({
+          error: "extracted a VISITOR id — bot cookies aren't authing the game page",
+          userId: auth.userId,
+        });
+      }
+      const collectMs = Math.min(Number(url.searchParams.get("ms") ?? 8000) || 8000, 20000);
+      const result = await probeCentrifuge({
+        userId: auth.userId,
+        username: "bot_stockfish",
+        token: auth.token,
+        channels: channelsFor(auth.userId, [id]),
+        collectMs,
+      });
+      return Response.json({
+        table: id,
+        gameserver: gs,
+        userId: auth.userId,
+        tokenLen: auth.token.length,
+        channels: channelsFor(auth.userId, [id]),
+        pings: result.pings,
+        frameCount: result.frames.length,
+        frames: result.frames,
+        error: result.error,
       });
     }
     if (url.pathname === "/probe") {
@@ -914,9 +1060,14 @@ export class BotDriver extends DurableObject<Env> {
     try { await this.tick(); }
     catch (e) { this.recordError("alarm", e); }
     if (this.status.running) {
+      // Poll fast (1s) while a realtime invite is open and unfilled, so a
+      // joining human is detected and launched quickly. Backoff on failures
+      // takes precedence. Once filled, the invite slot clears and we drop
+      // back to the normal cadence.
+      const waitingRealtimeInvite = this.status.openInvites.realtime.id != null;
       const delay = this.status.consecutiveTickFailures > 0
         ? TICK_BACKOFF_MS[Math.min(this.status.consecutiveTickFailures - 1, TICK_BACKOFF_MS.length - 1)]
-        : TICK_MS;
+        : (waitingRealtimeInvite ? INVITE_FAST_TICK_MS : TICK_MS);
       this.status.nextTickEarliest = Date.now() + delay;
       await this.ctx.storage.setAlarm(this.status.nextTickEarliest);
     }
@@ -941,6 +1092,73 @@ export class BotDriver extends DurableObject<Env> {
       this.status.recentMoves.splice(0, this.status.recentMoves.length - RECENT_MOVES_CAP);
     }
     this.status.stats.engineUses[full.engine] = (this.status.stats.engineUses[full.engine] ?? 0) + 1;
+  }
+
+  /**
+   * Send a table chat, splitting long messages into word-boundary chunks.
+   * BGA's say.html silently rejects messages over its length limit (returns
+   * a status-0 envelope, no throw) — which is why the long localized greeting
+   * and concede/timeout messages never appeared. Each chunk is sent
+   * sequentially so order is preserved. Returns true only if every chunk was
+   * accepted. Short messages send as a single chunk (unchanged behaviour).
+   */
+  private async sendChat(tableId: string, msg: string): Promise<boolean> {
+    if (!this.client) return false;
+    // Split at sentence/line boundaries (not mid-sentence) under BGA's cap.
+    const chunks = chunkChat(msg, 220);
+    let ok = true;
+    for (let i = 0; i < chunks.length; i++) {
+      // Pace multi-chunk sends: BGA's say.html silently drops chats fired
+      // back-to-back (flood control), which truncated long greetings to just
+      // the first chunk. A 2s gap per chunk clears BGA's anti-flood window.
+      if (i > 0) await new Promise((r) => setTimeout(r, 2_000));
+      try {
+        const env = await this.client.chat(tableId, chunks[i]) as { status?: number | string };
+        if (env && Number(env.status) !== 1) {
+          ok = false;
+          this.recordError("chatRejected", JSON.stringify(env).slice(0, 160), tableId);
+        }
+      } catch (e) {
+        ok = false;
+        this.recordError("chatFailed", e, tableId);
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * Send the opening greeting exactly once per table. Called from both the
+   * poll path (handleTable) and the move path (maybePlayMove / push
+   * reactions), which can fire within the same multi-second window. The send
+   * is slow (chunked), so we CLAIM saidHi=true *before* awaiting — otherwise
+   * two concurrent callers both see saidHi=false and each send the greeting
+   * (the double-intro bug). We do not reset on failure: better a missing/
+   * partial opener than a duplicate. A partial send is logged.
+   */
+  /**
+   * Refresh the opponent's id, display name, and language from the live game
+   * page (authoritative). The lobby snapshot captures these once and freezes
+   * them, which can be the wrong player: an open invite may cache one joiner
+   * before that game falls through, then a different player joins the same
+   * table id and actually plays. The game page always reflects the real
+   * opponent. Preserves prior values when the page yields nothing.
+   */
+  private refreshOpponent(m: TableMemo, html: string): void {
+    const opp = parseOpponent(html, this.uid ?? undefined);
+    if (!opp) return;
+    m.oppId = opp.id;
+    m.oppName = opp.name;
+    if (opp.language) m.oppLanguage = opp.language;
+  }
+
+  private async maybeGreet(tableId: string, m: TableMemo, isRealtime: boolean): Promise<void> {
+    if (!this.client || m.saidHi) return;
+    m.saidHi = true;
+    // Realtime defaults to the instant expert engine; async to grandmaster
+    // Stockfish. The greeting states the correct default for the gamemode.
+    const key = isRealtime ? "greetingRealtime" : "greeting";
+    const ok = await this.sendChat(tableId, tr(key, m.oppLanguage));
+    if (!ok) this.recordError("greetingPartial", "greeting send incomplete", tableId);
   }
 
   // --- lifecycle ---
@@ -1021,6 +1239,31 @@ export class BotDriver extends DurableObject<Env> {
     this.tickInFlight = true;
     try {
       await this.tickInner();
+    } finally {
+      this.tickInFlight = false;
+    }
+  }
+
+  /**
+   * 2b: react to a websocket push for one table by processing it immediately,
+   * instead of waiting up to a full poll interval. Shares the tickInFlight
+   * lock with the poll so a push-reaction and a scheduled tick can't both
+   * fire selectCell on the same table (the 901 "not your turn" race). If the
+   * lock is held we simply skip — the in-flight processing already has fresh
+   * state, and the safety poll backstops anything missed. Realtime-only
+   * (we only subscribe live realtime tables), so isRealtime=true.
+   */
+  private async reactToPush(tableId: string): Promise<void> {
+    if (!this.client || !this.uid || this.tickInFlight) return;
+    const m = this.status.tables[tableId];
+    if (!m || m.finished || m.conceded || m.gameserver == null) return;
+    this.tickInFlight = true;
+    try {
+      console.log(`ws:react t=${tableId}`);
+      await this.maybePlayMove(tableId, m, true);
+      await this.ctx.storage.put("tables", this.status.tables).catch(() => {});
+    } catch (e) {
+      this.recordError("pushReact", e, tableId);
     } finally {
       this.tickInFlight = false;
     }
@@ -1164,6 +1407,135 @@ export class BotDriver extends DurableObject<Env> {
 
     try { await this.maybeCreateOpenInvite(tables); }
     catch (e) { this.recordError("openInvite", e); }
+
+    // Maintain the realtime presence socket (phase 2a). Never throws into
+    // the tick — presence is best-effort and the poll loop above is the
+    // source of truth for actually playing.
+    try { await this.ensurePresence(tables); }
+    catch (e) { this.recordError("ensurePresence", e); }
+
+    // Bound the per-FEN move cache. Throttled so the list pass is negligible.
+    if (Date.now() - this.lastCacheGcAt > MOVE_CACHE_GC_INTERVAL_MS) {
+      this.lastCacheGcAt = Date.now();
+      try { await this.gcMoveCache(); }
+      catch (e) { this.recordError("gcMoveCache", e); }
+    }
+  }
+
+  /**
+   * Evict the oldest entries from the per-FEN move cache when it exceeds
+   * MOVE_CACHE_CAP. The cache writes one `mc:<fen>` key per unique position
+   * with no expiry, so without this it grows unbounded over the bot's
+   * lifetime. Lists all cache keys, and if over the cap, deletes the oldest
+   * (by stored ts) until back at the cap. Cheap enough to run hourly.
+   */
+  private async gcMoveCache(): Promise<void> {
+    const entries = await this.ctx.storage.list<CachedMove>({ prefix: MOVE_CACHE_PREFIX });
+    if (entries.size <= MOVE_CACHE_CAP) return;
+    const sorted = [...entries.entries()].sort(
+      (a, b) => (a[1]?.ts ?? 0) - (b[1]?.ts ?? 0),
+    );
+    const victims = sorted.slice(0, entries.size - MOVE_CACHE_CAP).map(([k]) => k);
+    // storage.delete accepts up to 128 keys per call; chunk to stay under it.
+    for (let i = 0; i < victims.length; i += 128) {
+      await this.ctx.storage.delete(victims.slice(i, i + 128));
+    }
+    console.log(`bot:gcMoveCache evicted=${victims.length} kept=${MOVE_CACHE_CAP}`);
+  }
+
+  /**
+   * Keep a Centrifugo websocket open and subscribed to every LIVE realtime
+   * table, so BGA registers the bot as present and doesn't neutralize it.
+   * Realtime-only: async games don't need presence (90-day clocks) and stay
+   * fully on polling. This does not move pieces — the poll loop does — it
+   * only holds the connection and answers pings.
+   *
+   * Lifecycle: the socket lives on the DO instance across the 5s ticks. If it
+   * drops (close/error) we null it and reconnect next tick. If no realtime
+   * game is live we close it. Token + uid come from a live game page (same
+   * extraction the probe validated).
+   */
+  private async ensurePresence(tables: RawTableInfo[]): Promise<void> {
+    if (!this.client || !this.uid) return;
+    const realtimeLive = tables.filter((t) => t.status === "play");
+
+    // No realtime game → no presence needed; drop any open socket.
+    if (realtimeLive.length === 0) {
+      if (this.ws) {
+        try { this.ws.close(); } catch { /* already closed */ }
+        this.ws = null;
+        this.wsChannels.clear();
+      }
+      return;
+    }
+
+    const want = new Set<string>(channelsFor(this.uid, realtimeLive.map((t) => t.id)));
+
+    // (Re)connect when we have no socket.
+    if (!this.ws) {
+      const seed = realtimeLive[0];
+      const gs = this.status.tables[seed.id]?.gameserver
+        ?? await this.client.resolveGameserver(seed.id).catch(() => null);
+      if (gs == null) return;
+      let html: string;
+      try { html = await this.client.fetchGamePage(gs, seed.id); }
+      catch (e) { this.recordError("wsFetchPage", e, seed.id); return; }
+      const auth = extractCentrifugeAuth(html);
+      if (!auth || isVisitorId(auth.userId)) {
+        this.recordError("wsAuth", "no/visitor centrifuge token", seed.id);
+        return;
+      }
+      let ws: WebSocket;
+      try { ws = await openCentrifugeSocket(); }
+      catch (e) { this.recordError("wsConnect", e); return; }
+      this.ws = ws;
+      this.wsChannels = new Set();
+      this.wsCmdId = 1;
+      ws.addEventListener("message", (ev: MessageEvent) => {
+        const text = typeof ev.data === "string" ? ev.data : "";
+        for (const f of parseFrames(text)) {
+          if (f.isPing) { try { ws.send("{}"); } catch { /* closed */ } continue; }
+          // 2b fast path: a published event on a table channel means
+          // something changed there (opponent moved, draw offered, …).
+          // React immediately instead of waiting for the next poll. We treat
+          // it as a wake signal — reactToPush re-fetches the page for the
+          // authoritative state. Presence join/leave frames have no `pub`,
+          // so they don't trigger this.
+          if (f.push?.pub && typeof f.push.channel === "string") {
+            const tm = /^\/table\/t(\d+)$/.exec(f.push.channel);
+            if (tm) void this.reactToPush(tm[1]);
+          }
+        }
+      });
+      const drop = () => {
+        if (this.ws === ws) { this.ws = null; this.wsChannels.clear(); }
+      };
+      ws.addEventListener("close", drop);
+      ws.addEventListener("error", drop);
+      const cmds: string[] = [JSON.stringify({
+        connect: { data: { user_id: auth.userId, username: "bot_stockfish", credentials: auth.token }, name: "js" },
+        id: this.wsCmdId++,
+      })];
+      for (const ch of want) {
+        cmds.push(JSON.stringify({ subscribe: { channel: ch }, id: this.wsCmdId++ }));
+        this.wsChannels.add(ch);
+      }
+      try { ws.send(cmds.join("\n")); }
+      catch (e) { this.recordError("wsSend", e); drop(); return; }
+      console.log(`ws:presence connected uid=${auth.userId} tables=${realtimeLive.map((t) => t.id).join(",")}`);
+      return;
+    }
+
+    // Connected already → subscribe to any newly-live realtime tables.
+    const fresh = [...want].filter((ch) => !this.wsChannels.has(ch));
+    if (fresh.length > 0) {
+      const cmds = fresh.map((ch) => {
+        this.wsChannels.add(ch);
+        return JSON.stringify({ subscribe: { channel: ch }, id: this.wsCmdId++ });
+      });
+      try { this.ws.send(cmds.join("\n")); }
+      catch (e) { this.recordError("wsSub", e); }
+    }
   }
 
   /** Send a polite concede message and resign the table. Idempotent on the
@@ -1177,10 +1549,10 @@ export class BotDriver extends DurableObject<Env> {
     tableId: string,
     m: TableMemo,
     reason: ConcedeReason,
-    chatMessage: string = CONCEDE_CHAT,
+    chatMessage?: string,
   ): Promise<void> {
     if (!this.client || m.conceded) return;
-    await this.client.chat(tableId, chatMessage).catch(() => {});
+    await this.sendChat(tableId, chatMessage ?? tr("concede", m.oppLanguage));
     await this.client.resign(tableId).catch((e) => {
       this.recordError("resign", e, tableId);
     });
@@ -1326,13 +1698,25 @@ export class BotDriver extends DurableObject<Env> {
             await this.client.openTableNow(slot.id).catch(() => {});
             continue;
           }
+          // Never abandon a table an opponent has already joined: that's a
+          // real (realtime) game launching through the setup/acceptance
+          // phase, not a dead invite. Leaving it here makes the bot
+          // silently quit a game the opponent is actively playing (the
+          // exact bug we hit). Release the slot so the reaper stops
+          // managing it as an invite and let the play loop carry the game.
+          const oppSeated = !!t.players
+            && Object.keys(t.players).some((pid) => pid !== this.uid);
+          if (oppSeated) {
+            slot.id = null;
+            slot.createdAt = null;
+            continue;
+          }
           if (actualMode === null) {
             // Transient init/setup status — BGA hasn't promoted the
             // table to open/asyncopen yet. Don't neutralize too eagerly:
-            // that would kill our own freshly-created table (and any
-            // opponent who had just sat down). But if it's been stuck
-            // this long the opponent never clicked through, so leave
-            // the dead invite and fall through to recreate.
+            // that would kill our own freshly-created table. But if it's
+            // been stuck this long with no opponent, the invite is dead,
+            // so leave it and fall through to recreate.
             const age = now - (slot.createdAt ?? now);
             if (age <= OPEN_INVITE_SETUP_TIMEOUT_MS) continue;
             this.recordError(
@@ -1421,7 +1805,22 @@ export class BotDriver extends DurableObject<Env> {
     if (raw.has_tournament && raw.has_tournament !== "0") return true;
     if (raw.tournament_id) return true;
     if (t.game_id !== "81") return true;
-    if (raw.unranked === "0" && raw.game_hide_ranking === "0") return true;
+    // Friendly-only enforcement — the prime directive. The bot only ever
+    // creates Training-mode (friendly, no-ELO) tables itself, so tables it
+    // owns are trusted. For ANY other table (an invite from another player)
+    // we fail CLOSED: play only when BGA carries a positive friendly signal.
+    // Training mode hides the ranking (game_hide_ranking="1"), or the table
+    // is explicitly unranked (unranked="1"). If neither signal is present —
+    // including when BGA omits the fields entirely — skip the table rather
+    // than risk playing a ranked / ELO-affecting game. (Recon shows a
+    // friendly Training table reports unranked="0" but game_hide_ranking="1",
+    // so the hide-ranking flag is the reliable friendly marker — the old
+    // `unranked==="0" && game_hide_ranking==="0"` check failed open whenever
+    // BGA omitted either field.)
+    if (!this.uid || t.table_creator !== this.uid) {
+      const friendly = raw.game_hide_ranking === "1" || raw.unranked === "1";
+      if (!friendly) return true;
+    }
     return false;
   }
 
@@ -1464,7 +1863,7 @@ export class BotDriver extends DurableObject<Env> {
         `Table alive for ${days}d (limit ${MAX_TABLE_AGE_MS / 86_400_000}d); conceding`,
         t.id,
       );
-      await this.concedeTable(t.id, m, "tableAge", OLD_GAME_CONCEDE_CHAT).catch((e) => {
+      await this.concedeTable(t.id, m, "tableAge", tr("oldGameConcede", m.oppLanguage)).catch((e) => {
         this.recordError("tableAgeConcede", e, t.id);
       });
       return;
@@ -1478,7 +1877,7 @@ export class BotDriver extends DurableObject<Env> {
     if (!m.oppName && t.players) {
       for (const [pid, seat] of Object.entries(t.players)) {
         if (pid === this.uid) continue;
-        if (seat.fullname) { m.oppName = seat.fullname; break; }
+        if (seat.fullname) { m.oppName = seat.fullname; m.oppId = pid; break; }
       }
     }
 
@@ -1532,17 +1931,63 @@ export class BotDriver extends DurableObject<Env> {
       m.acceptedSeat = true;
     }
 
-    // 2. ack game start (realtime only — async games skip this handshake
-    //    and transition asyncopen → asyncplay automatically).
-    if (isJoinableStatus(t.status) && !m.ackedStart) {
+    // 2. Launch handshake. IMPORTANT: everything past the asyncopen branch
+    //    is REALTIME-ONLY and deliberately walled off from async so that
+    //    realtime fixes can't touch the (working) async path:
+    //      - Async games only ever sit in `asyncopen` here, handled in the
+    //        first branch, then auto-progress to `asyncplay`. They never
+    //        need a launch or a ready handshake.
+    //      - The realtime branch additionally only fires once a human is
+    //        actually seated (`oppSeated`). A freshly-created table of
+    //        EITHER mode can momentarily report `init`/`setup` with no
+    //        opponent; that guard keeps the realtime launch logic from ever
+    //        running against such a table (including a nascent async one).
+    if (isJoinableStatus(t.status)) {
       if (t.status === "asyncopen") {
+        // ASYNC: nothing to launch; BGA promotes asyncopen → asyncplay.
         m.ackedStart = true;
-      } else {
-        const seatsFilled = Object.values(t.players ?? {}).filter((p) => p.table_status === "play").length;
-        const needed = Number(t.min_player ?? "2");
-        if (seatsFilled >= needed) {
-          await this.client.acceptGameStart(t.id);
+        return;
+      }
+      // REALTIME (open / setup / init): drive the launch handshake to "play"
+      // in ONE tight sequence instead of one step per 5s poll. The old
+      // step-per-tick flow stacked start→setup→play across ~3 ticks (~15-30s)
+      // so a joining human thought the bot was dead. Here the host launches
+      // (startgame.html), then we poll the table ~1s cadence, sending
+      // acceptGameStart whenever BGA parks it in the setup/ack phase, until
+      // it reaches "play" — usually 1-3s. Capped so we never hold the tick
+      // (and thus other games) for long; if it doesn't finish, the next tick
+      // resumes (ackedStart only latches once we've actually launched).
+      const oppSeated = Object.keys(t.players ?? {}).some((pid) => pid !== this.uid);
+      if (oppSeated) {
+        const launchStep = async (status: string): Promise<void> => {
+          if (status === "open" && t.table_creator === this.uid) {
+            await this.client!.startTable(t.id).catch((e) => this.recordError("startTable", e, t.id));
+          } else if (status !== "open" && isJoinableStatus(status)) {
+            await this.client!.acceptGameStart(t.id).catch(() => {});
+          }
+        };
+        await launchStep(t.status);
+        // Bound the inline handshake by wall-clock, not a fixed iteration
+        // count: this whole block runs inside the tick's per-table loop while
+        // tickInFlight is held, so every second spent here is a second other
+        // live games can't move and websocket push reactions are dropped. A
+        // ~3s budget catches the common 1-3s launch; anything slower resumes
+        // on the next tick (ackedStart only latches once we reach `play`).
+        const LAUNCH_POLL_INTERVAL_MS = 600;
+        const LAUNCH_MAX_WAIT_MS = 3_000;
+        const deadline = Date.now() + LAUNCH_MAX_WAIT_MS;
+        let launched = false;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, LAUNCH_POLL_INTERVAL_MS));
+          const cur = await this.client.getTableInfo(t.id).catch(() => null);
+          if (!cur) continue;
+          if (isLivePlayStatus(cur.status)) { launched = true; break; }
+          if (!isJoinableStatus(cur.status)) break; // finished/aborted — stop
+          await launchStep(cur.status);
+        }
+        if (launched) {
           m.ackedStart = true;
+          console.log(`ws:realtime launched fast t=${t.id}`);
         }
       }
       return;
@@ -1552,14 +1997,21 @@ export class BotDriver extends DurableObject<Env> {
     if (isLivePlayStatus(t.status)) {
       // Async games never went through the ackedStart branch above.
       if (!m.ackedStart) m.ackedStart = true;
-      if (!m.saidHi) {
-        await this.client.chat(t.id, OPENING_CHAT).catch(() => {});
-        m.saidHi = true;
-      }
       // resolve gameserver number once we're live
       if (m.gameserver == null) {
         const gs = await this.client.resolveGameserver(t.id).catch(() => null);
         if (gs != null) m.gameserver = gs;
+      }
+      // Greet once. Detect the opponent's interface language from the game
+      // page first so the greeting (and every later message) is in their
+      // language. Deferred until gameserver resolves so we can fetch the
+      // page; one extra fetch per game is negligible.
+      if (!m.saidHi && m.gameserver != null) {
+        try {
+          const html = await this.client.fetchGamePage(m.gameserver, t.id);
+          this.refreshOpponent(m, html);
+        } catch { /* fall back to English */ }
+        await this.maybeGreet(t.id, m, t.status === "play");
       }
 
       // chat-reply
@@ -1599,6 +2051,20 @@ export class BotDriver extends DurableObject<Env> {
     //    (game we actually played); for `archive` without `saidHi` the
     //    bot never played, so suppress the GG to avoid greeting tables
     //    that died in setup.
+    // Archive of a game we never actually played (joined but it died in
+    // setup / opponent declined, so saidHi was never set). Mark it finished
+    // with no GG and no tally, purely so the per-tick GC drops the memo.
+    // Without this these memos are re-fetched via getTableInfo every single
+    // tick forever — the source of the 100+ stale-memo backlog and its
+    // getTableInfo storm. An archived table is definitively over (an active
+    // game is "play"/"asyncplay"), so this can't drop a live game.
+    if (t.status === "archive" && !m.saidHi) {
+      if (!m.finished) {
+        m.finished = true;
+        m.finishedAt = Date.now();
+      }
+      return;
+    }
     const archivedPlayed = t.status === "archive" && m.saidHi;
     if (isFinishedStatus(t.status) || archivedPlayed) {
       if (!m.finished) {
@@ -1617,6 +2083,21 @@ export class BotDriver extends DurableObject<Env> {
           for (const [pid, seat] of Object.entries(t.players)) {
             if (pid === this.uid) continue;
             if (seat.score != null) { oppRawScore = String(seat.score); break; }
+          }
+        }
+        // If our score reads as a loss (0) but the opponent's score is missing
+        // from this snapshot, the friendly-draw quirk (BGA reporting 0/0
+        // instead of 0.5/0.5) would be misclassified as a loss. Re-fetch the
+        // authoritative per-table info once to backfill the opponent's score
+        // before tallying — this closes the live-path window that previously
+        // had to be repaired retroactively via /bot/reconcile-results.
+        if (score === 0 && oppRawScore == null && this.client) {
+          const ti = await this.client.getTableInfo(t.id).catch(() => null);
+          if (ti?.players) {
+            for (const [pid, seat] of Object.entries(ti.players)) {
+              if (pid === this.uid) continue;
+              if (seat.score != null) { oppRawScore = String(seat.score); break; }
+            }
           }
         }
         const oppScore = oppRawScore == null ? null : Number(oppRawScore);
@@ -1638,6 +2119,15 @@ export class BotDriver extends DurableObject<Env> {
           parsedScore: parsed,
           tally,
           oppRawScore,
+          durationMs: m.startedAt != null ? Date.now() - m.startedAt : undefined,
+          moveCount: m.moveCount,
+          botColor: m.botColor,
+          oppName: m.oppName,
+          oppId: m.oppId,
+          difficulty: m.effectiveDifficulty ?? m.difficulty ?? "grandmaster",
+          oppLanguage: m.oppLanguage,
+          realtime: t.status === "finished" ? true
+            : t.status === "asyncfinished" ? false : undefined,
         };
         if (!this.status.recentResults) this.status.recentResults = [];
         this.status.recentResults.push(entry);
@@ -1653,7 +2143,7 @@ export class BotDriver extends DurableObject<Env> {
         );
       }
       if (!m.saidGg) {
-        await this.client.chat(t.id, CLOSING_CHAT).catch(() => {});
+        await this.sendChat(t.id, tr("closing", m.oppLanguage));
         m.saidGg = true;
       }
       m.finished = true;
@@ -1709,9 +2199,29 @@ export class BotDriver extends DurableObject<Env> {
       .filter((h) => h.id != null && Number(h.id) > m.lastSeenChatId)
       .filter((h) => h.sender && h.sender !== this.uid)
       .filter((h) => h.type == null || h.type === "tablechat" || h.type === "chat");
-    for (const _ of fresh) {
-      try { await this.client.chat(tableId, CHAT_REPLY); }
-      catch { return; /* don't advance cursor */ }
+    for (const h of fresh) {
+      // Difficulty command: an exact, case-insensitive match of a single
+      // keyword, accepted only before the human's first move. Anything
+      // else (including keywords embedded in a sentence) is treated as
+      // untrusted chatter and gets the canned reply — this keeps the
+      // injection surface a closed enum rather than free text.
+      const word = String(h.msg ?? "").trim().toLowerCase();
+      const isCmd = !m.oppHasMoved && (word === "grandmaster" || word in DIFFICULTY_LEVELS);
+      let reply = tr("chatReply", m.oppLanguage);
+      if (isCmd) {
+        if (word === "grandmaster") {
+          // Store explicitly (not undefined) so we can distinguish "opponent
+          // chose grandmaster" from "no choice → use the gamemode default"
+          // (realtime defaults to fast local expert, async to grandmaster).
+          m.difficulty = "grandmaster";
+          reply = tr("difficultyGrandmaster", m.oppLanguage);
+        } else {
+          m.difficulty = word;
+          reply = tr("difficultySet", m.oppLanguage, { level: word, elo: DIFFICULTY_ELO[word] });
+        }
+      }
+      // If the send fails, don't advance the cursor — retry next tick.
+      if (!(await this.sendChat(tableId, reply))) return;
     }
     m.lastSeenChatId = maxId;
   }
@@ -1721,39 +2231,47 @@ export class BotDriver extends DurableObject<Env> {
   ): Promise<void> {
     if (!this.client || m.gameserver == null) return;
     const html = await this.client.fetchGamePage(m.gameserver, tableId);
+    // Keep the opponent's id/name/language fresh from the authoritative game
+    // page (greeting-time detection can miss it if the lobby snapshot hadn't
+    // resolved the seat yet, and it corrects stale names after a rename).
+    this.refreshOpponent(m, html);
+    // Greet from the common move path too. handleTable's live-play branch
+    // also greets, but a fast realtime game is often driven entirely by
+    // websocket push reactions (reactToPush → here) which bypass that
+    // branch, so without this the opener never gets sent.
+    await this.maybeGreet(tableId, m, isRealtime);
     const parsed = parseGameHtml(html);
     if (!parsed) {
       m.lastMoveAttempt = { ts: Date.now(), result: "no-parse" };
       return;
     }
 
-    // Opponent quit detection. BGA flips `zombie: 1` on the seat and/or
-    // sets `neutralized_player_id` to the bailed player's id once it has
-    // decided they've forfeited (typically: closed tab + missed enough
-    // turns for BGA's auto-pass to kick in). Per user policy we concede
-    // here rather than ride out the zombie-pass — frees the realtime
-    // slot, avoids hanging on any state BGA's auto-progression can't
-    // resolve (e.g. our own pawn waiting to be promoted while the opp is
-    // dead). Fires regardless of whose turn it is. Realtime only — async
-    // tables have 90-day clocks and a zombie there is just a slow human.
+    // Opponent zombie/neutralized observation — DIAGNOSTIC ONLY. BGA flips
+    // `zombie:1` / `neutralized_player_id` transiently in realtime (reconnects,
+    // bookkeeping), so they are NOT a reliable "opponent quit" signal and we
+    // must never resign a live game on them. The authoritative source of
+    // truth is the table status: if the opponent truly abandoned, BGA ends
+    // the game (status → finished/archive, usually awarding us the win),
+    // which the finished-status branch handles. So here we only log the flag
+    // once for observability, then play on / wait. Realtime only.
     if (isRealtime && this.uid) {
-      let oppQuit = false;
+      let reason = "";
       if (parsed.neutralizedPlayerId && parsed.neutralizedPlayerId !== this.uid) {
-        oppQuit = true;
+        reason = `neutralized=${parsed.neutralizedPlayerId}`;
       } else if (parsed.zombieByPlayer) {
-        for (const [pid, z] of Object.entries(parsed.zombieByPlayer)) {
-          if (pid !== this.uid && Number(z) === 1) { oppQuit = true; break; }
-        }
+        const z = Object.entries(parsed.zombieByPlayer)
+          .find(([pid, v]) => pid !== this.uid && Number(v) === 1);
+        if (z) reason = `zombie=${z[0]}`;
       }
-      if (oppQuit && !m.conceded) {
-        this.recordError("oppQuit", "opponent zombie/neutralized; conceding", tableId);
-        m.lastMoveAttempt = {
-          ts: Date.now(), result: "opp-quit-conceded", activePlayer: parsed.activePlayer,
-        };
-        await this.concedeTable(tableId, m, "oppQuit", OPP_QUIT_CHAT).catch((e) => {
-          this.recordError("oppQuitConcede", e, tableId);
-        });
-        return;
+      if (reason && !m.oppQuitSince) {
+        m.oppQuitSince = Date.now();
+        this.recordError(
+          "oppFlagged",
+          `${reason} botUid=${this.uid} zombie=${JSON.stringify(parsed.zombieByPlayer ?? {})}; not conceding — waiting for BGA to end the game`,
+          tableId,
+        );
+      } else if (!reason && m.oppQuitSince) {
+        m.oppQuitSince = null;
       }
     }
 
@@ -1794,7 +2312,7 @@ export class BotDriver extends DurableObject<Env> {
     // one we just played ourselves (avoids overwriting bot's lastMove
     // mid-lag with a stale diff).
     if (m.lastPieces) {
-      const moved: Array<{ pid: string; from: string; to: string; type: string }> = [];
+      const moved: Array<{ pid: string; from: string; to: string; type: string; color: string }> = [];
       for (const [pid, c] of Object.entries(parsed.pieces)) {
         const p = m.lastPieces[pid];
         if (!p) continue;
@@ -1807,6 +2325,7 @@ export class BotDriver extends DurableObject<Env> {
             from: xyToSq(px, py),
             to: xyToSq(cx, cy),
             type: c.piece_type,
+            color: c.piece_color,
           });
         }
       }
@@ -1814,6 +2333,22 @@ export class BotDriver extends DurableObject<Env> {
       if (pick && (pick.from !== m.lastMoveFrom || pick.to !== m.lastMoveTo)) {
         m.lastMoveFrom = pick.from;
         m.lastMoveTo = pick.to;
+      }
+      // Authoritative "opponent has replied" signal: any opponent-colored
+      // piece changed squares since our last observation. BGA's table HTML
+      // lags a few seconds after our selectCell (still echoing our turn), and
+      // a fast opponent can reply between two of our ticks — so the lag-based
+      // awaitingOppMove flag would otherwise stay pinned for the full
+      // AWAITING_OPP_TTL_MS even though it's genuinely our turn again. Their
+      // pieces only move when they move, so this clears the flag the instant
+      // we see it, letting the bot (and websocket push reactions) respond
+      // immediately instead of waiting out the TTL.
+      if (m.awaitingOppMove && m.botColor) {
+        const oppColor = m.botColor === "white" ? "black" : "white";
+        if (moved.some((mv) => mv.color === oppColor)) {
+          m.awaitingOppMove = false;
+          m.awaitingOppSince = null;
+        }
       }
     }
     m.lastPieces = parsed.pieces;
@@ -1851,6 +2386,13 @@ export class BotDriver extends DurableObject<Env> {
     if (ourTurn) {
       m.opponentTurnSince = null;
     } else if (isRealtime) {
+      // Realtime only: if the opponent has been on THIS turn (since their
+      // last move) for OPPONENT_INACTIVITY_LIMIT_MS without moving, treat it
+      // as an abandonment and concede to free the one realtime slot. The
+      // timer resets the moment they move (ourTurn → cleared above), so this
+      // is "15m since we've been waiting on their move", never since game
+      // start. This is the one allowed exception to "don't quit a live game"
+      // — 15m of dead silence in realtime is a genuine ghost.
       const now = Date.now();
       if (!m.opponentTurnSince) {
         m.opponentTurnSince = now;
@@ -1858,10 +2400,10 @@ export class BotDriver extends DurableObject<Env> {
         const mins = Math.round((now - m.opponentTurnSince) / 60_000);
         this.recordError(
           "opponentInactivity",
-          `Opponent on turn for ${mins}m (limit ${OPPONENT_INACTIVITY_LIMIT_MS / 60_000}m); conceding`,
+          `opponent on their turn ${mins}m without moving (limit ${OPPONENT_INACTIVITY_LIMIT_MS / 60_000}m); conceding`,
           tableId,
         );
-        await this.concedeTable(tableId, m, "opponentInactivity", OPPONENT_TIMEOUT_CHAT).catch((e) => {
+        await this.concedeTable(tableId, m, "opponentInactivity", tr("opponentTimeout", m.oppLanguage)).catch((e) => {
           this.recordError("opponentInactivityConcede", e, tableId);
         });
         return;
@@ -1887,6 +2429,31 @@ export class BotDriver extends DurableObject<Env> {
       return;
     }
 
+    // Draw-agreement gate. gamestate.id === 5 (`playerAgreeToDraw`) means
+    // the opponent offered a draw and BGA is blocking on our answer. There
+    // are no piece destinations in this state, so without this the bot just
+    // falls through to "no-dests" and the offer sits unanswered forever.
+    // The bot always accepts draws (friendly mode), so call proposeDraw to
+    // agree. wakeup nudges BGA the same way a move does.
+    if (parsed.gamestateId === 5) {
+      try {
+        await this.client.proposeDraw(m.gameserver, tableId);
+      } catch (e) {
+        m.lastMoveAttempt = {
+          ts: Date.now(), result: "agree-draw-failed",
+          activePlayer: parsed.activePlayer, err: String(e).slice(0, 200),
+        };
+        this.recordError("proposeDraw", e, tableId);
+        return;
+      }
+      await this.client.wakeup(m.gameserver, tableId).catch(() => {});
+      m.lastMoveAttempt = {
+        ts: Date.now(), result: "agreed-draw", activePlayer: parsed.activePlayer,
+      };
+      console.log(`t=${tableId} agreed to draw`);
+      return;
+    }
+
     // Pawn promotion gate. gamestate.id === 4 (`playerPromotePawn`) is
     // BGA's signal that our previous selectCell landed a pawn on the
     // back rank and BGA is now blocking on the piece-type choice. In
@@ -1905,7 +2472,11 @@ export class BotDriver extends DurableObject<Env> {
           activePlayer: parsed.activePlayer, err: String(e).slice(0, 200),
         };
         this.recordError("promotePawn", e, tableId);
-        return;
+        // Rethrow so handleTable's catch counts this toward the table's
+        // error budget. A move/promote that BGA keeps rejecting otherwise
+        // loops on our turn forever (errorCount never climbs, opponent-
+        // inactivity never fires because it's our turn) and pins the slot.
+        throw e;
       }
       m.lastTurn = "opp";
       await this.client.wakeup(m.gameserver, tableId).catch(() => {});
@@ -1933,6 +2504,30 @@ export class BotDriver extends DurableObject<Env> {
     const firstPiece = parsed.pieces[firstPid];
     const ourColor: "white" | "black" = firstPiece?.piece_color ?? "white";
     m.botColor = ourColor;
+    // We only reach here on our turn. If we're Black the human already
+    // moved (that's why it's our turn); if we're White, a second-or-later
+    // turn means they've replied. Either way the human has now moved, so
+    // lock difficulty selection.
+    if (ourColor === "black" || (m.moveCount ?? 0) >= 1) m.oppHasMoved = true;
+    // Per-gamemode default engine. Realtime favours SPEED: the remote
+    // Stockfish race takes up to ~5s/move, which feels broken in real time,
+    // so realtime defaults to the instant local js-chess-engine at expert
+    // (~1800). Async has no urgency, so it keeps full grandmaster Stockfish.
+    // Either is overridable by the opponent's chat command.
+    const effectiveDifficulty = m.difficulty ?? (isRealtime ? "expert" : "grandmaster");
+    m.effectiveDifficulty = effectiveDifficulty;
+    // useDifficulty = play the local js-chess-engine at a level; otherwise
+    // grandmaster = the remote race.
+    const useDifficulty = effectiveDifficulty !== "grandmaster"
+      && effectiveDifficulty in DIFFICULTY_LEVELS;
+    // Engine evals (chess-api.com, lichess-cloud-eval, stockfish.online) are
+    // all reported from White's perspective. Flip the sign when the bot plays
+    // Black so every stored cp/mate is bot-relative (positive = bot winning),
+    // matching what the dashboard and move log claim. Applied once at
+    // ingestion; cache writes below store the already-normalized value, so
+    // cache-hit reads need no further flip.
+    const toBotEval = (v: number | null | undefined): number | null | undefined =>
+      v == null ? v : (ourColor === "black" ? -v : v);
     const fen = buildFen(parsed.pieces, ourColor, parsed.destinationsByPiece);
     // Use the engine-grade FEN (correct castling rights) for the cache
     // and snapshot. The per-tick path above already wrote a placement
@@ -1948,8 +2543,14 @@ export class BotDriver extends DurableObject<Env> {
     // verdict. lookupUciMove still validates against the current legal
     // table so a cached move BGA no longer accepts falls through to a
     // fresh engine race.
+    // The shared FEN cache holds grandmaster-grade verdicts, so skip it
+    // entirely for difficulty-limited games — both reading (don't serve a
+    // strong move to a beginner) and writing (don't pollute the cache with
+    // weak js-chess-engine moves that grandmaster games would then reuse).
     const cacheKey = `${MOVE_CACHE_PREFIX}${fen}`;
-    const cached = await this.ctx.storage.get<CachedMove>(cacheKey).catch(() => undefined);
+    const cached = useDifficulty
+      ? undefined
+      : await this.ctx.storage.get<CachedMove>(cacheKey).catch(() => undefined);
     if (cached) {
       const cachedChosen = lookupUciMove(cached.move, parsed.pieces, parsed.destinationsByPiece);
       if (cachedChosen) {
@@ -1963,7 +2564,7 @@ export class BotDriver extends DurableObject<Env> {
 
     if (!chosen) {
       try {
-        const result = await this.askEngine(fen);
+        const result = await this.askEngine(fen, useDifficulty ? DIFFICULTY_LEVELS[effectiveDifficulty] : undefined);
         if (result) {
           engineResults = result.alternatives;
           if (result.move) {
@@ -2015,12 +2616,12 @@ export class BotDriver extends DurableObject<Env> {
 
     // Snapshot the engine eval for the gallery view. Pull from whichever
     // engine produced the chosen move so the displayed eval matches the
-    // move that was played. cp is in pawns; convention varies subtly
-    // across engines, treated as side-to-move = bot here.
+    // move that was played. cp is in pawns, normalized via toBotEval so
+    // positive = bot winning regardless of which color the bot plays.
     const winnerAlt = engineResults?.find((r) => r.engine === engineSource);
     if (winnerAlt && (winnerAlt.eval != null || winnerAlt.mate != null)) {
       m.lastEval = {
-        cp: winnerAlt.eval, mate: winnerAlt.mate ?? null,
+        cp: toBotEval(winnerAlt.eval) ?? undefined, mate: toBotEval(winnerAlt.mate) ?? null,
         engine: engineSource, ts: Date.now(),
       };
     }
@@ -2032,8 +2633,8 @@ export class BotDriver extends DurableObject<Env> {
     let moveMate: number | null | undefined;
     let moveThinkMs: number | undefined;
     if (winnerAlt) {
-      moveCp = winnerAlt.eval;
-      moveMate = winnerAlt.mate ?? null;
+      moveCp = toBotEval(winnerAlt.eval) ?? undefined;
+      moveMate = toBotEval(winnerAlt.mate) ?? null;
       moveThinkMs = winnerAlt.ms;
     } else if (engineSource.startsWith("cache:") && cached) {
       moveCp = cached.cp;
@@ -2048,6 +2649,7 @@ export class BotDriver extends DurableObject<Env> {
       captured: isCapture,
       pieceType: movedPiece?.piece_type,
     });
+    m.moveCount = (m.moveCount ?? 0) + 1;
     console.log(
       `t=${tableId} move ${fromSq}→${toSq} engine=${engineSource} ` +
       `color=${ourColor} piece=${movedPiece?.piece_type ?? "?"} ` +
@@ -2064,13 +2666,13 @@ export class BotDriver extends DurableObject<Env> {
     // well as whatever the cache already holds. Otherwise a one-off run
     // where the top engine was offline would downgrade a previously
     // cached top-engine verdict.
-    if (engineSource !== "random-fallback" && !engineSource.startsWith("cache:")) {
+    if (!useDifficulty && engineSource !== "random-fallback" && !engineSource.startsWith("cache:")) {
       const newRank = enginePrecedenceRank(engineSource);
       const cachedRank = cached ? enginePrecedenceRank(cached.engine) : Number.POSITIVE_INFINITY;
       if (newRank <= cachedRank) {
         await this.ctx.storage.put<CachedMove>(cacheKey, {
           move: `${fromSq}${toSq}`, engine: engineSource,
-          cp: winnerAlt?.eval, mate: winnerAlt?.mate ?? null,
+          cp: toBotEval(winnerAlt?.eval) ?? undefined, mate: toBotEval(winnerAlt?.mate) ?? null,
           ts: Date.now(),
         }).catch(() => {});
       }
@@ -2083,7 +2685,10 @@ export class BotDriver extends DurableObject<Env> {
         activePlayer: parsed.activePlayer, err: String(e).slice(0, 200),
       };
       this.recordError("selectCell", e, tableId);
-      return;
+      // Rethrow so handleTable's catch counts this toward the table's error
+      // budget (MAX_TABLE_ERRORS → concede). Swallowing it here let a table
+      // whose moves BGA persistently rejects spin on our turn indefinitely.
+      throw e;
     }
     m.lastMoveFrom = fromSq;
     m.lastMoveTo = toSq;
@@ -2099,22 +2704,27 @@ export class BotDriver extends DurableObject<Env> {
       ts: Date.now(), result: "played", activePlayer: parsed.activePlayer,
     };
     if (engineSource === "random-fallback" && !m.saidRandomFallback) {
-      await this.client.chat(tableId, RANDOM_FALLBACK_CHAT).catch(() => {});
+      await this.sendChat(tableId, tr("randomFallback", m.oppLanguage));
       m.saidRandomFallback = true;
     }
   }
 
-  private async askEngine(fen: string): Promise<{
+  private async askEngine(fen: string, level?: number): Promise<{
     move: string; engine: string; alternatives?: EngineAltEntry[];
   } | null> {
     // Hit our own engine via service binding — same Worker, so just call
-    // the Stockfish DO directly through env.ENGINE.
+    // the Stockfish DO directly through env.ENGINE. A `level` means a
+    // difficulty-limited game: run only the local js-chess-engine at that
+    // level (localOnly) instead of the remote Stockfish race.
     const id = this.env.ENGINE.idFromName(`bot:${this.uid ?? "anon"}`);
     const stub = this.env.ENGINE.get(id);
+    const body = level != null
+      ? { fen, localOnly: true, level }
+      : { fen, depth: ENGINE_DEPTH, movetime: ENGINE_MOVETIME_MS };
     const resp = await stub.fetch("https://do/bestmove", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ fen, depth: ENGINE_DEPTH, movetime: ENGINE_MOVETIME_MS }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) return null;
     const json = (await resp.json()) as {
