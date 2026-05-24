@@ -8,9 +8,17 @@ compatibility_flags = ["nodejs_compat"]
 # deploy time, so paste them there once and `npx wrangler deploy` just works.
 
 # Custom domain. Cloudflare provisions DNS and cert automatically.
+# MUST be a top-level key, so it goes before the first [section] header —
+# otherwise TOML parses it as `assets.routes` and wrangler warns.
 routes = [
   { pattern = "stockfish.ross.gg", custom_domain = true }
 ]
+
+# Static assets (favicon, etc). Files in ./public are served before the
+# Worker handler runs, so /favicon.png resolves to public/favicon.png
+# with no fetch handler changes.
+[assets]
+directory = "./public"
 
 [[durable_objects.bindings]]
 name = "ENGINE"
@@ -20,6 +28,10 @@ class_name = "StockfishEngine"
 name = "BOT"
 class_name = "BotDriver"
 
+[[durable_objects.bindings]]
+name = "WASM_ENGINE"
+class_name = "StockfishWasmEngine"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["StockfishEngine"]
@@ -28,20 +40,49 @@ new_sqlite_classes = ["StockfishEngine"]
 tag = "v2"
 new_sqlite_classes = ["BotDriver"]
 
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["StockfishWasmEngine"]
+
+# --- Cloudflare Container tier (native stockfish in Debian slim) ---
+# DORMANT. We deployed this once and it worked (warm latency ~350ms, beating
+# chess-api.com), but cold-start was ~9s and "always-on" pricing for a
+# perpetually-warm "lite" instance is ~$245/mo. A $6/mo Linux VPS running the
+# same container/server.mjs is cheaper + simpler for a hobby bot.
+#
+# To re-enable: uncomment the three blocks below, ensure Docker CLI is up
+# (colima + binfmt for cross-arch builds — see container/README), then
+# `npx wrangler deploy`. The v4 migration is already applied from the prior
+# enabled deploy; do NOT add a new migration to "re-create" the class.
+#
+# [[durable_objects.bindings]]
+# name = "STOCKFISH_CONTAINER"
+# class_name = "StockfishContainer"
+#
+# [[containers]]
+# class_name = "StockfishContainer"
+# image = "./container/Dockerfile"
+# max_instances = 3
+
+# v4 migration already applied — leave it in place even while the container is
+# dormant so the migration history matches what's on Cloudflare.
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["StockfishContainer"]
+
+# Bundle the Stockfish wasm binary so engine.ts can import it as a
+# pre-compiled WebAssembly.Module (CF Workers disallow runtime
+# WebAssembly.instantiate of raw bytes).
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = false
+
 # Cron watchdog — pokes the bot once a minute to re-arm its 5s alarm
 # loop in case it ever drops (deploys, evictions). The DO does the real
 # polling itself on a 5-second cadence via storage.setAlarm.
 [triggers]
 crons = ["*/1 * * * *"]
-
-# Bundle the wasm as a pre-compiled WebAssembly.Module. CF Workers disallow
-# runtime compilation (WebAssembly.instantiate(bytes)), but accept
-# instantiation of an already-compiled Module — so we hand emscripten the
-# pre-compiled module via Module.instantiateWasm rather than wasmBinary.
-[[rules]]
-type = "CompiledWasm"
-globs = ["**/*.wasm"]
-fallthrough = true
 
 # Observability
 [observability]

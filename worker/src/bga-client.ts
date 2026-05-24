@@ -275,7 +275,7 @@ export class BGAClient {
     throw new Error("could not resolve user id");
   }
 
-  async listTables(opts: { status?: "open" | "play" | "finished"; games?: number | string } = {}): Promise<Record<string, RawTableInfo>> {
+  async listTables(opts: { status?: "open" | "play" | "finished" | "setup"; games?: number | string } = {}): Promise<Record<string, RawTableInfo>> {
     const params = new URLSearchParams();
     params.set("status", opts.status ?? "open");
     if (opts.games !== undefined) params.set("games", String(opts.games));
@@ -292,40 +292,105 @@ export class BGAClient {
   }
 
   /**
-   * Direct per-table lookup via `tableinfos.html?id=<tableId>`. The real
-   * BGA UI uses this to fetch a single table's full state without paging
-   * the global lobby lists (which roll off recently-finished tables
-   * within seconds). Use this to chase down in-flight games whose
-   * `finished` snapshot the polling loop missed.
+   * Direct per-table lookup via the post-game `table/table/tableinfos.html`
+   * endpoint. This is the call BGA's own per-table page issues after a game
+   * ends; it returns the rich per-table envelope (data IS the table, not
+   * data.tables[id]) including `status: "finished"`, `result` with scores,
+   * and the full players map. Use this to chase down in-flight games whose
+   * `finished` lobby snapshot the polling loop missed.
+   *
+   * The older `tablemanager/tablemanager/tableinfos.html?id=` endpoint
+   * (which mirrors the lobby shape) was unreliable: it intermittently
+   * returned "didn't manage to process your request fast enough" errors
+   * and never included a `status: "finished"` row for completed games.
    */
   async getTableInfo(tableId: number | string): Promise<RawTableInfo | null> {
-    const params = new URLSearchParams({
+    const qs = new URLSearchParams({
       id: String(tableId),
+      nosuggest: "true",
+      table: String(tableId),
+      noerrortracking: "true",
       "dojo.preventCache": String(Date.now()),
     });
     const resp = await this.request(
-      "POST",
-      "https://en.boardgamearena.com/tablemanager/tablemanager/tableinfos.html",
-      params,
+      "GET",
+      `https://boardgamearena.com/table/table/tableinfos.html?${qs}`,
+      undefined,
+      { referer: `https://boardgamearena.com/table?table=${tableId}` },
+    );
+    const text = await resp.text();
+    let json: BGAEnvelope<RawTableInfo & {
+      result?: { player?: Array<{ player_id?: string; score?: string }> };
+    }>;
+    try { json = JSON.parse(text) as typeof json; }
+    catch { return null; }
+    if (json.status !== 1 || !json.data) return null;
+    const data = json.data;
+    // The per-table endpoint omits per-seat scores from `players[pid]`
+    // (unlike the lobby shape). For finished games BGA puts the
+    // authoritative scores under `result.player[]` instead. Backfill
+    // them onto the seat map so downstream code can keep reading
+    // `players[uid].score` regardless of which endpoint produced the
+    // table.
+    const seats = (data.players ??= {});
+    for (const p of data.result?.player ?? []) {
+      if (!p.player_id) continue;
+      const seat = (seats[p.player_id] ??= {});
+      if (seat.score == null && p.score != null) seat.score = p.score;
+    }
+    return data;
+  }
+
+  /**
+   * Player-scoped table list via `tableinfos.html?playerid=<uid>`. This is
+   * the endpoint BGA's own UI uses to populate the "your games" sidebar,
+   * and is the only way to discover:
+   *   - friends-only / private invites (filtered out of status=open)
+   *   - direct invitations from another player to the bot
+   *   - rematch invites in status=setup that scope to a private audience
+   * Returns every table the player is currently a participant of, across
+   * all statuses. Combine with myTables() for full coverage.
+   */
+  async playerTables(uid: string): Promise<Record<string, RawTableInfo>> {
+    const qs = new URLSearchParams({
+      playerid: uid,
+      "dojo.preventCache": String(Date.now()),
+    });
+    const resp = await this.request(
+      "GET",
+      `https://en.boardgamearena.com/tablemanager/tablemanager/tableinfos.html?${qs}`,
     );
     const json = (await resp.json()) as BGAEnvelope<{ tables?: Record<string, RawTableInfo> }>;
-    if (json.status !== 1) return null;
-    return json.data?.tables?.[String(tableId)] ?? null;
+    if (json.status !== 1) return {};
+    return json.data?.tables ?? {};
   }
 
   async myTables(gameId = 81): Promise<RawTableInfo[]> {
     await this.login();
     const uid = await this.resolveUserId();
+    // status=setup catches "Propose rematch / Play again" invites where
+    // someone has already seated themselves and is waiting on the bot
+    // (the bot appears in players[] with table_status=expected). Without
+    // it, those invites never enter handleTable and joinTable never
+    // fires. The uid filter below scopes to tables the bot is in.
+    //
+    // playerTables() catches friends-only / private / direct invites that
+    // never show up in the public status=open lobby.
+    //
     // Include "finished" so the bot can observe game endings and say GG.
     // BGA may not return more than the most-recent finished tables; that's
-    // fine — we only need to catch them once.
-    const [open, playing, done] = await Promise.all([
+    // fine, we only need to catch them once.
+    const [open, setup, playing, done, mine] = await Promise.all([
       this.listTables({ status: "open", games: gameId }).catch(() => ({})),
+      this.listTables({ status: "setup", games: gameId }).catch(() => ({})),
       this.listTables({ status: "play", games: gameId }).catch(() => ({})),
       this.listTables({ status: "finished", games: gameId }).catch(() => ({})),
+      this.playerTables(uid).catch(() => ({})),
     ]);
-    const merged: Record<string, RawTableInfo> = { ...open, ...playing, ...done };
-    return Object.values(merged).filter((t) => t.players && uid in t.players);
+    const merged: Record<string, RawTableInfo> = { ...open, ...setup, ...playing, ...done, ...mine };
+    return Object.values(merged)
+      .filter((t) => t.game_id === String(gameId))
+      .filter((t) => t.players && uid in t.players);
   }
 
   async joinTable(tableId: number | string): Promise<BGAEnvelope<unknown>> {
@@ -522,7 +587,43 @@ export class BGAClient {
       `?cell_x=${cellX}&cell_y=${cellY}&selected_piece=${selectedPieceId}` +
       `&lock=${lock}&table=${tableId}&noerrortracking=true&dojo.preventCache=${Date.now()}`;
     const resp = await this.request("GET", url);
-    return (await resp.json()) as BGAEnvelope<unknown>;
+    // BGA returns 200 OK + `{status:0,error:"..."}` for rejected moves
+    // (illegal under their validator, stale gamestate, lock collision,
+    // wrong-turn race). Without this check the bot records "played" and
+    // never retries, so the same dead game lingers forever on its turn.
+    const env = (await resp.json()) as BGAEnvelope<unknown> & { error?: string };
+    if (env && Number(env.status) !== 1) {
+      throw new Error(
+        `selectCell rejected: ${JSON.stringify(env).slice(0, 200)}`,
+      );
+    }
+    return env;
+  }
+
+  /**
+   * GET /<gs>/chess/chess/promotePawn.html — choose the piece type when
+   * a pawn reaches the back rank. Required follow-up after a selectCell
+   * that lands on rank 8 (white) / rank 1 (black); BGA holds the table in
+   * gamestate=4 (`playerPromotePawn`) until this is called. Always picks
+   * `queen` in the bot for now — under-promotion isn't worth the engine
+   * plumbing for a friendly-mode chess bot.
+   */
+  async promotePawn(
+    gameserverNum: number | string,
+    tableId: number | string,
+    pieceType: "queen" | "rook" | "bishop" | "knight",
+  ): Promise<BGAEnvelope<unknown>> {
+    const lock = randomUuid();
+    const url =
+      `https://boardgamearena.com/${gameserverNum}/chess/chess/promotePawn.html` +
+      `?piece_type=${pieceType}&lock=${lock}&table=${tableId}` +
+      `&noerrortracking=true&dojo.preventCache=${Date.now()}`;
+    const resp = await this.request("GET", url);
+    const env = (await resp.json()) as BGAEnvelope<unknown> & { error?: string };
+    if (env && Number(env.status) !== 1) {
+      throw new Error(`promotePawn rejected: ${JSON.stringify(env).slice(0, 200)}`);
+    }
+    return env;
   }
 
   async wakeup(gameserverNum: number | string, tableId: number | string): Promise<BGAEnvelope<unknown>> {

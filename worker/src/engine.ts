@@ -77,6 +77,14 @@ export class Engine {
       if (!uciOut.some((l) => l.includes("uciok"))) {
         throw new Error("no uciok after uci command. got: " + uciOut.slice(-5).join(" | "));
       }
+      // TIGHT config: keep the engine inside the DO's 128MB memory cap.
+      // Hash=1MB and single-thread search reduce peak RSS dramatically;
+      // SyzygyPath empty disables tablebase probe attempts.
+      this.sendSync("setoption name Hash value 1");
+      this.sendSync("setoption name Threads value 1");
+      this.sendSync("setoption name MultiPV value 1");
+      this.sendSync("setoption name SyzygyPath value <empty>");
+      this.sendSync("setoption name UCI_AnalyseMode value false");
       const readyOut = this.sendSync("isready");
       if (!readyOut.some((l) => l.includes("readyok"))) {
         throw new Error("no readyok after isready. got: " + readyOut.slice(-5).join(" | "));

@@ -41,23 +41,75 @@ export interface GameStateParsed {
   pieces: Record<string, Piece>;
   destinationsByPiece: Record<string, Destination[]>;
   activePlayer: string | null;
-  stateId: number | string | null;
+  /** Per-player seconds remaining on the chess clock. BGA reports this
+   *  as `reflexion.total[playerId]`. Counts down only while it's that
+   *  player's turn; goes negative once they overdraw. We use it to
+   *  detect opponents who ghosted mid-game on realtime tables. */
+  reflexion: Record<string, number> | null;
+  /** BGA gamestate.id. For chess: 3 = playerSelectPiece (our normal
+   *  move), 4 = playerPromotePawn (must call promotePawn instead of
+   *  selectCell), 5 = playerAgreeToDraw, 99 = gameEnd. Used to branch
+   *  the play loop when BGA puts the table in a state selectCell can't
+   *  resolve (e.g. a pawn that just reached the back rank). */
+  gamestateId: number | null;
+  /** Map of playerId → BGA zombie flag (1 = zombie). BGA flips this to
+   *  1 once a player has left/timed out long enough that BGA itself
+   *  starts auto-passing their turns. */
+  zombieByPlayer: Record<string, number> | null;
+  /** BGA's `neutralized_player_id` field — the player ID BGA has
+   *  unilaterally forfeited (most commonly an opponent who quit
+   *  mid-game in friendly mode). null when no one has been forfeited. */
+  neutralizedPlayerId: string | null;
 }
 
 /** Parse the chess game HTML into the structures we need to pick a move. */
 export function parseGameHtml(html: string): GameStateParsed | null {
   const pieces = parseJsonAtKey<Record<string, Piece>>(html, '"pieces":');
   const gamestate = parseJsonAtKey<{
-    active_player?: string;
     id?: number | string;
+    active_player?: string;
     args?: { destinations_by_piece?: Record<string, Destination[]> };
   }>(html, '"gamestate":');
   if (!gamestate || !pieces) return null;
+  const reflexionRaw = parseJsonAtKey<{ total?: Record<string, string | number> }>(
+    html, '"reflexion":',
+  );
+  let reflexion: Record<string, number> | null = null;
+  if (reflexionRaw?.total && typeof reflexionRaw.total === "object") {
+    reflexion = {};
+    for (const [pid, secs] of Object.entries(reflexionRaw.total)) {
+      const n = Number(secs);
+      if (Number.isFinite(n)) reflexion[pid] = n;
+    }
+  }
+  // Players blob carries per-seat zombie flag. The first `"players":`
+  // in the HTML is the in-game gamedata copy and reliably has it.
+  const playersRaw = parseJsonAtKey<Record<string, { zombie?: number | string }>>(
+    html, '"players":',
+  );
+  let zombieByPlayer: Record<string, number> | null = null;
+  if (playersRaw && typeof playersRaw === "object") {
+    zombieByPlayer = {};
+    for (const [pid, p] of Object.entries(playersRaw)) {
+      const z = Number(p?.zombie ?? 0);
+      if (Number.isFinite(z)) zombieByPlayer[pid] = z;
+    }
+  }
+  // Top-level scalar field — capture via a narrow regex rather than
+  // walking the whole gamedata blob. BGA emits it as
+  // `"neutralized_player_id":"99813153"` or `:null`.
+  let neutralizedPlayerId: string | null = null;
+  const nMatch = /"neutralized_player_id"\s*:\s*("(\d+)"|null|"")/.exec(html);
+  if (nMatch && nMatch[2]) neutralizedPlayerId = nMatch[2];
+  const gsId = gamestate.id != null ? Number(gamestate.id) : null;
   return {
     pieces,
     destinationsByPiece: gamestate.args?.destinations_by_piece ?? {},
     activePlayer: gamestate.active_player ?? null,
-    stateId: gamestate.id ?? null,
+    reflexion,
+    gamestateId: Number.isFinite(gsId) ? gsId : null,
+    zombieByPlayer,
+    neutralizedPlayerId,
   };
 }
 
@@ -66,14 +118,22 @@ export function parseGameHtml(html: string): GameStateParsed | null {
  * (0..7 = a..h) and y rows from black's perspective (white pieces start
  * at y=6/7 → ranks 2/1, so rank = 8 - y).
  *
- * Castling rights are a heuristic: include each side only if king is home
- * AND that side's rook is home. False positives (king/rook returned to
- * home without ever having moved) are rare and stockfish self-corrects
- * by simply not playing the illegal castle.
+ * Castling rights are derived from BGA's `destinations_by_piece`: a side
+ * gets `K`/`k` only when the king actually has a `kingsideCastling`
+ * destination available this turn (and similarly for queenside). A
+ * static "king on e1 + rook on h1" heuristic produced bogus rights
+ * whenever the king moved off and returned, leading the engine to
+ * suggest castles BGA refused — and forcing a random fallback. We may
+ * understate rights on turns where castling is blocked by check or
+ * intermediate attacks, but the engine never proposes an illegal castle.
  *
  * En passant target is left as '-'. Halfmove clock = 0, fullmove = 1.
  */
-export function buildFen(pieces: Record<string, Piece>, activeColor: "white" | "black"): string {
+export function buildFen(
+  pieces: Record<string, Piece>,
+  activeColor: "white" | "black",
+  destinationsByPiece: Record<string, Destination[]> = {},
+): string {
   // 8x8 board indexed as [rank=8..1][file=a..h] → board[r][f]
   const board: (string | null)[][] = Array.from({ length: 8 }, () => Array(8).fill(null));
   for (const p of Object.values(pieces)) {
@@ -97,22 +157,16 @@ export function buildFen(pieces: Record<string, Piece>, activeColor: "white" | "
   const placement = ranks.join("/");
   const turn = activeColor === "white" ? "w" : "b";
 
-  // Castling rights heuristic
-  const at = (color: "white" | "black", type: Piece["piece_type"], x: number, y: number) =>
-    Object.values(pieces).some(
-      (p) => p.piece_captured !== "1" && p.piece_color === color && p.piece_type === type
-        && Number(p.piece_x) === x && Number(p.piece_y) === y,
-    );
+  // Castling rights — only what BGA says the king can legally do right now.
   let castling = "";
-  // White king home is e1 = (4,7); rooks a1=(0,7), h1=(7,7).
-  if (at("white", "king", 4, 7)) {
-    if (at("white", "rook", 7, 7)) castling += "K";
-    if (at("white", "rook", 0, 7)) castling += "Q";
-  }
-  // Black king home is e8 = (4,0); rooks a8=(0,0), h8=(7,0).
-  if (at("black", "king", 4, 0)) {
-    if (at("black", "rook", 7, 0)) castling += "k";
-    if (at("black", "rook", 0, 0)) castling += "q";
+  for (const [pid, dests] of Object.entries(destinationsByPiece)) {
+    const p = pieces[pid];
+    if (!p || p.piece_type !== "king" || p.piece_captured === "1") continue;
+    const isWhite = p.piece_color === "white";
+    for (const d of dests ?? []) {
+      if (d.kingsideCastling) castling += isWhite ? "K" : "k";
+      if (d.queensideCastling) castling += isWhite ? "Q" : "q";
+    }
   }
   if (!castling) castling = "-";
 

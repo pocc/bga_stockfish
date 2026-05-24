@@ -184,6 +184,28 @@ existing `isFinishedStatus` branch can run. Keep this loop bounded by
 the active-game predicate; lifting the predicate would re-poll every
 historical memo and rate-limit the bot.
 
+### Reconcile-miss GC: drop memos when BGA can't find the table either
+
+The per-id reconcile above injects a missing finished game back into the
+tick. But if BGA itself can't find the table (rage-quit + archive,
+opponent dispute resolution, etc.), `getTableInfo` returns `null` and
+the memo just sits there forever with `gameserver != null && !finished`.
+That memo's `id` *still counts* against the bot in BGA's "you have a
+game in progress at another table!" check, so every subsequent
+`createTable` call fails and the bot stops accepting work.
+
+Fix lives next to the reconcile loop in `tick()`. Each memo tracks
+`reconcileMissCount`; a successful `getTableInfo` resets it to 0, and
+`RECONCILE_MISS_LIMIT` (3) consecutive nulls flip the memo to
+`finished = true` so the per-tick GC drops it on the next pass. The
+bot records a `reconcileMiss` row in `recentErrors` whenever this
+fires so you can see in `/bot/status` why a memo was dropped.
+
+Don't lower the threshold to 1: BGA occasionally returns null for a
+single tick on a table that's still live, and bouncing the memo would
+re-trigger every downstream lifecycle action (hello message, etc.) the
+moment it came back. Three ticks (~15s) is enough buffer.
+
 ### Transient `setup` status is not a mode mismatch
 
 `gamemodeOf("setup")` returns `null` because `setup`/`init` carry no

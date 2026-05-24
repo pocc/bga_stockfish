@@ -1,17 +1,28 @@
 import { StockfishEngine } from "./stockfish-do";
 import { BotDriver } from "./bot-do";
+import { StockfishWasmEngine } from "./wasm-engine-do";
+import { StockfishContainer } from "./container-do";
 
-export { StockfishEngine, BotDriver };
+export { StockfishEngine, BotDriver, StockfishWasmEngine, StockfishContainer };
 
 export interface Env {
   ENGINE: DurableObjectNamespace;
   BOT: DurableObjectNamespace;
+  /** Optional: WASM Stockfish DO. Bound when wrangler.toml includes it. */
+  WASM_ENGINE?: DurableObjectNamespace;
+  /** Optional: native Stockfish container binding. Dormant — uncomment the
+   *  [[containers]] + binding blocks in wrangler.toml to enable. */
+  STOCKFISH_CONTAINER?: DurableObjectNamespace;
   /** BGA bot credentials — set with `wrangler secret put`. */
   BGA_USERNAME: string;
   BGA_PASSWORD: string;
   /** Admin secret for mutating /bot/* endpoints. Set with `wrangler secret put BOT_ADMIN_SECRET`.
    *  When unset, mutating endpoints are blocked from external callers. */
   BOT_ADMIN_SECRET?: string;
+  /** RapidAPI key for the Chess Stockfish 16 API. Set with
+   *  `wrangler secret put RAPIDAPI_STOCKFISH_KEY`. When unset, the engine
+   *  is silently skipped in the race. */
+  RAPIDAPI_STOCKFISH_KEY?: string;
 }
 
 function botStub(env: Env) {
@@ -49,7 +60,6 @@ export default {
         service: "stockfish-worker",
         version: "0.2.0",
         endpoints: {
-          "POST /bestmove": "{ fen: string, movetime?: number, depth?: number, gameId?: string }",
           "GET /health": "this",
           "GET /bot/status": "public bot diagnostic snapshot",
         },
@@ -57,6 +67,11 @@ export default {
     }
 
     if (url.pathname === "/bestmove" && req.method === "POST") {
+      // Gated: the bot calls the DO directly via service binding, so the
+      // public HTTP route only exists for ad-hoc admin testing. Leaving it
+      // open lets anyone proxy through us to upstream APIs (chess-api.com,
+      // lichess, stockfish.online, rapidapi) on our quota/keys.
+      if (!isAdmin(req, env)) return unauthorized();
       let body: {
         fen?: string;
         movetime?: number;
@@ -97,13 +112,19 @@ export default {
     if (url.pathname === "/bot/status" && req.method === "GET") {
       return botStub(env).fetch("https://do/status");
     }
+    // Read-only debug: dump parsed game state for a tracked table id.
+    if (url.pathname === "/bot/inspect" && req.method === "GET") {
+      const qs = new URLSearchParams(url.search).toString();
+      return botStub(env).fetch(`https://do/inspect?${qs}`);
+    }
 
     // Mutating bot endpoints require the admin secret. The internal cron
     // handler calls the DO stub directly and bypasses this fetch handler,
     // so it doesn't need the secret.
     const mutatingBot = new Set([
       "/bot/start", "/bot/stop", "/bot/tick", "/bot/cleanup",
-      "/bot/probe", "/bot/wipe",
+      "/bot/probe", "/bot/wipe", "/bot/fix-result", "/bot/reconcile-results",
+      "/bot/resync-stats", "/bot/resync-engine-uses",
     ]);
     if (mutatingBot.has(url.pathname)) {
       if (!isAdmin(req, env)) return unauthorized();
@@ -142,6 +163,7 @@ function landingHtml(): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>stockfish.ross.gg</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
   :root {
     --bg: #f7f5f0;
@@ -153,6 +175,7 @@ function landingHtml(): string {
     --ok: #2c7a3a;
     --warn: #b85c38;
     --err: #c0392b;
+    --draw: #a8881e;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -165,6 +188,7 @@ function landingHtml(): string {
       --ok: #6ec27a;
       --warn: #e89968;
       --err: #e87968;
+      --draw: #e0c64a;
     }
   }
   * { box-sizing: border-box; }
@@ -188,6 +212,7 @@ function landingHtml(): string {
   pre code { background: transparent; padding: 0; }
   a { color: var(--accent); }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  #stats { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .card { background: var(--code-bg); padding: 10px 12px; border-radius: 6px; }
   .card .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
   .card .val { font-size: 22px; font-weight: 600; margin-top: 2px; }
@@ -197,8 +222,79 @@ function landingHtml(): string {
   .ok { color: var(--ok); }
   .warn { color: var(--warn); }
   .err { color: var(--err); }
+  .draw { color: var(--draw); }
   .muted { color: var(--muted); }
   .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; background: var(--code-bg); font-size: 11px; }
+  .pill.btn { cursor: pointer; user-select: none; border: 1px solid transparent; }
+  .pill.btn.on { border-color: var(--accent); color: var(--accent); }
+  /* Gallery of mini boards */
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }
+  .gcard { display: block; text-decoration: none; color: inherit; background: var(--code-bg); border-radius: 8px; padding: 10px; transition: transform 0.08s ease; }
+  .gcard:hover { transform: translateY(-1px); }
+  .gboard { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); aspect-ratio: 1 / 1; border-radius: 4px; overflow: hidden; box-shadow: 0 0 0 1px var(--rule) inset; }
+  .gsq { display: flex; align-items: center; justify-content: center; font-size: 17px; line-height: 1; }
+  .gsq.l { background: #ebe1c4; }
+  .gsq.d { background: #b38a5b; }
+  @media (prefers-color-scheme: dark) {
+    .gsq.l { background: #6f614a; }
+    .gsq.d { background: #3d3326; }
+  }
+  /* Highlight the from/to squares of the most recent move. */
+  .gsq.lm { box-shadow: inset 0 0 0 9999px rgba(255, 213, 79, 0.45); }
+  /* Force black pieces to actually render black on light squares,
+   * and use the filled (black) glyphs for both sides so contrast is
+   * consistent across light/dark mode. */
+  .gsq .pw { color: #fafafa; text-shadow: 0 0 1px #000, 0 0 1px #000; }
+  .gsq .pb { color: #111; text-shadow: 0 0 1px #fff, 0 0 1px #fff; }
+  .gmeta { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; }
+  .gmeta .mono { font-size: 11px; }
+  .gmeta .grow { flex: 1; }
+  .gev { font-weight: 600; }
+  .gev.plus { color: var(--ok); }
+  .gev.minus { color: var(--err); }
+  .gev.even { color: var(--muted); }
+  /* Turn-to-move chip on each gallery card. */
+  .turn { font-weight: 600; padding: 1px 6px; border-radius: 8px; font-size: 10px; }
+  .turn.bot { background: var(--accent); color: var(--bg); }
+  .turn.opp { background: var(--rule); color: var(--fg); }
+  /* Clock display: monospace + pulse on the side whose clock is ticking. */
+  .clock { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; }
+  .clock.live { animation: pulse 1.2s ease-in-out infinite; }
+  .clock.low { color: var(--err); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  /* Per-side line: shows who plays which color, with name + time spent.
+     White-on-dark name chip keeps the player ID highly readable; the
+     bot row gets a subtle accent border-left (no fill colour) so it's
+     identifiable without flashing. No pulse — the 👉 marker on the
+     active row is the to-move signal. */
+  .sideline { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; font-size: 11px; background: rgba(255, 255, 255, 0.03); min-width: 0; overflow: hidden; }
+  .sideline.bot { border-left: 3px solid var(--accent); }
+  .sideline.opp { border-left: 3px solid var(--rule); }
+  .sideline .glyph-w { color: #fafafa; text-shadow: 0 0 1px #000, 0 0 1px #000; font-size: 14px; line-height: 1; flex-shrink: 0; }
+  .sideline .glyph-b { color: #111; text-shadow: 0 0 1px #fff, 0 0 1px #fff; font-size: 14px; line-height: 1; flex-shrink: 0; }
+  .sideline .namechip { display: inline-block; padding: 1px 6px; border-radius: 3px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .sideline.bot .namechip { background: var(--accent); color: #fff; }
+  .sideline.opp .namechip { background: transparent; color: var(--fg); padding-left: 0; padding-right: 0; }
+  .sideline .spent { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; flex-shrink: 0; white-space: nowrap; }
+  .sideline .lowtag { color: var(--err); font-weight: 600; margin-left: 4px; }
+  .sideline .active-mark { font-size: 13px; line-height: 1; }
+  .sideline .active-mark-gap { display: inline-block; width: 16px; }
+  .sidestack { display: flex; flex-direction: column; gap: 3px; }
+  .ghist { margin-top: 4px; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Engine usage pie chart. */
+  .pie-wrap { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  .pie-svg { flex: 0 0 200px; }
+  .pie-legend { font-size: 12px; min-width: 240px; }
+  .pie-legend table { width: 100%; }
+  .pie-legend td { padding: 4px 6px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
+  .pie-sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .pie-svg path { transition: opacity 0.12s ease; }
+  .pie-svg path:hover { opacity: 0.7; cursor: default; }
+  /* Recent moves table — winner / fell-through indicators. */
+  .winner { color: var(--ok); font-weight: 600; }
+  .rejected { color: var(--muted); text-decoration: line-through; opacity: 0.7; }
+  .legend { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .legend .sw { display: inline-block; padding: 0 4px; border-radius: 3px; background: var(--code-bg); margin: 0 2px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   footer { margin-top: 32px; color: var(--muted); font-size: 11px; }
   .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .grow { flex: 1; }
@@ -212,25 +308,10 @@ function landingHtml(): string {
     <span id="state" class="pill muted">loading…</span>
     <a href="javascript:load()" class="pill">refresh</a>
   </div>
-  <p class="sub">Autonomous chess bot on BGA. Friendly games only. <span id="ticked" class="muted"></span></p>
+  <p class="sub">Autonomous chess bot on <a href="https://boardgamearena.com" target="_blank" rel="noopener">Board Game Arena</a>. Friendly games only. <span id="ticked" class="muted"></span></p>
 
   <h2>Stats</h2>
   <div class="cards" id="stats"></div>
-
-  <h2>Open invites</h2>
-  <div id="invites" class="muted">…</div>
-
-  <h2>Active games</h2>
-  <div id="games" class="muted">…</div>
-
-  <h2>Recent moves</h2>
-  <div id="moves" class="muted">…</div>
-
-  <h2>Engine usage</h2>
-  <div id="engines" class="muted">…</div>
-
-  <h2>Recent errors</h2>
-  <div id="errors" class="muted">…</div>
 
   <h2>Bot rules</h2>
   <ul style="padding-left: 22px; margin: 0; font-size: 13px;">
@@ -241,13 +322,217 @@ function landingHtml(): string {
     <li>After 3 consecutive errors on a table, sends a polite concession message and resigns.</li>
   </ul>
 
-  <h2>Engine API</h2>
-  <pre><code>curl -X POST https://stockfish.ross.gg/bestmove \\
-  -H 'content-type: application/json' \\
-  -d '{"fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1","depth":12}'</code></pre>
+  <h2 style="margin-bottom: 6px;">Active games</h2>
+  <div class="row" style="margin: 0 0 12px;">
+    <span id="gmode-gallery" class="pill btn" onclick="setGamesMode('gallery')">♞ gallery</span>
+    <span id="gmode-table" class="pill btn" onclick="setGamesMode('table')">≡ table</span>
+  </div>
+  <div id="games" class="muted">…</div>
+
+  <h2>Open invites</h2>
+  <div id="invites" class="muted">…</div>
+
+  <h2>Engine usage</h2>
+  <div id="engines" class="muted">…</div>
+
+  <h2>Recent moves</h2>
+  <div id="moves" class="muted">…</div>
+
+  <h2>Past Games</h2>
+  <div id="results" class="muted">…</div>
+
+  <h2>Technical details</h2>
+  <details>
+    <summary style="cursor: pointer; color: var(--accent); font-size: 13px;">Running a chess engine on Cloudflare Workers — what worked, what didn't</summary>
+    <div style="margin-top: 12px; font-size: 13px;">
+
+      <h3 style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 16px 0 6px;">Architecture</h3>
+      <p style="margin: 0 0 8px;">
+        Each <code>/bestmove</code> call races every available engine in parallel inside the per-game
+        Durable Object, capped at <code>RACE_CEILING_MS=5000</code>. When the ceiling fires (or all
+        engines settle, whichever comes first) the DO picks a winner by a fixed precedence list —
+        the strongest engine that returned a legal move wins. Failed engines don't block the race,
+        and every engine's result is recorded in the move log so you can see who carried each move.
+      </p>
+      <p style="margin: 0 0 8px;">
+        Precedence (strongest → weakest):
+        <code>lichess-cloud-eval</code> →
+        <code>chess-api.com</code> →
+        <code>stockfish.online</code> →
+        <code>rapidapi-stockfish-16</code> →
+        <code>js-chess-engine</code> →
+        random legal move.
+        (<code>stockfish-container</code> sits between
+        <code>rapidapi-stockfish-16</code> and <code>js-chess-engine</code>
+        but its binding is currently dormant — see below.)
+      </p>
+
+      <h3 style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 16px 0 6px;">Engines we tried</h3>
+      <table>
+        <thead><tr><th>Engine</th><th>Status</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="mono">chess-api.com</td>
+            <td class="ok">Works</td>
+            <td>External wrapper around Stockfish 17. Strongest in the race when it responds in
+              time, but variable latency and the occasional flake mean we never trust it alone.</td>
+          </tr>
+          <tr>
+            <td class="mono">lichess-cloud-eval</td>
+            <td class="ok">Works (cache-only)</td>
+            <td>
+              <code>GET lichess.org/api/cloud-eval?fen=…&amp;multiPv=1</code>. Returns
+              community-cached Stockfish evaluations, typically at very deep nominal depths
+              (30&ndash;75+ ply). When it hits it's authoritative and wins the race; for most
+              non-opening positions it 404s silently and the next engine wins. No auth, free.
+            </td>
+          </tr>
+          <tr>
+            <td class="mono">stockfish.online</td>
+            <td class="ok">Works</td>
+            <td>
+              <code>GET stockfish.online/api/s/v2.php?fen=…&amp;depth=…</code> (max depth 15).
+              Free, no auth. Added as a second hosted Stockfish source so the bot keeps playing
+              real engine moves when <code>chess-api.com</code> rate-limits.
+            </td>
+          </tr>
+          <tr>
+            <td class="mono">rapidapi-stockfish-16</td>
+            <td class="ok">Works (when key bound)</td>
+            <td>
+              <code>POST chess-stockfish-16-api.p.rapidapi.com/chess/api</code>, form-urlencoded
+              <code>fen=…</code> body, <code>x-rapidapi-key</code> header. Server-side depth is
+              fixed at 12 (the depth param is ignored). Returns bestmove + ponder only —
+              no eval, no continuation. Gated on
+              <code>RAPIDAPI_STOCKFISH_KEY</code> being set; silently skipped otherwise.
+            </td>
+          </tr>
+          <tr>
+            <td class="mono">wasm-stockfish</td>
+            <td class="err">Dropped — doesn't fit</td>
+            <td>
+              <code>stockfish-18-lite-single</code> (~7&nbsp;MB binary) compiled to WASM, hosted in
+              a dedicated DO so OOMs couldn't take down anything else. Even with <code>Hash=1</code>,
+              <code>Threads=1</code>, <code>MultiPV=1</code>, <code>SyzygyPath=&lt;empty&gt;</code>,
+              <code>UCI_AnalyseMode=false</code>, the NNUE plus emscripten heap blew past the
+              128&nbsp;MB DO memory cap on every call; cold-init also tended to exceed the 30&nbsp;s
+              CPU budget. Removed from the race after it never produced a move in production.
+            </td>
+          </tr>
+          <tr>
+            <td class="mono">stockfish-container</td>
+            <td class="warn">Dormant — works, not worth the price</td>
+            <td>
+              Native <code>stockfish</code> in a Debian-slim container behind a small Node HTTP
+              server (<code>POST /bestmove</code>, <code>Hash=16</code>, single thread, movetime
+              clamped 50&ndash;2000&nbsp;ms). Wired through a Cloudflare Container Durable Object,
+              built locally with colima + binfmt for cross-arch (mac arm64 → cf amd64). We
+              deployed it once: warm latency ~350&nbsp;ms (beats chess-api.com), cold start ~9&nbsp;s.
+              Disabled because keeping a "lite" instance perpetually warm runs ~$245/mo —
+              roughly 40&times; what a $6/mo Linux VPS running the same server costs. Code stays in
+              the tree; uncomment the <code>[[containers]]</code> blocks in
+              <code>wrangler.toml</code> to re-enable.
+            </td>
+          </tr>
+          <tr>
+            <td class="mono">vps-stockfish</td>
+            <td class="muted">Planned</td>
+            <td>
+              The cheaper version of the container tier: a small Linux droplet running the same
+              <code>server.mjs</code> as a systemd unit, behind nginx + Let's Encrypt. Worker calls
+              over plain HTTPS. No cold starts, no per-second billing, no cross-arch build dance.
+            </td>
+          </tr>
+          <tr>
+            <td class="mono">js-chess-engine</td>
+            <td class="ok">Works (weak)</td>
+            <td>Pure-JS alpha-beta search, level 3, ~30&nbsp;KB. Always available inside the
+              isolate with zero cold-start cost. Plays at roughly beginner strength but never
+              times out.</td>
+          </tr>
+          <tr>
+            <td class="mono">random legal move</td>
+            <td class="warn">Used more than expected</td>
+            <td>Last-resort. In practice it ends up carrying a large share of moves whenever the
+              hosted Stockfish APIs are all throttling or timing out together and lichess-cloud
+              misses the position (everything past the opening book). When the bot picks a random
+              move it also sends an in-game chat saying so, so the opponent isn't left wondering.
+              See the "Engine usage" chart above for the current breakdown.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 16px 0 6px;">Platform constraints we hit</h3>
+      <ul style="padding-left: 22px; margin: 0;">
+        <li><strong>128&nbsp;MB DO memory cap.</strong> The single biggest constraint. Real
+          Stockfish (even the lite WASM build) plus NNUE plus the emscripten heap won't fit.</li>
+        <li><strong>30&nbsp;s DO CPU per request.</strong> Cold-init of a heavy WASM module can
+          eat most of it before the first <code>go movetime</code>.</li>
+        <li><strong>No runtime <code>WebAssembly.instantiate</code> of raw bytes.</strong> The WASM
+          binary has to be bundled as a <code>CompiledWasm</code> rule in
+          <code>wrangler.toml</code> and imported as a pre-compiled module.</li>
+        <li><strong>Docker required for container builds.</strong> <code>wrangler deploy</code>
+          shells out to <code>docker build</code> for any Cloudflare Container, so the container
+          tier is blocked on having Docker installed on whichever machine runs the deploy.</li>
+        <li><strong>Cron + DO alarms for scheduling.</strong> The bot polls BGA on a 5&nbsp;s
+          alarm loop inside its DO; a 1-minute Cron Trigger re-arms the alarm after deploys or
+          evictions so the bot never falls silent.</li>
+      </ul>
+
+      <h3 style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 16px 0 6px;">What this means for play strength</h3>
+      <p style="margin: 0 0 8px;">
+        On a good day chess-api.com or lichess-cloud responds first and the bot plays at roughly
+        Stockfish-17 strength. On a bad day (or when both are throttling) the move falls to
+        <code>js-chess-engine</code> at level 3, or all the way down to a random legal move when
+        even that misses the 5&nbsp;s ceiling. The bot is intentionally limited to friendly games
+        for exactly this reason.
+      </p>
+
+      <h3 style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 16px 0 6px;">Recent findings</h3>
+      <ul style="padding-left: 22px; margin: 0 0 8px;">
+        <li><strong>Per-FEN move cache.</strong> Each engine race result is stored against the
+          position's FEN inside the per-game DO. A later turn (in any game) that reaches the same
+          FEN reuses the cached move instead of racing again. Cached moves are still re-validated
+          against BGA's current legal-move table before being played, so a stale entry that no
+          longer fits (castling rights changed, etc.) silently falls through to a fresh race.</li>
+        <li><strong>BGA HTML lag handling.</strong> Right after the bot plays, BGA's table HTML
+          still reports the bot as the active player for a few hundred milliseconds. The dashboard
+          and the tick loop now flip the turn locally as soon as <code>selectCell</code> succeeds
+          and gate further engine work behind an <code>awaitingOppMove</code> flag, so the bot
+          doesn't try to "play again" against its own move.</li>
+        <li><strong>Chat is treated as untrusted input.</strong> The bot replies <code>"I'm not
+          sure."</code> to every opponent chat message. No language-model parsing, no command
+          handling — chat is purely an injection surface and is answered the same way every
+          time.</li>
+        <li><strong>Auto-concede on repeated table errors.</strong> If the same table errors out
+          three ticks in a row (HTML parse failure, repeated illegal-move rejection, etc.) the bot
+          concedes that game and moves on, so one broken table can't stall the whole loop.</li>
+        <li><strong>Stale invites get cleaned up.</strong> An open invite that BGA leaves stuck in
+          <code>setup</code> for over 15&nbsp;minutes is closed and re-created, so a peer that
+          accepted-then-vanished doesn't pin a slot forever.</li>
+        <li><strong>Finished-game reconciliation.</strong> BGA's <code>finished</code> list rolls
+          off quickly, so a memo whose game ended between ticks can disappear from both
+          <code>play</code> and <code>finished</code>. The bot looks each missing memo up by id
+          (<code>tableinfos.html?id=…</code>) and only marks it finished after three consecutive
+          misses, so a transient indexing gap doesn't drop the game from stats.</li>
+        <li><strong>Realtime friendly-mode quirk.</strong> Setting BGA option 201 directly to
+          <code>1</code> on a freshly-created realtime table demotes it back to async. Toggling
+          <code>0&nbsp;→&nbsp;1</code> instead preserves the realtime flag — that's now the order
+          the bot uses when accepting a friendly invite.</li>
+        <li><strong>Opponent inactivity detection.</strong> On realtime tables the bot watches
+          BGA's per-player chess clock (<code>reflexion.total</code>); if the opponent overdraws
+          and goes negative without playing, the bot concedes politely rather than spinning until
+          a flag fall the server never reports.</li>
+      </ul>
+    </div>
+  </details>
+  <details style="margin-top: 8px;">
+    <summary style="cursor: pointer; color: var(--accent); font-size: 13px;">Recent errors</summary>
+    <div id="errors" class="muted" style="margin-top: 12px;">…</div>
+  </details>
 
   <footer>
-    Worker + Durable Objects on Cloudflare. Engine fallback chain: chess-api.com → bundled WASM Stockfish → random legal move.
+    Worker + Durable Objects on Cloudflare. Parallel engine race: lichess-cloud-eval · chess-api.com · stockfish.online · rapidapi-stockfish-16 · stockfish-container · js-chess-engine (local DO) · random legal move.
   </footer>
 </main>
 <script>
@@ -259,6 +544,12 @@ const fmtTime = (ts) => {
   if (ago < 3600) return Math.round(ago/60) + "m ago";
   if (ago < 86400) return Math.round(ago/3600) + "h ago";
   return d.toLocaleDateString();
+};
+const fmtUtc = (ts) => {
+  if (!ts) return "never";
+  const d = new Date(ts);
+  // ISO without milliseconds, with a trailing " UTC" so it's unambiguous.
+  return d.toISOString().replace(/\\.\\d{3}Z$/, "Z") + " UTC";
 };
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -276,34 +567,80 @@ async function load() {
 }
 
 function render(s) {
+  window.__lastStatus = s;
+  syncGamesModeButtons();
   const stateEl = document.getElementById("state");
   stateEl.textContent = s.running ? (s.loggedIn ? "running" : "running (not logged in)") : "stopped";
   stateEl.className = "pill " + (s.running && s.loggedIn ? "ok" : "warn");
-  document.getElementById("ticked").textContent = "last tick: " + fmtTime(s.lastTickAt);
+  document.getElementById("ticked").textContent = "last tick: " + fmtUtc(s.lastTickAt);
 
   const st = s.stats || { wins: 0, losses: 0, draws: 0, concedes: 0, engineUses: {} };
-  const liveTables = Object.values(s.tables || {}).filter(t => !t.finished).length;
+  // "Total" = lifetime BGA-scored games (wins+losses+draws) plus games
+  // currently being played. Concedes are intentionally excluded — they're
+  // mostly error states and abandoned/never-started tables that aren't
+  // really a meaningful "game played" signal.
+  // "Live" = tables BGA's lobby reports as play/asyncplay (opponent
+  // seated, moves being exchanged). Open invites and tables mid-cleanup
+  // are intentionally excluded — they aren't "games" yet.
+  const liveTables = liveGameIds(s).live.length;
+  const pastGames = (st.wins || 0) + (st.losses || 0) + (st.draws || 0);
+  const totalGames = pastGames + liveTables;
+  const winPct = pastGames > 0
+    ? "(" + Math.round((st.wins || 0) * 100 / pastGames) + "%)"
+    : null;
   document.getElementById("stats").innerHTML = [
+    card("Total games", totalGames),
     card("Live games", liveTables),
-    card("Wins", st.wins, "ok"),
-    card("Losses", st.losses),
-    card("Draws", st.draws),
-    card("Concedes", st.concedes, st.concedes > 0 ? "warn" : ""),
+    card("Wins", st.wins, "ok", winPct),
+    card("Losses", st.losses, "err"),
+    card("Draws", st.draws, "draw"),
   ].join("");
 
   document.getElementById("invites").innerHTML = renderInvites(s.openInvites);
-  document.getElementById("games").innerHTML = renderGames(s);
+  // Only repaint the games section if the new snapshot would render
+  // something. If a tick momentarily yields no live games (BGA flake,
+  // reconcile miss) we leave the prior gallery in place rather than
+  // flashing "no live games" between ticks. The placeholder "…" is
+  // treated as empty so the very first load still paints.
+  const gamesEl = document.getElementById("games");
+  const newGamesHtml = renderGames(s);
+  const newGamesHasContent = liveGameIds(s).live.length > 0;
+  const oldGamesIsPlaceholder = gamesEl.textContent.trim() === "…"
+    || gamesEl.textContent.trim() === "no live games";
+  if (newGamesHasContent || oldGamesIsPlaceholder) {
+    gamesEl.innerHTML = newGamesHtml;
+  }
   document.getElementById("moves").innerHTML = renderMoves(s.recentMoves);
+  document.getElementById("results").innerHTML = renderResults(s.recentResults);
   document.getElementById("engines").innerHTML = renderEngines(st.engineUses);
   document.getElementById("errors").innerHTML = renderErrors(s.recentErrors);
 }
 
-function card(label, val, cls) {
-  return '<div class="card"><div class="label">' + esc(label) + '</div><div class="val ' + (cls||'') + '">' + esc(val) + '</div></div>';
+function card(label, val, cls, suffix) {
+  const sub = suffix
+    ? ' <span class="muted" style="font-size: 13px; font-weight: 400;">' + esc(suffix) + '</span>'
+    : '';
+  return '<div class="card"><div class="label">' + esc(label) + '</div><div class="val ' + (cls||'') + '">' + esc(val) + sub + '</div></div>';
 }
 
-function tableLink(id) {
-  return '<a href="https://boardgamearena.com/table?table=' + encodeURIComponent(id) + '" target="_blank" class="mono">' + esc(id) + '</a>';
+// BGA's actual game URL is /<gameserver>/<gamename>?table=<id> — the
+// gameserver number is per-table and the bot DO captures it on the
+// first live-play tick (see bot-do.ts:resolveGameserver). When we don't
+// know it yet (very fresh table, or older error/move records that
+// outlived the memo), fall back to /table?table=<id>; BGA will bounce
+// you to the player-view page from there.
+function bgaUrl(id, gameserver) {
+  if (gameserver != null) {
+    return 'https://boardgamearena.com/' + encodeURIComponent(gameserver) + '/chess?table=' + encodeURIComponent(id);
+  }
+  return 'https://boardgamearena.com/table?table=' + encodeURIComponent(id);
+}
+
+function tableLink(id, gameserver) {
+  if (gameserver == null && window.__lastStatus) {
+    gameserver = window.__lastStatus.tables?.[id]?.gameserver;
+  }
+  return '<a href="' + bgaUrl(id, gameserver) + '" target="_blank" class="mono">' + esc(id) + '</a>';
 }
 
 function renderInvites(invites) {
@@ -316,56 +653,526 @@ function renderInvites(invites) {
   return '<table><thead><tr><th>Mode</th><th>Table</th><th>Created</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
-function renderGames(s) {
+function liveGameIds(s) {
   const memo = s.tables || {};
   const seen = new Map((s.lastTablesSeen || []).map(t => [t.id, t]));
   const ids = Array.from(new Set([...Object.keys(memo), ...seen.keys()]));
+  // Live = actually being played. Open invites (status: open/asyncopen/
+  // setup/init) live in the "Open invites" section instead.
   const live = ids.filter(id => {
     const m = memo[id] || {};
     if (m.finished || m.conceded) return false;
     const t = seen.get(id);
-    return t && t.status !== "finished" && t.status !== "asyncfinished";
+    if (!t) return false;
+    return t.status === "play" || t.status === "asyncplay";
   });
-  if (live.length === 0) return "<span class='muted'>no live games</span>";
+  // Most-recently-started first.
+  live.sort((a, b) => (memo[b]?.startedAt || 0) - (memo[a]?.startedAt || 0));
+  return { live, memo, seen };
+}
+
+// Page size by view: gallery is image-heavy so fewer per page; table is
+// dense so more fit comfortably without scroll fatigue.
+const GAMES_PAGE_SIZE = { gallery: 8, table: 20 };
+const MOVES_PAGE_SIZE = 10;
+const ERRORS_PAGE_SIZE = 10;
+const RESULTS_PAGE_SIZE = 10;
+const MOVES_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+let gamesPage = 1, movesPage = 1, errorsPage = 1, resultsPage = 1;
+function setGamesPage(p) {
+  gamesPage = Math.max(1, p | 0);
+  if (window.__lastStatus) document.getElementById("games").innerHTML = renderGames(window.__lastStatus);
+}
+function setMovesPage(p) {
+  movesPage = Math.max(1, p | 0);
+  if (window.__lastStatus) document.getElementById("moves").innerHTML = renderMoves(window.__lastStatus.recentMoves);
+}
+function setErrorsPage(p) {
+  errorsPage = Math.max(1, p | 0);
+  if (window.__lastStatus) document.getElementById("errors").innerHTML = renderErrors(window.__lastStatus.recentErrors);
+}
+function setResultsPage(p) {
+  resultsPage = Math.max(1, p | 0);
+  if (window.__lastStatus) document.getElementById("results").innerHTML = renderResults(window.__lastStatus.recentResults);
+}
+
+function renderGames(s) {
+  const mode = gamesMode();
+  return mode === "table" ? renderGamesTable(s) : renderGamesGallery(s);
+}
+
+// Generic pager. getter is a global function name (e.g. "setGamesPage")
+// taking a 1-based page index. noun is the unit (games / moves / errors).
+function pager(total, perPage, curPage, getter, noun) {
+  if (total <= perPage) return "";
+  const pages = Math.ceil(total / perPage);
+  if (curPage > pages) curPage = pages;
+  const btn = (p, label, disabled) => disabled
+    ? '<span class="pill muted">' + label + '</span>'
+    : '<a href="javascript:' + getter + '(' + p + ')" class="pill' + (p === curPage ? ' btn on' : '') + '">' + label + '</a>';
+  const parts = [btn(curPage - 1, "‹ prev", curPage === 1)];
+  const wnd = 2;
+  const lo = Math.max(2, curPage - wnd);
+  const hi = Math.min(pages - 1, curPage + wnd);
+  parts.push(btn(1, "1"));
+  if (lo > 2) parts.push('<span class="muted">…</span>');
+  for (let p = lo; p <= hi; p++) parts.push(btn(p, String(p)));
+  if (hi < pages - 1) parts.push('<span class="muted">…</span>');
+  if (pages > 1) parts.push(btn(pages, String(pages)));
+  parts.push(btn(curPage + 1, "next ›", curPage === pages));
+  return '<div class="row" style="margin-top: 12px; gap: 4px;">'
+    + parts.join("")
+    + '<span class="muted" style="margin-left: 8px; font-size: 11px;">'
+    + total + ' ' + noun + ' · page ' + curPage + '/' + pages + '</span>'
+    + '</div>';
+}
+
+function paginate(arr, perPage, curPage) {
+  const pages = Math.max(1, Math.ceil(arr.length / perPage));
+  const cur = Math.min(curPage, pages);
+  const start = (cur - 1) * perPage;
+  return arr.slice(start, start + perPage);
+}
+
+function renderGamesTable(s) {
+  const { live: all, memo, seen } = liveGameIds(s);
+  if (all.length === 0) return "<span class='muted'>no live games</span>";
+  const perPage = GAMES_PAGE_SIZE.table;
+  const live = paginate(all, perPage, gamesPage);
+  const movesByTable = new Map();
+  for (const mv of s.recentMoves || []) {
+    if (!movesByTable.has(mv.tableId)) movesByTable.set(mv.tableId, []);
+    movesByTable.get(mv.tableId).push(mv);
+  }
   const rows = live.map(id => {
     const m = memo[id] || {};
     const t = seen.get(id) || {};
-    const tags = [];
-    if (m.saidHi) tags.push("opened");
-    if (m.gameserver != null) tags.push("gs:" + m.gameserver);
-    if (m.errorCount) tags.push("<span class='warn'>errors:" + m.errorCount + "</span>");
-    return '<tr><td>' + tableLink(id) + '</td><td>' + esc(t.status || "?") + '</td><td class="muted">' + tags.join(" · ") + '</td></tr>';
+    const clocks = clocksHtml(m, m.oppName);
+    const lastMove = (m.lastMoveFrom && m.lastMoveTo)
+      ? '<span class="mono">' + esc(m.lastMoveFrom) + esc(m.lastMoveTo) + '</span>'
+      : '<span class="muted">—</span>';
+    const ev = evalPill(m.lastEval);
+    const hist = historyLine(movesByTable.get(id) || []);
+    const histCell = hist
+      ? '<span class="mono muted" style="font-size: 11px;">' + hist + '</span>'
+      : '<span class="muted">—</span>';
+    const started = m.startedAt ? fmtTime(m.startedAt) : '<span class="muted">—</span>';
+    const errBadge = m.errorCount ? ' <span class="warn">·err' + m.errorCount + '</span>' : "";
+    return '<tr>'
+      + '<td>' + tableLink(id) + '</td>'
+      + '<td>' + clocks + '</td>'
+      + '<td>' + lastMove + '</td>'
+      + '<td>' + ev + '</td>'
+      + '<td>' + histCell + '</td>'
+      + '<td class="muted">' + started + errBadge + '</td>'
+      + '</tr>';
   }).join("");
-  return '<table><thead><tr><th>Table</th><th>Status</th><th>State</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  return '<table><thead><tr>'
+    + '<th>Table</th><th>Players (👉 = to move)</th><th>Last</th><th>Eval</th><th>Recent</th><th>Started</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + pager(all.length, perPage, gamesPage, "setGamesPage", "games");
+}
+
+function renderGamesGallery(s) {
+  const { live: all, memo, seen } = liveGameIds(s);
+  if (all.length === 0) return "<span class='muted'>no live games</span>";
+  const perPage = GAMES_PAGE_SIZE.gallery;
+  const live = paginate(all, perPage, gamesPage);
+  const movesByTable = new Map();
+  for (const mv of s.recentMoves || []) {
+    if (!movesByTable.has(mv.tableId)) movesByTable.set(mv.tableId, []);
+    movesByTable.get(mv.tableId).push(mv);
+  }
+  const cards = live.map(id => {
+    const m = memo[id] || {};
+    const t = seen.get(id) || {};
+    const url = bgaUrl(id, m.gameserver);
+    const board = boardHtml(m.lastBoardFen, m.lastMoveFrom, m.lastMoveTo);
+    const ev = evalPill(m.lastEval);
+    const clocks = clocksHtml(m, m.oppName);
+    const hist = historyLine(movesByTable.get(id) || []);
+    const lastMv = (m.lastMoveFrom && m.lastMoveTo)
+      ? '<span class="mono muted" style="font-size: 11px;">last: ' + esc(m.lastMoveFrom) + esc(m.lastMoveTo) + '</span>'
+      : '';
+    return '<a class="gcard" href="' + url + '" target="_blank" rel="noopener" title="' + esc(id) + ' · ' + esc(t.status || "?") + '">'
+      + board
+      + '<div class="gmeta">'
+      +   lastMv
+      +   '<span class="grow"></span>'
+      +   ev
+      + '</div>'
+      + clocks
+      + (hist ? '<div class="ghist">' + hist + '</div>' : '')
+      + '<div class="gmeta">'
+      +   '<span class="mono muted grow">' + esc(id) + '</span>'
+      +   '<span class="muted">' + (m.startedAt ? fmtTime(m.startedAt) : "—") + '</span>'
+      + '</div>'
+      + '</a>';
+  }).join("");
+  return '<div class="gallery">' + cards + '</div>' + pager(all.length, perPage, gamesPage, "setGamesPage", "games");
+}
+
+function fmtClock(secs) {
+  if (secs == null || !Number.isFinite(secs)) return "—";
+  const sign = secs < 0 ? "-" : "";
+  const s = Math.abs(Math.round(secs));
+  if (s >= 86400) {
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    return sign + d + "d" + (h ? " " + h + "h" : "");
+  }
+  if (s >= 3600) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return sign + h + "h" + String(m).padStart(2, "0");
+  }
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return sign + m + ":" + String(r).padStart(2, "0");
+}
+
+// Time spent on the clock = start − current. start is captured the first
+// non-null tick we see, so it converges to BGA's initial reflexion within
+// one observation. Returns null if we don't have both values yet.
+function spentSecs(start, current) {
+  if (start == null || current == null) return null;
+  const s = start - current;
+  return s >= 0 ? s : 0;
+}
+
+function fmtSpent(s) {
+  if (s == null || !Number.isFinite(s)) return "—";
+  const n = Math.max(0, Math.round(s));
+  if (n < 60) return n + "s";
+  if (n < 3600) return Math.floor(n / 60) + "m" + String(n % 60).padStart(2, "0");
+  if (n < 86400) {
+    const h = Math.floor(n / 3600);
+    const m = Math.floor((n % 3600) / 60);
+    return h + "h" + (m ? String(m).padStart(2, "0") : "");
+  }
+  const d = Math.floor(n / 86400);
+  const h = Math.floor((n % 86400) / 3600);
+  return d + "d" + (h ? h + "h" : "");
+}
+
+// One side's row: a 👉 marker for the active player, color-block (which
+// colour they play), label (bot / opp name), time spent, and a
+// low-clock warning if applicable. The "bot" row is visually distinct
+// (accent stripe + tinted background) so it's obvious at a glance which
+// colour the bot is playing.
+function sideLine(opts) {
+  // opts: { isBot, color, label, spent, remaining, isLive }
+  const color = opts.color === "black" ? "black" : "white";
+  const glyph = color === "white" ? "♔" : "♚";
+  const glyphCls = color === "white" ? "glyph-w" : "glyph-b";
+  const colorTitle = color === "white" ? "White" : "Black";
+  const lowTag = (opts.remaining != null && opts.remaining < 60)
+    ? '<span class="lowtag">' + fmtClock(opts.remaining) + ' left</span>'
+    : "";
+  const lineCls = "sideline" + (opts.isBot ? " bot" : " opp");
+  const activeMarker = opts.isLive
+    ? '<span class="active-mark" title="to move">👉</span>'
+    : '<span class="active-mark-gap"></span>';
+  return '<div class="' + lineCls + '">'
+    + activeMarker
+    + '<span class="' + glyphCls + '" title="' + colorTitle + '">' + glyph + '</span>'
+    + '<span class="namechip">' + esc(opts.label) + '</span>'
+    + '<span class="grow" style="flex:1"></span>'
+    + '<span class="spent">' + fmtSpent(opts.spent) + '</span>'
+    + lowTag
+    + '</div>';
+}
+
+function clocksHtml(m, oppName) {
+  const botLive = m.lastTurn === "bot";
+  const oppLive = m.lastTurn === "opp";
+  const botColor = m.botColor || "white";
+  const oppColor = botColor === "black" ? "white" : "black";
+  const botSpent = spentSecs(m.botClockStart, m.botClock);
+  const oppSpent = spentSecs(m.oppClockStart, m.oppClock);
+  const bot = sideLine({
+    isBot: true, color: botColor, label: "bot_stockfish",
+    spent: botSpent, remaining: m.botClock, isLive: botLive,
+  });
+  const opp = sideLine({
+    isBot: false, color: oppColor, label: oppName || "opponent",
+    spent: oppSpent, remaining: m.oppClock, isLive: oppLive,
+  });
+  // White always on top to match the board's natural orientation, no
+  // matter which side the bot is on.
+  const top = botColor === "white" ? bot : opp;
+  const bottom = botColor === "white" ? opp : bot;
+  return '<div class="sidestack">' + top + bottom + '</div>';
+}
+
+function historyLine(moves) {
+  if (!moves || moves.length === 0) return "";
+  // moves are appended in time order; take the last 5 bot moves we logged.
+  const last = moves.slice(-5);
+  return last.map(mv => esc(mv.from) + esc(mv.to)).join(" · ");
+}
+
+// Unicode chess piece glyphs (filled, used for both colors; CSS recolors via
+// the .pw / .pb spans so contrast on the wood-tone squares stays readable).
+const PIECE_GLYPH = { k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟" };
+function sqToRF(sq) {
+  if (!sq || sq.length < 2) return null;
+  const f = sq.charCodeAt(0) - 97;
+  const r = 8 - Number(sq[1]);
+  if (f < 0 || f > 7 || r < 0 || r > 7) return null;
+  return { r, f };
+}
+function boardHtml(fen, fromSq, toSq) {
+  const placement = (fen || "").split(" ")[0] || "";
+  const from = sqToRF(fromSq);
+  const to = sqToRF(toSq);
+  // Expand FEN rows ("rnbqkbnr/...") into 64 cells (rank 8 first).
+  const cells = [];
+  const rows = placement.split("/");
+  for (let r = 0; r < 8; r++) {
+    const row = rows[r] || "";
+    const expanded = [];
+    for (const ch of row) {
+      if (/[1-8]/.test(ch)) for (let i = 0; i < Number(ch); i++) expanded.push(null);
+      else expanded.push(ch);
+    }
+    while (expanded.length < 8) expanded.push(null);
+    for (let f = 0; f < 8; f++) {
+      const isLight = (r + f) % 2 === 0;
+      const piece = expanded[f];
+      let glyph = "";
+      if (piece) {
+        const isWhite = piece === piece.toUpperCase();
+        const g = PIECE_GLYPH[piece.toLowerCase()] || "";
+        glyph = '<span class="' + (isWhite ? "pw" : "pb") + '">' + g + '</span>';
+      }
+      const lm = (from && from.r === r && from.f === f) || (to && to.r === r && to.f === f);
+      cells.push('<div class="gsq ' + (isLight ? "l" : "d") + (lm ? " lm" : "") + '">' + glyph + '</div>');
+    }
+  }
+  return '<div class="gboard">' + cells.join("") + '</div>';
+}
+
+function evalPill(ev) {
+  if (!ev) return '<span class="muted">?</span>';
+  if (ev.mate != null && ev.mate !== 0) {
+    const cls = ev.mate > 0 ? "plus" : "minus";
+    return '<span class="gev ' + cls + '">M' + Math.abs(ev.mate) + '</span>';
+  }
+  if (ev.cp == null) return '<span class="muted">?</span>';
+  const cp = Number(ev.cp);
+  const cls = cp > 0.2 ? "plus" : (cp < -0.2 ? "minus" : "even");
+  const sign = cp > 0 ? "+" : "";
+  return '<span class="gev ' + cls + '">' + sign + cp.toFixed(1) + '</span>';
+}
+
+function gamesMode() {
+  try {
+    const v = localStorage.getItem("gamesMode");
+    // legacy: "minimal" was the old name for "table"
+    if (v === "minimal") return "table";
+    return v === "table" ? "table" : "gallery";
+  } catch (e) { return "gallery"; }
+}
+function setGamesMode(mode) {
+  try { localStorage.setItem("gamesMode", mode); } catch (e) {}
+  gamesPage = 1;
+  syncGamesModeButtons();
+  // Re-render from the most recent payload if we have it; otherwise just
+  // refresh from the server.
+  if (window.__lastStatus) document.getElementById("games").innerHTML = renderGames(window.__lastStatus);
+  else load();
+}
+function syncGamesModeButtons() {
+  const mode = gamesMode();
+  const tbl = document.getElementById("gmode-table");
+  const gal = document.getElementById("gmode-gallery");
+  if (tbl) tbl.classList.toggle("on", mode === "table");
+  if (gal) gal.classList.toggle("on", mode === "gallery");
+}
+
+// Engines we care about as columns, in precedence order. wasm-stockfish was
+// dropped from the race after exhausting the 128MB DO budget on every call.
+const MOVE_ENGINE_COLUMNS = [
+  "lichess-cloud-eval",
+  "chess-api.com",
+  "stockfish.online",
+  "rapidapi-stockfish-16",
+  "stockfish-container",
+  "js-chess-engine (local DO)",
+];
+
+const ENGINE_LABELS = {
+  "lichess-cloud-eval": "lichess",
+  "rapidapi-stockfish-16": "rapidapi",
+  "js-chess-engine (local DO)": "local chess.js",
+};
+function shortEngine(e) {
+  return ENGINE_LABELS[e] || e.replace(/\\s*\\(.*\\)\\s*$/, "");
 }
 
 function renderMoves(moves) {
   if (!moves || moves.length === 0) return "<span class='muted'>no moves yet</span>";
-  const rows = moves.slice().reverse().slice(0, 20).map(m => {
-    return '<tr><td class="muted">' + fmtTime(m.ts) + '</td><td>' + tableLink(m.tableId) + '</td><td class="mono">' + esc(m.from) + ' → ' + esc(m.to) + '</td><td class="muted">' + esc(m.engine) + '</td></tr>';
+  // Drop moves older than 24h; keep newest first.
+  const cutoff = Date.now() - MOVES_MAX_AGE_MS;
+  const all = moves.slice().reverse().filter(m => (m.ts || 0) >= cutoff);
+  if (all.length === 0) return "<span class='muted'>no moves in the last 24h</span>";
+  const recent = paginate(all, MOVES_PAGE_SIZE, movesPage);
+  // Only show columns for engines we actually observed in this window.
+  const seen = new Set();
+  recent.forEach(m => (m.engineResults || []).forEach(r => seen.add(r.engine)));
+  const cols = MOVE_ENGINE_COLUMNS.filter(e => seen.has(e));
+  const headers = cols.map(e =>
+    '<th class="mono" title="' + esc(e) + '">' + esc(shortEngine(e)) + '</th>'
+  ).join("");
+  const legend = '<div class="legend">'
+    + '<span class="sw winner">👉 e2e4</span> chosen move · '
+    + '<span class="sw">⊘ <span class="rejected">e2e4</span></span> engine move BGA refused · '
+    + 'bot fails over left-to-right until a move is accepted, then a random valid move.'
+    + '</div>';
+  const rows = recent.map(m => {
+    const byEngine = new Map((m.engineResults || []).map(r => [r.engine, r]));
+    // Race winner = leftmost (highest-precedence) engine that returned a non-error move.
+    let raceWinner = null;
+    for (const e of cols) {
+      const r = byEngine.get(e);
+      if (r && !r.error && r.move) { raceWinner = e; break; }
+    }
+    const chosenIsListed = cols.includes(m.engine);
+    const fellThrough = chosenIsListed && raceWinner && raceWinner !== m.engine;
+    const cells = cols.map(e => {
+      const r = byEngine.get(e);
+      const isChosen = m.engine === e;
+      const isRejectedWinner = fellThrough && e === raceWinner;
+      return renderEngineCell(r, isChosen, isRejectedWinner);
+    });
+    const movePill = m.engine === "random-fallback"
+      ? ' <span class="pill warn" title="no engine produced a usable move">random</span>'
+      : (fellThrough ? ' <span class="pill warn" title="fell through left-to-right">fellthrough</span>' : "");
+    return '<tr>'
+      + '<td class="muted">' + fmtTime(m.ts) + '</td>'
+      + '<td>' + tableLink(m.tableId) + '</td>'
+      + '<td class="mono">' + esc(m.from) + ' → ' + esc(m.to) + movePill + '</td>'
+      + cells.join("")
+      + '</tr>';
   }).join("");
-  return '<table><thead><tr><th>When</th><th>Table</th><th>Move</th><th>Engine</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  return legend
+    + '<table><thead><tr>'
+    + '<th>When</th><th>Table</th><th>Move</th>' + headers
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + pager(all.length, MOVES_PAGE_SIZE, movesPage, "setMovesPage", "moves (24h)");
 }
+
+function renderResults(results) {
+  if (!results || results.length === 0) {
+    return "<span class='muted'>no finished games yet</span>";
+  }
+  // Newest first, paginated. Concedes never enter this list - they are
+  // logged separately via bot:concede console lines (see concedeTable in
+  // bot-do.ts).
+  const all = results.slice().reverse();
+  const page = paginate(all, RESULTS_PAGE_SIZE, resultsPage);
+  const rows = page.map(r => {
+    const tallyClass = r.tally === "win" ? "ok"
+      : r.tally === "loss" ? "err"
+      : r.tally === "draw" ? "" : "warn";
+    const tallyLabel = r.tally === "none"
+      ? '<span class="pill warn" title="parsedScore did not match 0 / 0.5 / 1">uncounted</span>'
+      : '<span class="pill ' + tallyClass + '">' + esc(r.tally) + '</span>';
+    return '<tr>'
+      + '<td class="muted">' + fmtTime(r.ts) + '</td>'
+      + '<td>' + tableLink(r.tableId) + '</td>'
+      + '<td class="mono">' + esc(r.status) + '</td>'
+      + '<td class="mono">' + (r.rawScore == null ? '<span class="muted">null</span>' : esc(r.rawScore)) + '</td>'
+      + '<td class="mono">' + (r.parsedScore == null ? '<span class="muted">null</span>' : esc(r.parsedScore)) + '</td>'
+      + '<td>' + tallyLabel + '</td>'
+      + '</tr>';
+  }).join("");
+  return '<table><thead><tr>'
+    + '<th>When</th><th>Table</th><th>Status</th><th>Raw score</th><th>Parsed</th><th>Tally</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + pager(all.length, RESULTS_PAGE_SIZE, resultsPage, "setResultsPage", "games");
+}
+
+function renderEngineCell(r, isChosen, isRejectedWinner) {
+  if (!r) return '<td class="muted">—</td>';
+  if (r.error) {
+    return '<td class="err" title="' + esc(r.error) + '">fail <span class="muted">' + r.ms + 'ms</span></td>';
+  }
+  if (!r.move) return '<td class="muted">no move</td>';
+  if (isChosen) {
+    return '<td><span class="winner mono">👉 ' + esc(r.move) + '</span>'
+      + ' <span class="muted">' + r.ms + 'ms</span></td>';
+  }
+  if (isRejectedWinner) {
+    return '<td title="BGA refused this move; bot fell through to the next engine"><span class="mono">⊘ </span>'
+      + '<span class="mono rejected">' + esc(r.move) + '</span>'
+      + ' <span class="muted">' + r.ms + 'ms</span></td>';
+  }
+  return '<td class="muted"><span class="mono">' + esc(r.move) + '</span>'
+    + ' <span class="muted">' + r.ms + 'ms</span></td>';
+}
+
+// Colors chosen to stay legible on both light + dark backgrounds and to
+// echo the wood / accent palette already on the page.
+const PIE_COLORS = [
+  "#b85c38", "#5b8a72", "#8a6fb0", "#c9a23a", "#3a7ca5",
+  "#a8554a", "#6f8a4a", "#5e4a8a", "#b07f3f", "#4a8a8a",
+];
 
 function renderEngines(uses) {
   const entries = Object.entries(uses || {});
   if (entries.length === 0) return "<span class='muted'>no engine calls yet</span>";
   entries.sort((a, b) => b[1] - a[1]);
   const total = entries.reduce((s, [, n]) => s + n, 0);
-  const rows = entries.map(([k, n]) => {
-    const pct = total > 0 ? Math.round(100 * n / total) : 0;
-    return '<tr><td class="mono">' + esc(k) + '</td><td class="right">' + esc(n) + '</td><td class="right muted">' + pct + '%</td></tr>';
+  if (total === 0) return "<span class='muted'>no engine calls yet</span>";
+  const cx = 100, cy = 100, r = 95;
+  let angle = -Math.PI / 2;
+  const paths = entries.map(([k, n], i) => {
+    const frac = n / total;
+    const a0 = angle;
+    const a1 = angle + frac * Math.PI * 2;
+    angle = a1;
+    const color = PIE_COLORS[i % PIE_COLORS.length];
+    // Edge case: single 100% slice can't be drawn as an arc — use a circle.
+    if (frac >= 0.9999) {
+      return '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '"><title>' + esc(k) + ' · ' + n + ' · 100%</title></circle>';
+    }
+    const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+    const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+    const largeArc = (a1 - a0) > Math.PI ? 1 : 0;
+    const d = "M " + cx + " " + cy
+      + " L " + x0.toFixed(2) + " " + y0.toFixed(2)
+      + " A " + r + " " + r + " 0 " + largeArc + " 1 " + x1.toFixed(2) + " " + y1.toFixed(2)
+      + " Z";
+    const pct = (100 * frac).toFixed(1);
+    return '<path d="' + d + '" fill="' + color + '"><title>' + esc(k) + ' · ' + n + ' · ' + pct + '%</title></path>';
   }).join("");
-  return '<table><thead><tr><th>Engine</th><th class="right">Moves</th><th class="right">Share</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  const legend = entries.map(([k, n], i) => {
+    const pct = (100 * n / total).toFixed(1);
+    const moves = n === 1 ? "1 move" : esc(n) + " moves";
+    return '<tr>'
+      + '<td><span class="pie-sw" style="background:' + PIE_COLORS[i % PIE_COLORS.length] + '"></span><span class="mono">' + esc(k) + '</span></td>'
+      + '<td class="right">' + moves + '</td>'
+      + '<td class="right muted">' + pct + '%</td>'
+      + '</tr>';
+  }).join("");
+  return '<div class="pie-wrap">'
+    + '<svg class="pie-svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="engine usage pie chart">' + paths + '</svg>'
+    + '<div class="pie-legend"><table><tbody>' + legend + '</tbody></table></div>'
+    + '</div>';
 }
 
 function renderErrors(errors) {
   if (!errors || errors.length === 0) return "<span class='muted'>no recent errors</span>";
-  const rows = errors.slice().reverse().slice(0, 20).map(e => {
+  const all = errors.slice().reverse();
+  const page = paginate(all, ERRORS_PAGE_SIZE, errorsPage);
+  const rows = page.map(e => {
     const tcell = e.tableId ? tableLink(e.tableId) : '<span class="muted">—</span>';
     return '<tr><td class="muted">' + fmtTime(e.ts) + '</td><td class="mono">' + esc(e.scope) + '</td><td>' + tcell + '</td><td class="mono err">' + esc(e.msg) + '</td></tr>';
   }).join("");
-  return '<table><thead><tr><th>When</th><th>Scope</th><th>Table</th><th>Message</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  return '<table><thead><tr><th>When</th><th>Scope</th><th>Table</th><th>Message</th></tr></thead><tbody>' + rows + '</tbody></table>'
+    + pager(all.length, ERRORS_PAGE_SIZE, errorsPage, "setErrorsPage", "errors");
 }
 
 load();

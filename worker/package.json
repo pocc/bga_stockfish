@@ -21,6 +21,8 @@
     "wrangler": "^4.63.0"
   },
   "dependencies": {
-    "chess.js": "^1.4.0"
+    "@cloudflare/containers": "^0.3.4",
+    "chess.js": "^1.4.0",
+    "js-chess-engine": "^2.4.6"
   }
 }

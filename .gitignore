@@ -27,3 +27,9 @@ build/
 .DS_Store
 .idea/
 .vscode/
+
+# Local agent state (Claude Code worktrees + per-machine settings)
+.claude/
+
+# Editor backups
+*.bak
