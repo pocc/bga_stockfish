@@ -169,9 +169,11 @@ export default {
    */
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     const stub = botStub(env);
-    // /start is idempotent; it ensures running=true and arms the alarm.
-    await stub.fetch("https://do/start", { method: "POST" });
-    await stub.fetch("https://do/tick");
+    // Single watchdog call: re-arms the alarm chain and runs one tick, but
+    // honors an operator pause (/bot/stop). Poking /start here instead would
+    // override a deliberate stop within ~60s, so the bot could never be
+    // paused. A fresh deploy has paused=false, so auto-start still works.
+    await stub.fetch("https://do/watchdog", { method: "POST" });
   },
 };
 
@@ -344,14 +346,24 @@ function landingHtml(): string {
   <p class="sub">Autonomous chess bot on <a href="https://boardgamearena.com" target="_blank" rel="noopener">Board Game Arena</a>. Friendly games only. <span id="ticked" class="muted"></span></p>
 
   <h2>Stats</h2>
+  <div class="row" id="diff-tabs" style="margin: 0 0 10px; gap: 6px;">
+    <span id="diff-all" class="pill btn" onclick="setDiff('all')">All</span>
+    <span id="diff-grandmaster" class="pill btn on" onclick="setDiff('grandmaster')" title="Default difficulty">Grandmaster (Stockfish)*</span>
+    <span id="diff-expert" class="pill btn" onclick="setDiff('expert')">Expert</span>
+    <span id="diff-advanced" class="pill btn" onclick="setDiff('advanced')">Advanced</span>
+    <span id="diff-intermediate" class="pill btn" onclick="setDiff('intermediate')">Intermediate</span>
+    <span id="diff-easy" class="pill btn" onclick="setDiff('easy')">Easy</span>
+    <span id="diff-beginner" class="pill btn" onclick="setDiff('beginner')">Beginner</span>
+  </div>
   <div class="cards" id="stats"></div>
+  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">* default difficulty</p>
 
   <h2>Bot rules</h2>
   <ul style="padding-left: 22px; margin: 0; font-size: 13px;">
     <li>Friendly games only. Ranked invites declined.</li>
     <li>Maintains one open invite per gamemode (realtime + turn-based).</li>
     <li>Always accepts draw offers and collective-abandon proposals.</li>
-    <li>Default strength is gamemode-dependent: <span class="mono">expert</span> (~1800, instant local engine) for realtime, full <span class="mono">grandmaster</span> Stockfish for turn-based. Before your first move, send one word — <span class="mono">beginner</span> / <span class="mono">easy</span> / <span class="mono">intermediate</span> / <span class="mono">advanced</span> / <span class="mono">expert</span> / <span class="mono">grandmaster</span> — to set my level.</li>
+    <li>Default strength is full <span class="mono">grandmaster</span> Stockfish for both realtime and turn-based games. Send one word at any time — <span class="mono">beginner</span> / <span class="mono">easy</span> / <span class="mono">intermediate</span> / <span class="mono">advanced</span> / <span class="mono">expert</span> / <span class="mono">grandmaster</span> — to set my level.</li>
     <li>Replies <span class="mono">"I'm not sure."</span> to every opponent chat message except those exact difficulty keywords (chat otherwise treated as untrusted).</li>
     <li>Speaks to each opponent in their BGA interface language (41 supported, English fallback).</li>
     <li>After 3 consecutive errors on a table, sends a polite concession message and resigns.</li>
@@ -408,13 +420,13 @@ function landingHtml(): string {
         <thead><tr><th>Engine</th><th>Status</th><th>Notes</th></tr></thead>
         <tbody>
           <tr>
-            <td class="mono">chess-api.com</td>
+            <td class="mono"><a href="https://chess-api.com/" target="_blank" rel="noopener">chess-api.com</a></td>
             <td class="ok">Works</td>
             <td>External wrapper around Stockfish 17. Strongest in the race when it responds in
               time, but variable latency and the occasional flake mean we never trust it alone.</td>
           </tr>
           <tr>
-            <td class="mono">lichess-cloud-eval</td>
+            <td class="mono"><a href="https://lichess.org/api#tag/Analysis/operation/apiCloudEval" target="_blank" rel="noopener">lichess-cloud-eval</a></td>
             <td class="ok">Works (cache-only)</td>
             <td>
               <code>GET lichess.org/api/cloud-eval?fen=…&amp;multiPv=1</code>. Returns
@@ -424,7 +436,7 @@ function landingHtml(): string {
             </td>
           </tr>
           <tr>
-            <td class="mono">stockfish.online</td>
+            <td class="mono"><a href="https://stockfish.online/" target="_blank" rel="noopener">stockfish.online</a></td>
             <td class="ok">Works</td>
             <td>
               <code>GET stockfish.online/api/s/v2.php?fen=…&amp;depth=…</code> (max depth 15).
@@ -433,7 +445,7 @@ function landingHtml(): string {
             </td>
           </tr>
           <tr>
-            <td class="mono">rapidapi-stockfish-16</td>
+            <td class="mono"><a href="https://rapidapi.com/AnyChess/api/chess-stockfish-16-api" target="_blank" rel="noopener">rapidapi-stockfish-16</a></td>
             <td class="ok">Works (when key bound)</td>
             <td>
               <code>POST chess-stockfish-16-api.p.rapidapi.com/chess/api</code>, form-urlencoded
@@ -444,7 +456,7 @@ function landingHtml(): string {
             </td>
           </tr>
           <tr>
-            <td class="mono">wasm-stockfish</td>
+            <td class="mono"><a href="https://github.com/official-stockfish/Stockfish" target="_blank" rel="noopener">wasm-stockfish</a></td>
             <td class="err">Dropped — doesn't fit</td>
             <td>
               <code>stockfish-18-lite-single</code> (~7&nbsp;MB binary) compiled to WASM, hosted in
@@ -456,7 +468,7 @@ function landingHtml(): string {
             </td>
           </tr>
           <tr>
-            <td class="mono">stockfish-container</td>
+            <td class="mono"><a href="https://stockfishchess.org/" target="_blank" rel="noopener">stockfish-container</a></td>
             <td class="warn">Dormant — works, not worth the price</td>
             <td>
               Native <code>stockfish</code> in a Debian-slim container behind a small Node HTTP
@@ -471,7 +483,7 @@ function landingHtml(): string {
             </td>
           </tr>
           <tr>
-            <td class="mono">vps-stockfish</td>
+            <td class="mono"><a href="https://stockfishchess.org/" target="_blank" rel="noopener">vps-stockfish</a></td>
             <td class="muted">Planned</td>
             <td>
               The cheaper version of the container tier: a small Linux droplet running the same
@@ -480,7 +492,7 @@ function landingHtml(): string {
             </td>
           </tr>
           <tr>
-            <td class="mono">js-chess-engine</td>
+            <td class="mono"><a href="https://www.npmjs.com/package/js-chess-engine" target="_blank" rel="noopener">js-chess-engine</a></td>
             <td class="ok">Works (weak)</td>
             <td>Pure-JS alpha-beta search, level 3, ~30&nbsp;KB. Always available inside the
               isolate with zero cold-start cost. Plays at roughly beginner strength but never
@@ -626,27 +638,7 @@ function render(s) {
   stateEl.className = "pill " + (s.running && s.loggedIn ? "ok" : "warn");
   document.getElementById("ticked").textContent = "last tick: " + fmtUtc(s.lastTickAt);
 
-  const st = s.stats || { wins: 0, losses: 0, draws: 0, concedes: 0, engineUses: {} };
-  // "Total" = lifetime BGA-scored games (wins+losses+draws) plus games
-  // currently being played. Concedes are intentionally excluded — they're
-  // mostly error states and abandoned/never-started tables that aren't
-  // really a meaningful "game played" signal.
-  // "Live" = tables BGA's lobby reports as play/asyncplay (opponent
-  // seated, moves being exchanged). Open invites and tables mid-cleanup
-  // are intentionally excluded — they aren't "games" yet.
-  const liveTables = liveGameIds(s).live.length;
-  const pastGames = (st.wins || 0) + (st.losses || 0) + (st.draws || 0);
-  const totalGames = pastGames + liveTables;
-  const winPct = pastGames > 0
-    ? "(" + Math.round((st.wins || 0) * 100 / pastGames) + "%)"
-    : null;
-  document.getElementById("stats").innerHTML = [
-    card("Total games", totalGames),
-    card("Live games", liveTables),
-    card("Wins", st.wins, "ok", winPct),
-    card("Losses", st.losses, "err"),
-    card("Draws", st.draws, "draw"),
-  ].join("");
+  renderStats(s);
 
   document.getElementById("invites").innerHTML = renderInvites(s.openInvites);
   // Only repaint the games section if the new snapshot would render
@@ -673,6 +665,60 @@ function card(label, val, cls, suffix) {
     ? ' <span class="muted" style="font-size: 13px; font-weight: 400;">' + esc(suffix) + '</span>'
     : '';
   return '<div class="card"><div class="label">' + esc(label) + '</div><div class="val ' + (cls||'') + '">' + esc(val) + sub + '</div></div>';
+}
+
+// Difficulty filter for the Stats cards. "all" = lifetime aggregate; the
+// rest read per-difficulty counters (stats.byDifficulty) plus live tables
+// whose memo difficulty matches. Default is grandmaster — the bot's name
+// is bot_stockfish, so the full-Stockfish tier is the headline view.
+const DIFF_KEYS = ["all", "grandmaster", "expert", "advanced", "intermediate", "easy", "beginner"];
+let selectedDiff = "grandmaster";
+function setDiff(d) {
+  selectedDiff = DIFF_KEYS.includes(d) ? d : "grandmaster";
+  syncDiffButtons();
+  if (window.__lastStatus) renderStats(window.__lastStatus);
+}
+function syncDiffButtons() {
+  for (const k of DIFF_KEYS) {
+    const el = document.getElementById("diff-" + k);
+    if (el) el.classList.toggle("on", k === selectedDiff);
+  }
+}
+// Difficulty a live game is being played at: the locked effective level,
+// else the opponent-chosen level, else grandmaster (the default + what
+// pre-difficulty entries fall back to elsewhere).
+function liveDifficulty(memo, id) {
+  const m = memo[id] || {};
+  return m.effectiveDifficulty || m.difficulty || "grandmaster";
+}
+
+function renderStats(s) {
+  const st = s.stats || { wins: 0, losses: 0, draws: 0, concedes: 0, engineUses: {}, byDifficulty: {} };
+  const { live: liveIds, memo } = liveGameIds(s);
+  // "Total" = BGA-scored games (wins+losses+draws) plus games currently
+  // being played. Concedes are excluded (mostly error/abandoned states).
+  // "Live" = tables BGA reports as play/asyncplay. Both are filtered to the
+  // selected difficulty tab; "all" is the lifetime aggregate.
+  let wins, losses, draws, liveTables;
+  if (selectedDiff === "all") {
+    wins = st.wins || 0; losses = st.losses || 0; draws = st.draws || 0;
+    liveTables = liveIds.length;
+  } else {
+    const bd = (st.byDifficulty || {})[selectedDiff] || { wins: 0, losses: 0, draws: 0 };
+    wins = bd.wins || 0; losses = bd.losses || 0; draws = bd.draws || 0;
+    liveTables = liveIds.filter(id => liveDifficulty(memo, id) === selectedDiff).length;
+  }
+  const pastGames = wins + losses + draws;
+  const totalGames = pastGames + liveTables;
+  const winPct = pastGames > 0 ? "(" + Math.round(wins * 100 / pastGames) + "%)" : null;
+  document.getElementById("stats").innerHTML = [
+    card("Total games", totalGames),
+    card("Live games", liveTables),
+    card("Wins", wins, "ok", winPct),
+    card("Losses", losses, "err"),
+    card("Draws", draws, "draw"),
+  ].join("");
+  syncDiffButtons();
 }
 
 // BGA's actual game URL is /<gameserver>/<gamename>?table=<id> — the
@@ -1082,6 +1128,25 @@ function shortEngine(e) {
   return ENGINE_LABELS[e] || e.replace(/\\s*\\(.*\\)\\s*$/, "");
 }
 
+// Homepage / docs for each engine, so the usage legend and the "Engines we
+// tried" table link out to the source. random-fallback has no page.
+const ENGINE_LINKS = {
+  "lichess-cloud-eval": "https://lichess.org/api#tag/Analysis/operation/apiCloudEval",
+  "stockfish.online": "https://stockfish.online/",
+  "chess-api.com": "https://chess-api.com/",
+  "rapidapi-stockfish-16": "https://rapidapi.com/AnyChess/api/chess-stockfish-16-api",
+  "stockfish-container": "https://stockfishchess.org/",
+  "js-chess-engine (local DO)": "https://www.npmjs.com/package/js-chess-engine",
+};
+// Wrap an engine key's display text in a link to its page when we have one.
+function engineNameHtml(key, text) {
+  const href = ENGINE_LINKS[key];
+  const label = '<span class="mono">' + esc(text == null ? key : text) + '</span>';
+  return href
+    ? '<a href="' + href + '" target="_blank" rel="noopener">' + label + '</a>'
+    : label;
+}
+
 // Past-games "Lang" column: BGA interface-language code → flag + name. The
 // flag is a representative country (languages aren't 1:1 with flags), good
 // enough for an at-a-glance column.
@@ -1289,7 +1354,7 @@ function renderEngines(uses) {
     const pct = (100 * n / total).toFixed(1);
     const moves = n === 1 ? "1 move" : esc(n) + " moves";
     return '<tr>'
-      + '<td><span class="pie-sw" style="background:' + PIE_COLORS[i % PIE_COLORS.length] + '"></span><span class="mono">' + esc(k) + '</span></td>'
+      + '<td><span class="pie-sw" style="background:' + PIE_COLORS[i % PIE_COLORS.length] + '"></span>' + engineNameHtml(k) + '</td>'
       + '<td class="right">' + moves + '</td>'
       + '<td class="right muted">' + pct + '%</td>'
       + '</tr>';
