@@ -130,13 +130,23 @@ export function parseGameHtml(html: string): GameStateParsed | null {
  */
 export function parseOpponent(
   html: string, botUserId: string | undefined,
-): { id: string; name: string; language?: string } | null {
+): { id: string; name: string; language?: string; premium?: boolean } | null {
   const re = /"user_id":"(\d+)"[^{}]*?"language":"([a-z]{2})"[^{}]*?"player_name":"([^"]*)"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
     const [, id, language, name] = m;
     if (botUserId && id === botUserId) continue;
-    return { id, name: decodeBgaName(name), language };
+    // The player object continues past player_name with flat metadata
+    // ("grade", "rank", "country", "is_premium", ...) before any nested
+    // object. Read is_premium from a bounded slice of this same blob; the
+    // window is far shorter than the distance to the next player object, so
+    // it can't pick up a neighbour's flag.
+    const tail = html.slice(m.index, m.index + 600);
+    const prem = /"is_premium":(true|false)/.exec(tail);
+    return {
+      id, name: decodeBgaName(name), language,
+      premium: prem ? prem[1] === "true" : undefined,
+    };
   }
   return null;
 }

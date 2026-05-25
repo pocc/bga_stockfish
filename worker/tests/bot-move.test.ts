@@ -5,6 +5,12 @@ import { parseOpponent, buildFen, parseGameHtml, type Piece, type Destination } 
 //   "user_id":"<id>","status":"online","device":"desktop","language":"xx","player_name":"Name"
 const block = (id: string, lang: string, name: string) =>
   `{"user_id":"${id}","status":"online","device":"desktop","language":"${lang}","player_name":"${name}"}`;
+// Richer block, as the live game page actually serves it: flat metadata
+// (grade/rank/country/is_premium) trails player_name before any nested object.
+const richBlock = (id: string, lang: string, name: string, premium: boolean) =>
+  `{"user_id":"${id}","status":"online","device":"desktop","language":"${lang}",` +
+  `"player_name":"${name}","grade":"3","rank":1400,"karma":"100","country":"US",` +
+  `"is_premium":${premium},"is_beginner":false,"languages":{"en":{"id":"en","level":"0"}}}`;
 
 const BOT = "99861258";
 const HTML = block(BOT, "en", "bot_stockfish") + "," + block("99999001", "es", "Javividoor");
@@ -37,6 +43,26 @@ describe("parseOpponent", () => {
     });
     // sanity: the decoded form is the real accented string, not the escape.
     expect(parseOpponent(html, BOT)?.name).toBe("lagloïre");
+  });
+
+  test("captures opponent premium membership from the rich block", () => {
+    const html = richBlock(BOT, "en", "bot_stockfish", false) + "," +
+      richBlock("99999001", "es", "Javividoor", true);
+    expect(parseOpponent(html, BOT)).toEqual({
+      id: "99999001", name: "Javividoor", language: "es", premium: true,
+    });
+  });
+
+  test("reads premium=false and never picks up a neighbour's flag", () => {
+    // Opponent is free; the bot block (premium) follows. The opponent's own
+    // is_premium must win, not the next block's.
+    const html = richBlock("99999001", "es", "Javividoor", false) + "," +
+      richBlock(BOT, "en", "bot_stockfish", true);
+    expect(parseOpponent(html, BOT)?.premium).toBe(false);
+  });
+
+  test("leaves premium undefined when the block lacks is_premium", () => {
+    expect(parseOpponent(HTML, BOT)?.premium).toBeUndefined();
   });
 });
 

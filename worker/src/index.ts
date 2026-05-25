@@ -348,7 +348,7 @@ function landingHtml(): string {
   <h2>Stats</h2>
   <div class="row" id="diff-tabs" style="margin: 0 0 10px; gap: 6px;">
     <span id="diff-all" class="pill btn" onclick="setDiff('all')">All</span>
-    <span id="diff-grandmaster" class="pill btn on" onclick="setDiff('grandmaster')" title="Default difficulty">Grandmaster (Stockfish)*</span>
+    <span id="diff-grandmaster" class="pill btn on" onclick="setDiff('grandmaster')" title="Default difficulty">Grandmaster*</span>
     <span id="diff-expert" class="pill btn" onclick="setDiff('expert')">Expert</span>
     <span id="diff-advanced" class="pill btn" onclick="setDiff('advanced')">Advanced</span>
     <span id="diff-intermediate" class="pill btn" onclick="setDiff('intermediate')">Intermediate</span>
@@ -356,7 +356,7 @@ function landingHtml(): string {
     <span id="diff-beginner" class="pill btn" onclick="setDiff('beginner')">Beginner</span>
   </div>
   <div class="cards" id="stats"></div>
-  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">* default difficulty</p>
+  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">* default difficulty — full grandmaster-strength Stockfish (the remote engine race)</p>
 
   <h2>Bot rules</h2>
   <ul style="padding-left: 22px; margin: 0; font-size: 13px;">
@@ -381,6 +381,13 @@ function landingHtml(): string {
 
   <h2>Engine usage</h2>
   <div id="engines" class="muted">…</div>
+
+  <h2>Opponents by language</h2>
+  <div id="languages" class="muted">…</div>
+
+  <h2>Opponents by membership</h2>
+  <p class="sub" style="margin: -2px 0 10px;">BGA premium vs. free, by finished game. Membership is read from the opponent's game-page profile, so it's only recorded for games played after this was added.</p>
+  <div id="premium" class="muted">…</div>
 
   <h2>Recent moves</h2>
   <p class="sub" style="margin: -2px 0 10px;">Parallel engine race, winner picked by precedence: lichess-cloud-eval · stockfish.online · chess-api.com · rapidapi-stockfish-16 · stockfish-container · js-chess-engine (local DO) · random legal move.</p>
@@ -656,7 +663,9 @@ function render(s) {
   }
   document.getElementById("moves").innerHTML = renderMoves(s.recentMoves);
   document.getElementById("results").innerHTML = renderResults(s.recentResults);
-  document.getElementById("engines").innerHTML = renderEngines(st.engineUses);
+  document.getElementById("engines").innerHTML = renderEngines((s.stats || {}).engineUses);
+  document.getElementById("languages").innerHTML = renderLanguages(s.recentResults);
+  document.getElementById("premium").innerHTML = renderPremium(s.recentResults);
   document.getElementById("errors").innerHTML = renderErrors(s.recentErrors);
 }
 
@@ -1322,20 +1331,27 @@ const PIE_COLORS = [
   "#a8554a", "#6f8a4a", "#5e4a8a", "#b07f3f", "#4a8a8a",
 ];
 
-function renderEngines(uses) {
-  const entries = Object.entries(uses || {});
-  if (entries.length === 0) return "<span class='muted'>no engine calls yet</span>";
-  entries.sort((a, b) => b[1] - a[1]);
-  const total = entries.reduce((s, [, n]) => s + n, 0);
-  if (total === 0) return "<span class='muted'>no engine calls yet</span>";
+// Shared donut/pie renderer. entries: array of [key, count]. opts:
+//   label(key)  -> legend-cell HTML for the slice (default: mono span)
+//   ariaLabel   -> SVG aria-label
+//   unit/unit1  -> plural / singular count noun (default "moves"/"move")
+// Slices are sorted by count desc and coloured from PIE_COLORS.
+function pieChart(entries, opts) {
+  opts = opts || {};
+  const label = opts.label || (k => '<span class="mono">' + esc(k) + '</span>');
+  const unit = opts.unit || "moves", unit1 = opts.unit1 || "move";
+  const sorted = entries.slice().sort((a, b) => b[1] - a[1]);
+  const total = sorted.reduce((s, [, n]) => s + n, 0);
+  if (total === 0) return null;
   const cx = 100, cy = 100, r = 95;
   let angle = -Math.PI / 2;
-  const paths = entries.map(([k, n], i) => {
+  const paths = sorted.map(([k, n], i) => {
     const frac = n / total;
     const a0 = angle;
     const a1 = angle + frac * Math.PI * 2;
     angle = a1;
     const color = PIE_COLORS[i % PIE_COLORS.length];
+    const pct = (100 * frac).toFixed(1);
     // Edge case: single 100% slice can't be drawn as an arc — use a circle.
     if (frac >= 0.9999) {
       return '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '"><title>' + esc(k) + ' · ' + n + ' · 100%</title></circle>';
@@ -1347,22 +1363,66 @@ function renderEngines(uses) {
       + " L " + x0.toFixed(2) + " " + y0.toFixed(2)
       + " A " + r + " " + r + " 0 " + largeArc + " 1 " + x1.toFixed(2) + " " + y1.toFixed(2)
       + " Z";
-    const pct = (100 * frac).toFixed(1);
     return '<path d="' + d + '" fill="' + color + '"><title>' + esc(k) + ' · ' + n + ' · ' + pct + '%</title></path>';
   }).join("");
-  const legend = entries.map(([k, n], i) => {
+  const legend = sorted.map(([k, n], i) => {
     const pct = (100 * n / total).toFixed(1);
-    const moves = n === 1 ? "1 move" : esc(n) + " moves";
+    const count = n === 1 ? "1 " + unit1 : esc(n) + " " + unit;
     return '<tr>'
-      + '<td><span class="pie-sw" style="background:' + PIE_COLORS[i % PIE_COLORS.length] + '"></span>' + engineNameHtml(k) + '</td>'
-      + '<td class="right">' + moves + '</td>'
+      + '<td><span class="pie-sw" style="background:' + PIE_COLORS[i % PIE_COLORS.length] + '"></span>' + label(k) + '</td>'
+      + '<td class="right">' + count + '</td>'
       + '<td class="right muted">' + pct + '%</td>'
       + '</tr>';
   }).join("");
   return '<div class="pie-wrap">'
-    + '<svg class="pie-svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="engine usage pie chart">' + paths + '</svg>'
+    + '<svg class="pie-svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="' + esc(opts.ariaLabel || "pie chart") + '">' + paths + '</svg>'
     + '<div class="pie-legend"><table><tbody>' + legend + '</tbody></table></div>'
     + '</div>';
+}
+
+function renderEngines(uses) {
+  const chart = pieChart(Object.entries(uses || {}), {
+    label: k => engineNameHtml(k),
+    ariaLabel: "engine usage pie chart",
+    unit: "moves", unit1: "move",
+  });
+  return chart || "<span class='muted'>no engine calls yet</span>";
+}
+
+// Count finished games by a per-result key (e.g. opponent language). Only
+// games with the field set are counted, so the chart reflects detected data.
+function countResults(results, keyOf) {
+  const counts = {};
+  for (const r of results || []) {
+    const k = keyOf(r);
+    if (k == null || k === "") continue;
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  return Object.entries(counts);
+}
+
+function renderLanguages(results) {
+  const chart = pieChart(countResults(results, r => r.oppLanguage), {
+    label: k => '<span>' + (LANG_DISPLAY[k] || ('🏳️ ' + esc(k))) + '</span>',
+    ariaLabel: "opponents by language pie chart",
+    unit: "games", unit1: "game",
+  });
+  return chart || "<span class='muted'>no opponent languages recorded yet</span>";
+}
+
+function renderPremium(results) {
+  // oppPremium is boolean | undefined; bucket the two known states and ignore
+  // games where membership wasn't detected.
+  const chart = pieChart(
+    countResults(results, r => r.oppPremium === true ? "Premium"
+      : r.oppPremium === false ? "Free" : null),
+    {
+      label: k => '<span class="' + (k === "Premium" ? "ok" : "muted") + '">' + esc(k) + '</span>',
+      ariaLabel: "opponents by membership pie chart",
+      unit: "games", unit1: "game",
+    },
+  );
+  return chart || "<span class='muted'>no opponent membership recorded yet</span>";
 }
 
 function renderErrors(errors) {

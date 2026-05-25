@@ -266,6 +266,10 @@ interface TableMemo {
    *  game page. Drives which language the bot's chat is sent in. Unset =
    *  not yet detected / unknown → English. */
   oppLanguage?: string;
+  /** True if the opponent has a BGA premium membership, false if free.
+   *  Parsed from the game-page player blob (is_premium). Unset = not yet
+   *  detected (e.g. opponent only seen via the lobby fallback). */
+  oppPremium?: boolean;
   /** Wall-clock ms we marked the table finished. Set wherever
    *  `finished = true` is set. */
   finishedAt?: number;
@@ -490,6 +494,10 @@ interface ResultEntry {
   difficulty?: string;
   /** Opponent's BGA interface-language code, for the past-games flag. */
   oppLanguage?: string;
+  /** True if the opponent was a BGA premium member, false if free. Unset on
+   *  entries written before this field existed, or when membership wasn't
+   *  detected. Drives the premium/free breakdown on the dashboard. */
+  oppPremium?: boolean;
   /** True if the game was realtime, false if turn-based (async). Derived
    *  from the terminal status ("finished" = realtime, "asyncfinished" =
    *  async). Undefined when the status didn't disambiguate ("archive") or
@@ -1257,6 +1265,7 @@ export class BotDriver extends DurableObject<Env> {
     m.oppId = opp.id;
     m.oppName = opp.name;
     if (opp.language) m.oppLanguage = opp.language;
+    if (opp.premium !== undefined) m.oppPremium = opp.premium;
   }
 
   private async maybeGreet(tableId: string, m: TableMemo, _isRealtime: boolean): Promise<void> {
@@ -2359,6 +2368,7 @@ export class BotDriver extends DurableObject<Env> {
           oppId: m.oppId,
           difficulty: tallyDifficulty,
           oppLanguage: m.oppLanguage,
+          oppPremium: m.oppPremium,
           // Prefer the gamemode captured during live play (authoritative);
           // fall back to the terminal status only for legacy memos that
           // finished before m.realtime was recorded. `archive` is ambiguous,
