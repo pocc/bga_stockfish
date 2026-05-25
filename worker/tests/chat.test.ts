@@ -3,9 +3,9 @@ import { chunkChat } from "../src/chat";
 
 const GREETING =
   "Hi! I'm bot_stockfish, a chess bot on Board Game Arena https://stockfish.ross.gg/ \n" +
-  "In realtime games I default to expert level (~1800) with a fast local engine, so my moves are instant.\n\n" +
-  "Want to change the difficulty? Before your first move, type one of these five words to set my level:\n\n" +
-  "beginner (~700)\neasy (~1000)\nintermediate (~1300)\nadvanced (~1600)\ngrandmaster (~2800)\n\nGood luck!";
+  "My default is Stockfish (~2800), a grandmaster-strength chess bot based on work done by https://stockfishchess.org/ \n\n" +
+  "Want to change the difficulty? At any time, type one of these five words to set my level:\n\n" +
+  "beginner (~700)\neasy (~1000)\nintermediate (~1300)\nadvanced (~1600)\nexpert (~1800)\n\nGood luck!";
 
 describe("chunkChat", () => {
   test("keeps every chunk under the limit", () => {
@@ -17,14 +17,14 @@ describe("chunkChat", () => {
     // The prompt's two sentences must stay together, not split as before.
     const promptChunk = chunks.find((c) => c.includes("Want to change the difficulty?"));
     expect(promptChunk).toBeDefined();
-    expect(promptChunk).toContain("Before your first move");
+    expect(promptChunk).toContain("At any time");
   });
 
   test("keeps the whole difficulty list in one chunk", () => {
     const chunks = chunkChat(GREETING, 220);
     const listChunk = chunks.find((c) => c.includes("beginner (~700)"));
     expect(listChunk).toContain("easy (~1000)");
-    expect(listChunk).toContain("grandmaster (~2800)");
+    expect(listChunk).toContain("expert (~1800)");
   });
 
   test("does not split inside a URL", () => {
