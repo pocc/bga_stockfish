@@ -28,10 +28,6 @@ class_name = "StockfishEngine"
 name = "BOT"
 class_name = "BotDriver"
 
-[[durable_objects.bindings]]
-name = "WASM_ENGINE"
-class_name = "StockfishWasmEngine"
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["StockfishEngine"]
@@ -70,13 +66,13 @@ new_sqlite_classes = ["StockfishWasmEngine"]
 tag = "v4"
 new_sqlite_classes = ["StockfishContainer"]
 
-# Bundle the Stockfish wasm binary so engine.ts can import it as a
-# pre-compiled WebAssembly.Module (CF Workers disallow runtime
-# WebAssembly.instantiate of raw bytes).
-[[rules]]
-type = "CompiledWasm"
-globs = ["**/*.wasm"]
-fallthrough = false
+# v5 removes the WASM Stockfish DO. It was never wired into the engine race
+# (stockfish-do.ts never called WASM_ENGINE) — the local fallback is
+# js-chess-engine — so it shipped a ~7MB wasm bundle and an idle DO for
+# nothing. The class held no persistent state, so deletion loses no data.
+[[migrations]]
+tag = "v5"
+deleted_classes = ["StockfishWasmEngine"]
 
 # Cron watchdog — pokes the bot once a minute to re-arm its 5s alarm
 # loop in case it ever drops (deploys, evictions). The DO does the real

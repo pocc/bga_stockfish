@@ -1,15 +1,12 @@
 import { StockfishEngine } from "./stockfish-do";
 import { BotDriver } from "./bot-do";
-import { StockfishWasmEngine } from "./wasm-engine-do";
 import { StockfishContainer } from "./container-do";
 
-export { StockfishEngine, BotDriver, StockfishWasmEngine, StockfishContainer };
+export { StockfishEngine, BotDriver, StockfishContainer };
 
 export interface Env {
   ENGINE: DurableObjectNamespace;
   BOT: DurableObjectNamespace;
-  /** Optional: WASM Stockfish DO. Bound when wrangler.toml includes it. */
-  WASM_ENGINE?: DurableObjectNamespace;
   /** Optional: native Stockfish container binding. Dormant — uncomment the
    *  [[containers]] + binding blocks in wrangler.toml to enable. */
   STOCKFISH_CONTAINER?: DurableObjectNamespace;

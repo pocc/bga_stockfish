@@ -4,9 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:glue": "node scripts/build-glue.mjs",
-    "predeploy": "npm run build:glue && npm run test:run",
-    "predev": "npm run build:glue",
+    "predeploy": "npm run test:run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
