@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { parseOpponent, buildFen, type Piece, type Destination } from "../src/bot-move";
+import { parseOpponent, buildFen, parseGameHtml, type Piece, type Destination } from "../src/bot-move";
 
 // Player blocks in BGA's game-page HTML look like:
 //   "user_id":"<id>","status":"online","device":"desktop","language":"xx","player_name":"Name"
@@ -79,5 +79,23 @@ describe("buildFen en passant target", () => {
       wp: [{ dest_x: 4, dest_y: 3 }],
     };
     expect(epField(buildFen(pieces, "white", dests))).toBe("-");
+  });
+});
+
+describe("parseGameHtml neutralized_player_id", () => {
+  // Minimal valid game page: parseGameHtml needs a "pieces" and "gamestate" blob.
+  const base = '"pieces":{},"gamestate":{"id":3,"active_player":"99861258"}';
+
+  test('"0" is the "nobody neutralized" sentinel → null (regression: must not look like a quit)', () => {
+    expect(parseGameHtml(`${base},"neutralized_player_id":"0"`)?.neutralizedPlayerId).toBeNull();
+  });
+
+  test("a real neutralized player id is captured", () => {
+    expect(parseGameHtml(`${base},"neutralized_player_id":"99999001"`)?.neutralizedPlayerId).toBe("99999001");
+  });
+
+  test("null / empty-string parse as null", () => {
+    expect(parseGameHtml(`${base},"neutralized_player_id":null`)?.neutralizedPlayerId).toBeNull();
+    expect(parseGameHtml(`${base},"neutralized_player_id":""`)?.neutralizedPlayerId).toBeNull();
   });
 });

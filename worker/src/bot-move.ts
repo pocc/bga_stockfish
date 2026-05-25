@@ -100,7 +100,10 @@ export function parseGameHtml(html: string): GameStateParsed | null {
   // `"neutralized_player_id":"99813153"` or `:null`.
   let neutralizedPlayerId: string | null = null;
   const nMatch = /"neutralized_player_id"\s*:\s*("(\d+)"|null|"")/.exec(html);
-  if (nMatch && nMatch[2]) neutralizedPlayerId = nMatch[2];
+  // BGA emits "0" (and bare 0 / null / "") to mean "nobody is neutralized".
+  // "0" is a truthy string, so it MUST be excluded or every game looks like
+  // the opponent quit — which would resign every live game.
+  if (nMatch && nMatch[2] && nMatch[2] !== "0") neutralizedPlayerId = nMatch[2];
   const gsId = gamestate.id != null ? Number(gamestate.id) : null;
   return {
     pieces,
