@@ -342,6 +342,30 @@ export class BGAClient {
   }
 
   /**
+   * Fetch the full replay log for a finished/archived table via
+   * `archive/archive/logs.html`. Returns BGA's parsed JSON envelope `data`
+   * (containing `logs[]` with every `pieceMoved` notification), or null if
+   * the log isn't available yet. The log can lag a few seconds behind a
+   * realtime game flipping to `finished`, so callers should tolerate null
+   * and retry. Read-only.
+   */
+  async getGameLog(tableId: number | string): Promise<unknown | null> {
+    const resp = await this.request(
+      "GET",
+      `https://boardgamearena.com/archive/archive/logs.html?table=${tableId}&translated=true&dojo.preventCache=${Date.now()}`,
+      undefined,
+      { referer: `https://boardgamearena.com/table?table=${tableId}` },
+    );
+    const text = await resp.text();
+    if (!text) return null;
+    let json: BGAEnvelope<unknown>;
+    try { json = JSON.parse(text) as BGAEnvelope<unknown>; }
+    catch { return null; }
+    if (json.status !== 1 || json.data == null) return null;
+    return json.data;
+  }
+
+  /**
    * Player-scoped table list via `tableinfos.html?playerid=<uid>`. This is
    * the endpoint BGA's own UI uses to populate the "your games" sidebar,
    * and is the only way to discover:
@@ -589,7 +613,13 @@ export class BGAClient {
       headers.referer = `https://boardgamearena.com/${gameserverNum}/chess?table=${tableId}`;
     }
     const resp = await this.request("GET", url, undefined, headers);
-    return (await resp.json()) as BGAEnvelope<unknown>;
+    // Tolerate empty / non-JSON bodies: BGA acks some decisions with an empty
+    // 200 and signals failure with a non-2xx. Never throw here — callers read
+    // `status` to decide success (1) vs failure (0).
+    const text = (await resp.text()).trim();
+    if (!text) return { status: resp.ok ? 1 : 0 } as BGAEnvelope<unknown>;
+    try { return JSON.parse(text) as BGAEnvelope<unknown>; }
+    catch { return { status: resp.ok ? 1 : 0 } as BGAEnvelope<unknown>; }
   }
 
   async selectCell(
@@ -651,21 +681,39 @@ export class BGAClient {
   }
 
   /**
-   * GET /<gs>/chess/chess/proposeDraw.html — the chess draw action. It both
-   * proposes a draw and, when the opponent already has one pending (the
-   * game sits in gamestate=5 `playerAgreeToDraw`), agrees to it. The bot
-   * calls this to accept an opponent's draw offer. Mirrors selectCell's
+   * GET /<gs>/chess/chess/declineDraw.html — the chess action that refuses a
+   * pending draw offer (state 5 `playerAgreeToDraw`). Endpoint + param shape
+   * confirmed from a captured browser request. The bot never accepts a draw
+   * (it would record as 0.5/0.5 and skew stats), so when an opponent offers
+   * one we call this to refuse and unblock our turn. Mirrors proposeDraw's
    * lock/token handling.
+   *
+   * The companion actions are `proposeDraw.html` (offer a draw) and, by the
+   * same naming convention, `agreeDraw.html` (accept). We intentionally expose
+   * NEITHER here — the bot must never offer or accept a draw, and keeping an
+   * accept path around would be a footgun against that policy.
    */
-  async proposeDraw(gameserverNum: number | string, tableId: number | string): Promise<BGAEnvelope<unknown>> {
+  async declineDraw(gameserverNum: number | string, tableId: number | string): Promise<BGAEnvelope<unknown>> {
     const lock = randomUuid();
     const url =
-      `https://boardgamearena.com/${gameserverNum}/chess/chess/proposeDraw.html` +
+      `https://boardgamearena.com/${gameserverNum}/chess/chess/declineDraw.html` +
       `?lock=${lock}&table=${tableId}&noerrortracking=true&dojo.preventCache=${Date.now()}`;
     const resp = await this.request("GET", url);
-    const env = (await resp.json()) as BGAEnvelope<unknown> & { error?: string };
-    if (env && Number(env.status) !== 1) {
-      throw new Error(`proposeDraw rejected: ${JSON.stringify(env).slice(0, 200)}`);
+    // BGA chess action acks are frequently an EMPTY 200 body (like
+    // acceptGameStart), so a strict resp.json() throws "Unexpected end of JSON
+    // input" on what is actually a success. Treat any 2xx empty/non-JSON body
+    // as ok; only a non-2xx status or a parsed {status:0} envelope is a real
+    // rejection.
+    const text = (await resp.text()).trim();
+    if (!resp.ok) {
+      throw new Error(`declineDraw http ${resp.status}: ${text.slice(0, 200)}`);
+    }
+    if (!text) return { status: 1 } as BGAEnvelope<unknown>;
+    let env: BGAEnvelope<unknown> & { error?: string };
+    try { env = JSON.parse(text) as typeof env; }
+    catch { return { status: 1 } as BGAEnvelope<unknown>; }
+    if (Number(env.status) !== 1) {
+      throw new Error(`declineDraw rejected: ${JSON.stringify(env).slice(0, 200)}`);
     }
     return env;
   }
