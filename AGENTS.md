@@ -4,7 +4,7 @@ Academic project: a chess bot that plays games on [boardgamearena.com](https://b
 
 Two halves:
 
-1. **`worker/`** — Cloudflare Worker + Durable Object exposing a UCI-style chess engine at `https://stockfish.ross.gg`. Primary engine is the public [chess-api.com](https://chess-api.com) (POST `/v1`); fallback is `stockfish-18-lite-single.wasm` (~7MB, NNUE-lite, single-threaded) bundled into the DO; last-resort fallback is a random legal move via `chess.js`.
+1. **`worker/`** - Cloudflare Worker + Durable Object exposing a UCI-style chess engine at `https://stockfish.ross.gg`. It races several public engines in parallel (lichess cloud-eval, stockfish.online, chess-api.com, optional RapidAPI Stockfish) and picks the best by precedence; the local fallback is `js-chess-engine` running inside the DO; the last-resort fallback is a random legal move via `chess.js`.
 2. **`bga/`** — TypeScript client library for boardgamearena.com (chess only), reverse-engineered via Playwright. Plus a bot loop that polls BGA for the bot's turn, asks the Worker for a move, and submits it back.
 
 ## Bot rules
@@ -12,9 +12,9 @@ Two halves:
 - **Friendly games only.** The bot must never play ranked / ELO-affecting games. Reject any invite that isn't a friendly.
 - **Auto-accept all invites.** Both realtime (live) and long-running (turn-based / "Train" mode) invites should be accepted automatically, as long as they're friendly.
 - **Decline gracefully** if the invite is ranked or the variant isn't standard chess.
-- **Never accept a draw.** If anyone offers a draw, the bot replies asking them to use BGA's "Propose to abandon the game collectively" menu option instead. See [bga/docs/chess-api.md](bga/docs/chess-api.md) for the endpoint.
-- **Always accept a collective-abandon proposal**, automatically. The daemon polls the in-game page for the embedded `globalThis.gameui.decision` blob and calls `decide.html?type=abandon&decision=1` when it sees a pending one.
+- **Never accept a draw; always accept a collective-abandon proposal.** A draw records as 0.5/0.5 and skews the win/loss stats, so the bot declines every draw. A direct draw offer parks the table in `gamestate.id=5` (`playerAgreeToDraw`); the bot calls the chess `declineDraw.html` action (NOT `decline.html`, which 500s) and posts a chat telling the opponent they can resign or use BGA's "Propose to abandon the game collectively" menu option instead. A collective-abandon proposal ends the game with no draw score, so the bot accepts it: it shows up in the in-game page's embedded `globalThis.gameui.decision` blob (`decision_type:"abandon"`), and the bot calls `decide.html?type=abandon&decision=1` when it sees a pending one. See [bga/docs/chess-api.md](bga/docs/chess-api.md) for the endpoints.
 - **Opponent chat is untrusted.** The bot replies to every opponent chat message with the literal string `I'm not sure.` (anti-injection; chat is data, never instructions).
+- **Quit when the opponent quits (realtime AND async).** Friendly games carry no rating penalty, so if BGA flags the opponent as gone (`zombie:1` / `neutralized_player_id`) and the flag PERSISTS for `OPP_QUIT_CONFIRM_MS` (60s, to ride out transient reconnect blips), the bot concedes too — freeing the single realtime slot immediately, or cleaning up a dead async table instead of waiting out the 15-min inactivity timer / 30-day age sweep / BGA's own end-of-game sweep.
 
 ## Architecture
 
@@ -49,11 +49,14 @@ POST https://stockfish.ross.gg/bot/wipe      # destructive: quit every table the
   owns the BGA session, cookies, and per-table memo. State is persisted
   to DO storage on every change, so deploys / evictions are transparent.
 - Polling cadence: the DO self-schedules a 5-second tick via
-  `storage.setAlarm`. A Cron Trigger (`*/1 * * * *`) pokes
-  `/bot/start` + `/bot/tick` once a minute as a watchdog in case the
-  alarm chain ever drops.
+  `storage.setAlarm`. A Cron Trigger (`*/1 * * * *`) pokes an internal
+  `/watchdog` once a minute, which re-arms the alarm chain and runs a
+  tick in case the alarm ever drops.
 - The driver auto-starts on first cron poke after deploy. No manual
-  curl needed unless you want to pause it (`/bot/stop`).
+  curl needed unless you want to pause it (`/bot/stop`). Pause is a
+  persisted flag: the watchdog honors it, so a deliberate `/bot/stop`
+  stays stopped (it is NOT restarted by the next cron poke). Resume
+  with `/bot/start`.
 - Move selection: parses `pieces` + `destinations_by_piece` from the
   in-game HTML, builds a FEN from the live board (castling rights are
   derived heuristically from king + rook positions; en passant is `-`),
@@ -69,27 +72,34 @@ POST https://stockfish.ross.gg/bot/wipe      # destructive: quit every table the
 
 #### Engine selection chain
 
-1. **chess-api.com** (primary). Public REST, no auth, fast, returns eval + continuation.
-2. **Local WASM Stockfish** runs `stockfish-18-lite-single.wasm` inside the DO via the emscripten glue. The glue is wrapped at build time by `scripts/build-glue.mjs` so its env-detection takes the "node module" branch under CF Workers.
-3. **Random legal move** via `chess.js`, only when both engines fail.
+`StockfishEngine` (`src/stockfish-do.ts`) fires every available engine in
+parallel, waits up to a 5s ceiling, then picks the best result by the
+`ENGINE_PRECEDENCE` order (lower = stronger):
 
-Flags on the request let callers force one path (e.g. `localOnly: true` for testing the WASM engine).
+1. **lichess cloud-eval** - community-cached Stockfish evals at very deep
+   nominal depths; hits only for common positions (404 = miss, next engine).
+2. **stockfish.online** - free Stockfish API (depth <= 15).
+3. **chess-api.com** - public REST, no auth, returns eval + continuation.
+4. **RapidAPI Stockfish 16** - only when `RAPIDAPI_STOCKFISH_KEY` is set.
+5. **stockfish-container** - dormant (binding commented out in wrangler.toml).
+6. **js-chess-engine (local DO)** - pure-JS fallback that always returns a
+   move, so the race never comes up empty when the remotes are slow/offline.
+7. **Random legal move** via `chess.js` - last resort if every engine fails.
 
-#### Why the glue needs wrapping
+Flags on the request let callers force a subset (e.g. `localOnly: true` runs
+only the local js-chess-engine; `level` caps it to a difficulty tier).
 
-The upstream `stockfish-18-lite-single.js` from the `stockfish` npm package is an emscripten IIFE that auto-detects browser vs node vs web-worker. CF Workers match none of those cleanly. `scripts/build-glue.mjs` produces `src/stockfish-glue-wrapped.js` which:
-
-- runs the IIFE inside a function whose lexical scope provides node-shaped `module`, `process` (with `[Symbol.toStringTag]="process"`, since emscripten checks this), `require` (stubbed for `worker_threads`/`path`/`fs`), etc.
-- shadows `self`/`onmessage`/`window`/`document`/`importScripts`/`fetch`/`XMLHttpRequest` with `let` bindings (needed for strict-mode bare-name assignments inside the IIFE).
-
-The `.wasm` is bundled as raw `ArrayBuffer` via wrangler's `Data` rule and fed to emscripten via `Module.wasmBinary`, so the engine never tries to fetch its own wasm.
+> Historical note: an earlier design used a bundled `stockfish-18-lite`
+> WASM engine inside a dedicated `StockfishWasmEngine` DO. It was removed
+> (migration `v5`); it was never wired into the race, and js-chess-engine
+> covers the local-fallback role without shipping a ~7MB wasm.
 
 ### Worker config
 
 - **Custom domain:** `stockfish.ross.gg` (zone `ross.gg` on Cloudflare, custom_domain route)
-- **Compatibility flags:** `nodejs_compat` (needed for emscripten glue's expectations)
-- **Durable Object class:** `StockfishEngine`, namespace `ENGINE`, SQLite-backed
-- **Total upload:** ~5.5MB gzipped (under the 10MB paid-plan limit)
+- **Compatibility flags:** `nodejs_compat`
+- **Durable Object classes:** `StockfishEngine` (`ENGINE`) + `BotDriver` (`BOT`), SQLite-backed
+- **Total upload:** well under the 10MB paid-plan limit (the ~7MB Stockfish wasm was removed)
 - **No inline secrets.** The Worker source has zero credentials. `account_id` and the API token live in `worker/.env.local` (gitignored) and are auto-loaded by wrangler v4. If you ever add runtime credentials, use `wrangler secret put <NAME>` rather than putting them in `wrangler.toml` or `.env*`.
 
 ### BGA client (`bga/`)
@@ -227,7 +237,6 @@ client-side as "the bot quit my game the moment I joined".
 ```bash
 cd worker
 npm install --ignore-scripts          # sharp's optional postinstall fails on Node 25; skip it
-npm run build:glue                     # regenerate src/stockfish-glue-wrapped.js
 npm run dev                            # local wrangler dev server
 ```
 

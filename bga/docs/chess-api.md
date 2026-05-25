@@ -89,7 +89,7 @@ GET /table/table/concede.html?src=menu&table=<id>&noerrortracking=true&dojo.prev
 → "" (24-byte success envelope, same shape as other ack endpoints)
 ```
 
-### Accept / refuse a table-level proposal (e.g. "abandon collectively")
+### Accept / refuse a table-level proposal ("abandon collectively")
 The in-game menu has "Propose to abandon the game collectively". Whoever
 proposes first creates a pending decision; both seats must answer.
 ```
@@ -101,13 +101,42 @@ Referer: https://boardgamearena.com/<N>/chess?table=<id>
 ```
 - Apex domain (not `en.`).
 - `decision=1` accepts, `decision=0` refuses.
-- `type` mirrors the proposal kind; observed: `abandon`. Presumably also
-  used for draw offers (untested).
+- `type` is the proposal kind; observed: `abandon`. (A **draw offer is NOT**
+  a table-level decision; it's a chess gamestate, see below.)
 - The pending state is exposed in the in-game HTML as
   `globalThis.gameui.decision = {"players":{"<uid>":1|0|"undecided"},
   "decision_type":"abandon","decision_taken":false,"decision_refused":false}`
   so the bot can poll the chess page to detect a fresh proposal without
   the WebSocket.
+
+The bot **accepts** a collective abandon (it ends the game with no score, so
+it doesn't touch the win/loss/draw stats) but **declines every draw** (see
+next section).
+
+### Draw offers (chess gamestate, NOT decide.html)
+A draw offer is a per-game chess action, not a table-level decision. The
+chess state machine (from `g_gamestates` in the in-game HTML):
+- State **3** `playerSelectPiece`: normal turn; `possibleactions` include
+  `proposeDraw` (this is how a player *offers* a draw).
+- State **5** `playerAgreeToDraw`: the offer is pending against the active
+  player; `possibleactions` are `agree` / `decline`
+  (transitions: `agreed → 99` game end, `declined → 52`). There are no
+  `destinations_by_piece` in this state.
+
+Invoke a chess action at `…/<N>/chess/chess/<action>.html?lock=<uuid>&table=<id>&noerrortracking=true&dojo.preventCache=<ms>` (GET). IMPORTANT: the endpoint name is NOT the bare `possibleactions` label; the real action names carry a `Draw` suffix:
+```
+GET /<N>/chess/chess/proposeDraw.html    # offer a draw (state 3)        [confirmed]
+GET /<N>/chess/chess/declineDraw.html    # refuse a pending draw (state 5) [confirmed]
+GET /<N>/chess/chess/agreeDraw.html      # accept a pending draw (state 5) [inferred; bot never calls it]
+```
+Both confirmed endpoints were captured from real browser requests; the param
+shape matches `selectCell` (client-generated `lock` uuid + `table` +
+cache-buster). The bare labels `decline.html` / `agree.html` return **HTTP
+500** (not valid action names), which is the trap to avoid.
+
+The bot only ever calls `declineDraw.html`; accepting a draw records as
+0.5/0.5 and skews its stats. After a successful decline it posts a chat
+suggesting the opponent resign or propose a collective abandon instead.
 
 ## In-game (chess) actions
 
