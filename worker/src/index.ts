@@ -142,6 +142,7 @@ export default {
       "/bot/start", "/bot/stop", "/bot/tick", "/bot/cleanup",
       "/bot/probe", "/bot/wipe", "/bot/fix-result", "/bot/reconcile-results",
       "/bot/resync-stats", "/bot/resync-engine-uses", "/bot/ws-probe",
+      "/bot/purge-cache",
     ]);
     if (mutatingBot.has(url.pathname)) {
       if (!isAdmin(req, env)) return unauthorized();
@@ -325,6 +326,21 @@ function landingHtml(): string {
   .pie-sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   .pie-svg path { transition: opacity 0.12s ease; }
   .pie-svg path:hover { opacity: 0.7; cursor: default; }
+  /* 2-col grid for the three summary charts: language spans 2 rows on the
+     left (lots of entries), engine + membership stack on the right. Tight
+     pie sizing inside the grid so legend + pie still fit side-by-side. */
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; gap: 8px 24px; margin: 0 0 12px; align-items: start; }
+  .chart-grid > section { min-width: 0; }
+  .chart-grid .cg-tall { grid-column: 1; grid-row: 1 / span 2; }
+  .chart-grid > section > h2 { margin-top: 0; }
+  .chart-grid .pie-wrap { gap: 12px; }
+  .chart-grid .pie-svg { flex: 0 0 150px; width: 150px; height: 150px; }
+  .chart-grid .pie-legend { min-width: 0; }
+  .chart-grid .pie-legend td { padding: 2px 4px; }
+  @media (max-width: 640px) {
+    .chart-grid { grid-template-columns: 1fr; }
+    .chart-grid .cg-tall { grid-column: auto; grid-row: auto; }
+  }
   /* Recent moves table — winner / fell-through indicators. */
   .winner { color: var(--ok); font-weight: 600; }
   .rejected { color: var(--muted); text-decoration: line-through; opacity: 0.7; }
@@ -379,15 +395,21 @@ function landingHtml(): string {
   <h2>Open invites</h2>
   <div id="invites" class="muted">…</div>
 
-  <h2>Engine usage</h2>
-  <div id="engines" class="muted">…</div>
-
-  <h2>Opponents by language</h2>
-  <div id="languages" class="muted">…</div>
-
-  <h2>Opponents by membership</h2>
-  <p class="sub" style="margin: -2px 0 10px;">BGA premium vs. free, by finished game. Membership is read from the opponent's game-page profile, so it's only recorded for games played after this was added.</p>
-  <div id="premium" class="muted">…</div>
+  <div class="chart-grid">
+    <section class="cg-tall">
+      <h2>Opponents by language</h2>
+      <div id="languages" class="muted">…</div>
+    </section>
+    <section>
+      <h2>Engine usage</h2>
+      <div id="engines" class="muted">…</div>
+    </section>
+    <section>
+      <h2>Opponents by membership</h2>
+      <p class="sub" style="margin: -2px 0 10px;">BGA premium vs. free, by finished game. Membership is read from the opponent's game-page profile, so it's only recorded for games played after this was added.</p>
+      <div id="premium" class="muted">…</div>
+    </section>
+  </div>
 
   <h2>Recent moves</h2>
   <p class="sub" style="margin: -2px 0 10px;">Parallel engine race, winner picked by precedence: lichess-cloud-eval · stockfish.online · chess-api.com · rapidapi-stockfish-16 · stockfish-container · js-chess-engine (local DO) · random legal move.</p>
@@ -655,7 +677,7 @@ function render(s) {
   // treated as empty so the very first load still paints.
   const gamesEl = document.getElementById("games");
   const newGamesHtml = renderGames(s);
-  const newGamesHasContent = liveGameIds(s).live.length > 0;
+  const newGamesHasContent = selectedLiveIds(s).live.length > 0;
   const oldGamesIsPlaceholder = gamesEl.textContent.trim() === "…"
     || gamesEl.textContent.trim() === "no live games";
   if (newGamesHasContent || oldGamesIsPlaceholder) {
@@ -685,7 +707,14 @@ let selectedDiff = "grandmaster";
 function setDiff(d) {
   selectedDiff = DIFF_KEYS.includes(d) ? d : "grandmaster";
   syncDiffButtons();
-  if (window.__lastStatus) renderStats(window.__lastStatus);
+  // The games panel is now difficulty-filtered too (selectedLiveIds), so it
+  // must repaint on a tab change — and the page index may overshoot the
+  // smaller filtered set, so reset to page 1.
+  gamesPage = 1;
+  if (window.__lastStatus) {
+    renderStats(window.__lastStatus);
+    document.getElementById("games").innerHTML = renderGames(window.__lastStatus);
+  }
 }
 function syncDiffButtons() {
   for (const k of DIFF_KEYS) {
@@ -703,20 +732,20 @@ function liveDifficulty(memo, id) {
 
 function renderStats(s) {
   const st = s.stats || { wins: 0, losses: 0, draws: 0, concedes: 0, engineUses: {}, byDifficulty: {} };
-  const { live: liveIds, memo } = liveGameIds(s);
-  // "Total" = BGA-scored games (wins+losses+draws) plus games currently
-  // being played. Concedes are excluded (mostly error/abandoned states).
-  // "Live" = tables BGA reports as play/asyncplay. Both are filtered to the
-  // selected difficulty tab; "all" is the lifetime aggregate.
-  let wins, losses, draws, liveTables;
+  // "Live" uses the SAME difficulty-filtered set the gallery/table renders
+  // (selectedLiveIds), so the "Live games" count can never disagree with the
+  // number of cards shown below it. "Total" = BGA-scored games (wins+losses+
+  // draws) plus those live tables. Concedes are excluded (mostly error/
+  // abandoned states). "all" is the lifetime aggregate.
+  const { live: liveIds } = selectedLiveIds(s);
+  let wins, losses, draws;
   if (selectedDiff === "all") {
     wins = st.wins || 0; losses = st.losses || 0; draws = st.draws || 0;
-    liveTables = liveIds.length;
   } else {
     const bd = (st.byDifficulty || {})[selectedDiff] || { wins: 0, losses: 0, draws: 0 };
     wins = bd.wins || 0; losses = bd.losses || 0; draws = bd.draws || 0;
-    liveTables = liveIds.filter(id => liveDifficulty(memo, id) === selectedDiff).length;
   }
+  const liveTables = liveIds.length;
   const pastGames = wins + losses + draws;
   const totalGames = pastGames + liveTables;
   const winPct = pastGames > 0 ? "(" + Math.round(wins * 100 / pastGames) + "%)" : null;
@@ -776,6 +805,19 @@ function liveGameIds(s) {
   // Most-recently-started first.
   live.sort((a, b) => (memo[b]?.startedAt || 0) - (memo[a]?.startedAt || 0));
   return { live, memo, seen };
+}
+
+// Live game ids honoring the active difficulty tab. Both the Stats "Live
+// games" card and the gallery/table render from THIS set so the count and the
+// cards always agree (the bug where Stats showed 5 grandmaster games while the
+// gallery rendered all 9). "all" returns every live game; a specific tier
+// returns only games being played at that tier. The "hidden" count is how
+// many live games the current filter is suppressing, so the panel can hint.
+function selectedLiveIds(s) {
+  const { live, memo, seen } = liveGameIds(s);
+  if (selectedDiff === "all") return { live, memo, seen, hidden: 0 };
+  const filtered = live.filter(id => liveDifficulty(memo, id) === selectedDiff);
+  return { live: filtered, memo, seen, hidden: live.length - filtered.length };
 }
 
 // Page size by view: gallery is image-heavy so fewer per page; table is
@@ -841,9 +883,25 @@ function paginate(arr, perPage, curPage) {
   return arr.slice(start, start + perPage);
 }
 
+// Banner shown above the games panel when a difficulty tab is hiding live
+// games played at other tiers, so a small "Live games: 5" next to 9 running
+// boards reads as a filter, not a bug. Click jumps to the "all" tab.
+function liveFilterHint(hidden) {
+  if (selectedDiff === "all" || !hidden) return "";
+  return '<div class="muted" style="margin-bottom: 10px; font-size: 12px;">'
+    + 'showing <b>' + esc(selectedDiff) + '</b> games · '
+    + hidden + ' more live at other difficulties · '
+    + '<a href="javascript:setDiff(&#39;all&#39;)" class="pill">show all</a>'
+    + '</div>';
+}
+
 function renderGamesTable(s) {
-  const { live: all, memo, seen } = liveGameIds(s);
-  if (all.length === 0) return "<span class='muted'>no live games</span>";
+  const { live: all, memo, seen, hidden } = selectedLiveIds(s);
+  if (all.length === 0) {
+    return hidden
+      ? liveFilterHint(hidden) + "<span class='muted'>no live games at this difficulty</span>"
+      : "<span class='muted'>no live games</span>";
+  }
   const perPage = GAMES_PAGE_SIZE.table;
   const live = paginate(all, perPage, gamesPage);
   const movesByTable = new Map();
@@ -879,15 +937,20 @@ function renderGamesTable(s) {
       + '<td class="muted">' + started + errBadge + '</td>'
       + '</tr>';
   }).join("");
-  return '<table><thead><tr>'
+  return liveFilterHint(hidden)
+    + '<table><thead><tr>'
     + '<th>Table</th><th>Mode</th><th>Players (👉 = to move)</th><th>Last</th><th>Eval</th><th>Recent</th><th>Started</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, perPage, gamesPage, "setGamesPage", "games");
 }
 
 function renderGamesGallery(s) {
-  const { live: all, memo, seen } = liveGameIds(s);
-  if (all.length === 0) return "<span class='muted'>no live games</span>";
+  const { live: all, memo, seen, hidden } = selectedLiveIds(s);
+  if (all.length === 0) {
+    return hidden
+      ? liveFilterHint(hidden) + "<span class='muted'>no live games at this difficulty</span>"
+      : "<span class='muted'>no live games</span>";
+  }
   const perPage = GAMES_PAGE_SIZE.gallery;
   const live = paginate(all, perPage, gamesPage);
   const movesByTable = new Map();
@@ -929,7 +992,9 @@ function renderGamesGallery(s) {
       + '</div>'
       + '</a>';
   }).join("");
-  return '<div class="gallery">' + cards + '</div>' + pager(all.length, perPage, gamesPage, "setGamesPage", "games");
+  return liveFilterHint(hidden)
+    + '<div class="gallery">' + cards + '</div>'
+    + pager(all.length, perPage, gamesPage, "setGamesPage", "games");
 }
 
 function fmtClock(secs) {
@@ -1136,6 +1201,14 @@ const ENGINE_LABELS = {
 function shortEngine(e) {
   return ENGINE_LABELS[e] || e.replace(/\\s*\\(.*\\)\\s*$/, "");
 }
+// Same shortening, but preserves a leading "cache:" prefix so cache-hit
+// rows in the engine-usage chart stay distinguishable from live races.
+function shortEngineWithCache(e) {
+  if (typeof e === "string" && e.indexOf("cache:") === 0) {
+    return "cache:" + shortEngine(e.slice("cache:".length));
+  }
+  return shortEngine(e);
+}
 
 // Homepage / docs for each engine, so the usage legend and the "Engines we
 // tried" table link out to the source. random-fallback has no page.
@@ -1148,9 +1221,13 @@ const ENGINE_LINKS = {
   "js-chess-engine (local DO)": "https://www.npmjs.com/package/js-chess-engine",
 };
 // Wrap an engine key's display text in a link to its page when we have one.
+// A "cache:<engine>" key links to the same homepage as the underlying engine.
 function engineNameHtml(key, text) {
-  const href = ENGINE_LINKS[key];
-  const label = '<span class="mono">' + esc(text == null ? key : text) + '</span>';
+  const baseKey = typeof key === "string" && key.indexOf("cache:") === 0
+    ? key.slice("cache:".length) : key;
+  const href = ENGINE_LINKS[baseKey];
+  const display = text == null ? shortEngineWithCache(key) : text;
+  const label = '<span class="mono">' + esc(display) + '</span>';
   return href
     ? '<a href="' + href + '" target="_blank" rel="noopener">' + label + '</a>'
     : label;

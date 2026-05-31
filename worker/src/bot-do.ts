@@ -20,7 +20,8 @@ import type { Env } from "./index";
 import { BGAClient, type Cookie, type RawTableInfo } from "./bga-client";
 import {
   parseGameHtml, parseOpponent, buildFen, lookupUciMove, anyLegalMove, xyToSq,
-  type Destination,
+  placementAfterMove, chooseRepetitionAwareMove,
+  type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
 import { chunkChat } from "./chat";
@@ -30,9 +31,11 @@ import {
 } from "./centrifuge";
 import {
   isJoinableStatus, isLivePlayStatus, isFinishedStatus,
-  gamemodeOf, GAMEMODES, type Gamemode,
+  gamemodeOf, inviteSlotModeOf, GAMEMODES, decideReconcileMiss,
+  isBenignCreateTableError,
+  type Gamemode,
 } from "./bot-status";
-import { enginePrecedenceRank } from "./stockfish-do";
+import { enginePrecedenceRank, isCacheableEngine } from "./stockfish-do";
 import { parseGameLog, reconstructMoves } from "./game-log";
 
 const TICK_MS = 5_000;
@@ -191,6 +194,16 @@ const MOVE_CACHE_GC_INTERVAL_MS = 60 * 60 * 1000;
  *  consecutiveFailures - 1; clamped to the last entry. Resets on success. */
 const TICK_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
 
+/** Bot-relative eval (pawns, positive = bot ahead) at or above which the
+ *  repetition guard will dodge a threefold draw. Below this the bot is even
+ *  or worse, where a draw is a fine-to-welcome result, so we let it repeat.
+ *  Tuned to "up about a pawn" — enough of an edge to be worth playing on. */
+const REPETITION_AVOID_EVAL = 0.8;
+/** Max placements retained per memo for repetition detection. The history is
+ *  reset on the bot's own irreversible moves (captures / pawn pushes), so this
+ *  is just a backstop against an unbounded shuffle. */
+const REPETITION_HISTORY_CAP = 40;
+
 interface OpenInvite {
   id: string | null;
   createdAt: number | null;
@@ -247,6 +260,14 @@ interface TableMemo {
    *  the past-games table can show game length without re-deriving from
    *  the (rolling, capped) recentMoves log. */
   moveCount?: number;
+  /** Per-engine count of moves the bot played on this table, keyed by the
+   *  same `engineSource` strings used in recentMoves (e.g. "stockfish.online",
+   *  "cache:lichess-cloud-eval", "js-chess-engine (local DO)", ...).
+   *  Accumulated each move and snapshotted onto the ResultEntry at finish, so
+   *  "which engines did this game use" survives after the per-move recentMoves
+   *  log rolls off its cap. Lets us answer e.g. "what engines did our
+   *  grandmaster losses use" for any retained result. */
+  engineCounts?: Record<string, number>;
   /** Opponent-selected difficulty: a DIFFICULTY_LEVELS key, "grandmaster",
    *  or unset (= use the default for both gamemodes: grandmaster).
    *  Settable any time via chat, so the opponent can change it mid-game. */
@@ -293,6 +314,12 @@ interface TableMemo {
    *  (we don't fetch the page on the opponent's turn), so during their
    *  thinking time it shows the post-our-move snapshot. */
   lastBoardFen?: string;
+  /** Placement field (FEN field 0) of every position the bot has handed the
+   *  opponent this game, oldest first. The repetition guard counts a
+   *  candidate move's resulting placement against this list: two prior
+   *  occurrences mean playing it would create a claimable threefold. Reset on
+   *  the bot's own irreversible moves and capped at REPETITION_HISTORY_CAP. */
+  posHistory?: string[];
   /** Engine verdict for `lastBoardFen`. `cp` is in pawns from the
    *  side-to-move's perspective (so positive = bot winning at the time
    *  it asked). Persists across cache hits because CachedMove also
@@ -517,6 +544,12 @@ interface ResultEntry {
   /** Final-position FEN derived by replaying `moves`. Best-effort; undefined
    *  when reconstruction failed. */
   finalFen?: string;
+  /** Per-engine count of the bot's moves in this game, keyed by engineSource
+   *  (e.g. "stockfish.online", "cache:chess-api.com", "js-chess-engine
+   *  (local DO)"). Snapshotted from the table memo at finish so engine
+   *  provenance survives after recentMoves rolls off. Undefined on entries
+   *  written before this field existed. */
+  engineCounts?: Record<string, number>;
 }
 
 interface BotStatus {
@@ -737,6 +770,12 @@ export class BotDriver extends DurableObject<Env> {
       await this.boot();
       const apply = url.searchParams.get("apply") === "1";
       const result = await this.resyncStats(apply);
+      return Response.json(result);
+    }
+    if (url.pathname === "/purge-cache") {
+      await this.boot();
+      const apply = url.searchParams.get("apply") === "1";
+      const result = await this.purgeMoveCache(apply);
       return Response.json(result);
     }
     if (url.pathname === "/resync-engine-uses") {
@@ -960,16 +999,30 @@ export class BotDriver extends DurableObject<Env> {
     if (prev.tally === next) {
       return { ok: true, before: prev, after: prev, stats: this.status.stats };
     }
-    const dec = (k: keyof BotStats) => {
+    // Rebalance BOTH the top-line counters and the per-difficulty bucket so
+    // the dashboard's difficulty tabs stay consistent with the "all" totals.
+    // (Skipping byDifficulty here used to leave it drifted until a separate
+    // /resync-stats pass.) The bucket is keyed by the entry's recorded
+    // difficulty, defaulting to grandmaster for pre-field entries.
+    if (!this.status.stats.byDifficulty) {
+      this.status.stats.byDifficulty = emptyDifficultyTally();
+    }
+    const diffKey = prev.difficulty || "grandmaster";
+    const bucket = this.status.stats.byDifficulty[diffKey]
+      ?? (this.status.stats.byDifficulty[diffKey] = { wins: 0, losses: 0, draws: 0 });
+    const decTop = (k: keyof BotStats) => {
       const v = this.status.stats[k];
       if (typeof v === "number" && v > 0) (this.status.stats as any)[k] = v - 1;
     };
-    if (prev.tally === "win") dec("wins");
-    else if (prev.tally === "loss") dec("losses");
-    else if (prev.tally === "draw") dec("draws");
-    if (next === "win") this.status.stats.wins++;
-    else if (next === "loss") this.status.stats.losses++;
-    else if (next === "draw") this.status.stats.draws++;
+    const decBucket = (k: "wins" | "losses" | "draws") => {
+      if (bucket[k] > 0) bucket[k] -= 1;
+    };
+    if (prev.tally === "win") { decTop("wins"); decBucket("wins"); }
+    else if (prev.tally === "loss") { decTop("losses"); decBucket("losses"); }
+    else if (prev.tally === "draw") { decTop("draws"); decBucket("draws"); }
+    if (next === "win") { this.status.stats.wins++; bucket.wins++; }
+    else if (next === "loss") { this.status.stats.losses++; bucket.losses++; }
+    else if (next === "draw") { this.status.stats.draws++; bucket.draws++; }
     const after: ResultEntry = { ...prev, tally: next };
     results[idx] = after;
     await this.ctx.storage.put("recentResults", results);
@@ -1461,6 +1514,15 @@ export class BotDriver extends DurableObject<Env> {
     // myTables succeeded → reset backoff counter and clear stale single-err.
     this.status.consecutiveTickFailures = 0;
     this.status.lastErr = null;
+    // BGA occasionally answers myTables with an HTML interstitial (rate
+    // limit / session bounce) that the client parses to an EMPTY array
+    // rather than throwing. An empty snapshot looks identical to "the bot
+    // genuinely has no open tables", so on its own it can't bump the
+    // reconcile counters. We pair it with the per-table getTableInfo
+    // results below: if myTables was empty AND not a single live memo
+    // resolved this tick, the whole snapshot is suspect and we skip the
+    // miss bump (see SUSPECT_BLOCK handling in the reconcile loop).
+    const myTablesEmpty = tables.length === 0;
 
     // Reconcile in-flight tables that fell off the lobby snapshots.
     // myTables() polls status=open/asyncopen (plus the recently-finished
@@ -1528,6 +1590,11 @@ export class BotDriver extends DurableObject<Env> {
       );
     }
     // Bounded-parallel reconcile for the remaining (potentially live) tables.
+    // Phase 1: fetch each table; re-inject the live ones and collect the
+    // misses WITHOUT bumping yet. We need the whole tick's resolution count
+    // before we can tell a genuine vanish from a transient BGA block.
+    let reconcileResolved = 0;
+    const missedThisTick: Array<[string, TableMemo]> = [];
     for (let i = 0; i < toReconcile.length; i += RECONCILE_CONCURRENCY) {
       const batch = toReconcile.slice(i, i + RECONCILE_CONCURRENCY);
       await Promise.all(
@@ -1536,20 +1603,49 @@ export class BotDriver extends DurableObject<Env> {
           if (t) {
             m.reconcileMissCount = 0;
             tables.push(t);
+            reconcileResolved++;
             return;
           }
-          m.reconcileMissCount = (m.reconcileMissCount ?? 0) + 1;
-          if (m.reconcileMissCount >= RECONCILE_MISS_LIMIT) {
-            this.recordError(
-              "reconcileMiss",
-              `Table ${id} missing from both myTables and getTableInfo for ${m.reconcileMissCount} ticks; marking finished`,
-              id,
-            );
-            m.finished = true;
-            m.finishedAt = Date.now();
-          }
+          missedThisTick.push([id, m]);
         }),
       );
+    }
+    // Phase 2: a suspected snapshot block is myTables coming back empty AND
+    // not a single getTableInfo resolving this tick, with at least two live
+    // memos in play (one missing realtime table can't be distinguished from
+    // a block, so it falls through to normal GC). When BGA wedges every
+    // request for a tick, bumping all counters would poison the data and, at
+    // RECONCILE_MISS_LIMIT, falsely GC every realtime game at once. Skip the
+    // bump and log a single summary instead of one error per table.
+    const suspectBlock =
+      myTablesEmpty && reconcileResolved === 0 && missedThisTick.length >= 2;
+    if (suspectBlock) {
+      this.recordError(
+        "reconcileSnapshotSuspect",
+        `myTables returned empty and all ${missedThisTick.length} live memo lookup(s) failed this tick; treating as a transient BGA block and skipping reconcile-miss bump`,
+      );
+    } else {
+      for (const [id, m] of missedThisTick) {
+        m.reconcileMissCount = (m.reconcileMissCount ?? 0) + 1;
+        // Realtime games GC after RECONCILE_MISS_LIMIT misses; async games
+        // fail OPEN (never abandoned on a flake). See decideReconcileMiss.
+        const decision = decideReconcileMiss(
+          m.reconcileMissCount, m.realtime, RECONCILE_MISS_LIMIT,
+        );
+        if (decision.log) {
+          this.recordError(
+            "reconcileMiss",
+            decision.reason === "fail-open-async"
+              ? `Async table ${id} missing from myTables and getTableInfo for ${m.reconcileMissCount} ticks; leaving live (fail open, not abandoning)`
+              : `Table ${id} missing from both myTables and getTableInfo for ${m.reconcileMissCount} ticks; marking finished`,
+            id,
+          );
+        }
+        if (decision.markFinished) {
+          m.finished = true;
+          m.finishedAt = Date.now();
+        }
+      }
     }
 
     // Build the snapshot from this tick, then patch back any active-memo
@@ -1603,6 +1699,46 @@ export class BotDriver extends DurableObject<Env> {
       if (!liveIds.has(id) && (m.finished || m.conceded)) {
         delete this.status.tables[id];
       }
+    }
+    // Sweep no-interaction orphan memos. getMemo() stamps a memo the moment
+    // handleTable touches ANY snapshot table, but several handleTable paths
+    // early-return before setting an interaction flag (reclaim seat, lost
+    // seat, a freshly-created open-invite slot a human never joins). If such
+    // a table then falls off the snapshot, the memo has acceptedSeat/
+    // ackedStart/saidHi all false — so it matches neither the reconcile
+    // `missing` filter (which REQUIRES an interaction flag) nor the
+    // finished/conceded GC above, and leaks forever (e.g. table 857063590).
+    // GC any orphan that's absent from the snapshot, never interacted, not a
+    // currently-advertised open-invite slot, and older than STALE_UNPLAYED_MS.
+    // A null startedAt (legacy memo) is stamped now so the grace clock starts
+    // rather than GC'ing it blind on first sight.
+    const openInviteIds = new Set(
+      Object.values(this.status.openInvites)
+        .map((s) => s.id)
+        .filter((id): id is string => id != null),
+    );
+    const orphans: string[] = [];
+    for (const id of Object.keys(this.status.tables)) {
+      const m = this.status.tables[id];
+      if (liveIds.has(id)) continue;
+      if (m.finished || m.conceded) continue;
+      if (m.acceptedSeat || m.ackedStart || m.saidHi) continue;
+      if (openInviteIds.has(id)) continue;
+      if (m.startedAt == null) { m.startedAt = Date.now(); continue; }
+      if (Date.now() - m.startedAt > STALE_UNPLAYED_MS) {
+        delete this.status.tables[id];
+        orphans.push(id);
+      }
+    }
+    if (orphans.length > 0) {
+      this.recordError(
+        "orphanSweep",
+        `GC'd ${orphans.length} no-interaction orphan memo(s) (off-snapshot, never joined, >${
+          STALE_UNPLAYED_MS / 60_000
+        }m old): ${orphans.slice(0, 10).join(", ")}${
+          orphans.length > 10 ? ", …" : ""
+        }`,
+      );
     }
     await this.putIfChanged("tables", this.status.tables);
     await this.putIfChanged("stats", this.status.stats);
@@ -1663,6 +1799,57 @@ export class BotDriver extends DurableObject<Env> {
       await this.ctx.storage.delete(victims.slice(i, i + 128));
     }
     console.log(`bot:gcMoveCache evicted=${victims.length} kept=${MOVE_CACHE_CAP}`);
+  }
+
+  /**
+   * Evict every move-cache entry whose verdict did NOT come from a
+   * Stockfish/lichess source (isCacheableEngine). One-shot cleanup for legacy
+   * entries written before the cache-write gate was tightened — e.g. a
+   * js-chess-engine move cached when the remote race fully failed during a
+   * grandmaster game, or a `random-fallback` slipping through an older gate.
+   * After this runs (and the tightened write gate is deployed), every `mc:`
+   * key is guaranteed to be a remote Stockfish/lichess verdict. Dry-run by
+   * default; pass apply=true to actually delete. Returns a per-engine
+   * breakdown of what stays vs goes.
+   */
+  private async purgeMoveCache(apply: boolean): Promise<{
+    apply: boolean;
+    total: number;
+    kept: number;
+    removed: number;
+    keptByEngine: Record<string, number>;
+    removedByEngine: Record<string, number>;
+  }> {
+    const entries = await this.ctx.storage.list<CachedMove>({ prefix: MOVE_CACHE_PREFIX });
+    const keptByEngine: Record<string, number> = {};
+    const removedByEngine: Record<string, number> = {};
+    const victims: string[] = [];
+    for (const [key, val] of entries) {
+      const engine = val?.engine ?? "(missing)";
+      if (isCacheableEngine(engine)) {
+        keptByEngine[engine] = (keptByEngine[engine] ?? 0) + 1;
+      } else {
+        removedByEngine[engine] = (removedByEngine[engine] ?? 0) + 1;
+        victims.push(key);
+      }
+    }
+    if (apply) {
+      // storage.delete accepts up to 128 keys per call; chunk to stay under it.
+      for (let i = 0; i < victims.length; i += 128) {
+        await this.ctx.storage.delete(victims.slice(i, i + 128));
+      }
+      console.log(
+        `bot:purgeMoveCache removed=${victims.length} kept=${entries.size - victims.length}`,
+      );
+    }
+    return {
+      apply,
+      total: entries.size,
+      kept: entries.size - victims.length,
+      removed: victims.length,
+      keptByEngine,
+      removedByEngine,
+    };
   }
 
   /**
@@ -1870,9 +2057,18 @@ export class BotDriver extends DurableObject<Env> {
     );
 
     // First pass: adopt any unowned-but-matching tables into the slot for
-    // their gamemode (covers restarts where DO storage was cleared).
+    // their gamemode. Covers two recovery cases:
+    //   1. DO storage was cleared (restart) but BGA still has our tables.
+    //   2. The slot was nulled mid-flight (older builds did this on the
+    //      `oppSeated` transient, then lost the table when opp left) and
+    //      the table sits orphaned in BGA's records, blocking every future
+    //      createTable with "you are already at a real-time table".
+    // inviteSlotModeOf (not gamemodeOf) maps `setup`/`init` to "realtime",
+    // so a bot-owned table in the brief setup transitional state is also
+    // re-adopted into the realtime slot and can be cleaned up by the
+    // setup-timeout path below.
     for (const t of myJoinable) {
-      const mode = gamemodeOf(t.status);
+      const mode = inviteSlotModeOf(t.status);
       if (!mode) continue;
       const slot = this.status.openInvites[mode];
       if (slot.id == null) {
@@ -1920,39 +2116,36 @@ export class BotDriver extends DurableObject<Env> {
             await this.client.openTableNow(slot.id).catch(() => {});
             continue;
           }
-          // Never abandon a table an opponent has already joined: that's a
-          // real (realtime) game launching through the setup/acceptance
-          // phase, not a dead invite. Leaving it here makes the bot
-          // silently quit a game the opponent is actively playing (the
-          // exact bug we hit). Release the slot so the reaper stops
-          // managing it as an invite and let the play loop carry the game.
           const oppSeated = !!t.players
             && Object.keys(t.players).some((pid) => pid !== this.uid);
-          if (oppSeated) {
-            slot.id = null;
-            slot.createdAt = null;
-            continue;
-          }
           if (actualMode === null) {
             // Transient init/setup status — BGA hasn't promoted the
-            // table to open/asyncopen yet. Don't neutralize too eagerly:
-            // that would kill our own freshly-created table. But if it's
-            // been stuck this long with no opponent, the invite is dead,
-            // so leave it and fall through to recreate.
+            // table to open/asyncopen yet. Within the 15-min launch
+            // window, do nothing so handleTable's launch handshake can
+            // drive the table to play (including when oppSeated — that
+            // means a real realtime game is being launched and a
+            // leaveTable here would silently quit it). Past 15 min the
+            // launch is genuinely stuck: opp ghosted between Join and
+            // Accept, or BGA wedged the table mid-handshake. Without an
+            // escape the table holds the realtime slot indefinitely and
+            // blocks every future createTable ("you are already at a
+            // real-time table about to start"). Abort regardless of
+            // oppSeated.
             const age = now - (slot.createdAt ?? now);
             if (age <= OPEN_INVITE_SETUP_TIMEOUT_MS) continue;
             this.recordError(
               `setupTimeout:${mode}`,
-              `table stuck in ${t.status} for ${Math.round(age / 60_000)}m`,
+              `table stuck in ${t.status} for ${Math.round(age / 60_000)}m${oppSeated ? " (opp seated)" : ""}`,
               slot.id,
             );
             await this.client.leaveTable(slot.id).catch(() => {});
           } else {
-            // Confirmed wrong mode (e.g. realtime demoted to async): leave
-            // the rogue table and schedule a recreate. The
-            // OPEN_INVITE_RETRY_MS cooldown is honored before retry so a
-            // persistently-broken realtime path can't flood the lobby
-            // (max one createTable per minute per mode).
+            // Confirmed wrong mode (e.g. realtime demoted to async).
+            // Never leave a wrong-mode table with an opp already seated:
+            // they joined a real game and leaving would silently quit
+            // it. Just keep the slot parked; status will move to
+            // play/finished on its own and clear the slot below.
+            if (oppSeated) continue;
             this.recordError(
               `modeMismatch:${mode}->${actualMode}`,
               `BGA returned ${t.status} for gamemode=${mode}`,
@@ -2012,7 +2205,17 @@ export class BotDriver extends DurableObject<Env> {
         // a correctly-moded open slot in the verification path above.
         console.log(`opened ${mode} friendly invite table=${tableId}`);
       } catch (e) {
-        this.recordError(`createTable:${mode}`, e);
+        // BGA refuses a second realtime table while one is already launching
+        // ("about to start") or mid-game — expected during the window between
+        // an opponent joining our invite and the game reaching `play`. The
+        // per-mode cooldown (lastAttempt, set above) is already armed, so just
+        // back off quietly instead of flooding recentErrors ~1/min. Genuine
+        // faults (HTML error pages, auth loss) still get recorded.
+        if (isBenignCreateTableError(String(e))) {
+          console.log(`createTable ${mode} deferred — already at a realtime table`);
+        } else {
+          this.recordError(`createTable:${mode}`, e);
+        }
       }
     }
 
@@ -2363,6 +2566,7 @@ export class BotDriver extends DurableObject<Env> {
           oppRawScore,
           durationMs: m.startedAt != null ? Date.now() - m.startedAt : undefined,
           moveCount: m.moveCount,
+          engineCounts: m.engineCounts,
           botColor: m.botColor,
           oppName: m.oppName,
           oppId: m.oppId,
@@ -2860,6 +3064,18 @@ export class BotDriver extends DurableObject<Env> {
     let engineSource = "unknown";
     let engineResults: EngineAltEntry[] | undefined;
     let engineErr: string | undefined;
+    // Set when the repetition guard swapped off the top engine move (or
+    // bypassed the cache) to dodge a threefold. Used to skip the cache WRITE
+    // below: the deviation is game-specific (depends on this table's
+    // posHistory), so caching it would pollute the shared cache with a
+    // context-bound pick. The cache must keep holding the true best move.
+    let avoidedRepetition = false;
+    const history = m.posHistory ?? [];
+    const completesThreefold = (pieceId: string, dest: Destination): boolean => {
+      const placement = placementAfterMove(parsed.pieces, pieceId, dest);
+      return placement != null
+        && history.filter((p) => p === placement).length >= 2;
+    };
 
     // Cache lookup: identical FENs across games reuse a prior engine
     // verdict. lookupUciMove still validates against the current legal
@@ -2876,10 +3092,22 @@ export class BotDriver extends DurableObject<Env> {
     if (cached) {
       const cachedChosen = lookupUciMove(cached.move, parsed.pieces, parsed.destinationsByPiece);
       if (cachedChosen) {
-        chosen = cachedChosen;
-        engineSource = `cache:${cached.engine}`;
-        if (cached.cp != null || cached.mate != null) {
-          m.lastEval = { cp: cached.cp, mate: cached.mate, engine: cached.engine, ts: Date.now() };
+        // The cache is the engine of the repetition bug: it hands back the
+        // same move for a recurring placement. If replaying it would complete
+        // a threefold AND the bot is winning (a draw would throw the edge
+        // away), bypass the cache so the engine race below can offer
+        // alternatives the guard can pick from. When even/losing, take it —
+        // the draw is fine.
+        const cacheWinning = (cached.mate != null && cached.mate > 0)
+          || (cached.cp != null && cached.cp >= REPETITION_AVOID_EVAL);
+        if (cacheWinning && completesThreefold(cachedChosen.pieceId, cachedChosen.dest)) {
+          avoidedRepetition = true;
+        } else {
+          chosen = cachedChosen;
+          engineSource = `cache:${cached.engine}`;
+          if (cached.cp != null || cached.mate != null) {
+            m.lastEval = { cp: cached.cp, mate: cached.mate, engine: cached.engine, ts: Date.now() };
+          }
         }
       }
     }
@@ -2889,26 +3117,34 @@ export class BotDriver extends DurableObject<Env> {
         const result = await this.askEngine(fen, useDifficulty ? DIFFICULTY_LEVELS[effectiveDifficulty] : undefined);
         if (result) {
           engineResults = result.alternatives;
-          if (result.move) {
-            chosen = lookupUciMove(result.move, parsed.pieces, parsed.destinationsByPiece);
-            if (chosen) engineSource = result.engine;
+          // Candidate list best-first: the race winner, then the other
+          // engines' moves in precedence order (alternatives is already
+          // precedence-sorted). chooseRepetitionAwareMove resolves each
+          // against BGA's legal table, skips unresolvable ones, and — when
+          // the bot is winning — returns the best move that doesn't complete
+          // a threefold (falling back to the top pick if every move repeats).
+          const candidates: MoveCandidate[] = [];
+          if (result.move) candidates.push({ uci: result.move, engine: result.engine });
+          for (const alt of result.alternatives ?? []) {
+            if (!alt.move || alt.error || alt.engine === result.engine) continue;
+            candidates.push({ uci: alt.move, engine: alt.engine });
           }
-          // Winner's move failed to resolve against BGA's legal table (most
-          // commonly: engine suggested a castle BGA refuses, or an old
-          // alternatives entry from a stale FEN). Walk the rest of the
-          // race results in their original (precedence) order before
-          // resorting to a random move.
-          if (!chosen && result.alternatives) {
-            for (const alt of result.alternatives) {
-              if (!alt.move || alt.error) continue;
-              if (alt.engine === result.engine) continue;
-              const cand = lookupUciMove(alt.move, parsed.pieces, parsed.destinationsByPiece);
-              if (cand) {
-                chosen = cand;
-                engineSource = alt.engine;
-                break;
-              }
-            }
+          // avoidDraw only when the bot is clearly ahead — otherwise a draw is
+          // an acceptable (or, when behind, welcome) result and we keep the
+          // engine's top move. Eval is White-relative off the wire; normalize
+          // to bot-relative via toBotEval before comparing.
+          const winner = result.alternatives?.find((a) => a.engine === result.engine);
+          const winnerCp = toBotEval(winner?.eval);
+          const winnerMate = toBotEval(winner?.mate);
+          const avoidDraw = (winnerMate != null && winnerMate > 0)
+            || (winnerCp != null && winnerCp >= REPETITION_AVOID_EVAL);
+          const pick = chooseRepetitionAwareMove(
+            candidates, parsed.pieces, parsed.destinationsByPiece, history, avoidDraw,
+          );
+          if (pick) {
+            chosen = { pieceId: pick.pieceId, dest: pick.dest };
+            engineSource = pick.engine;
+            if (pick.avoidedRepetition) avoidedRepetition = true;
           }
         }
       } catch (e) {
@@ -2996,6 +3232,10 @@ export class BotDriver extends DurableObject<Env> {
       pieceType: movedPiece?.piece_type,
     });
     m.moveCount = (m.moveCount ?? 0) + 1;
+    // Tally engine provenance per game so it outlives the capped recentMoves
+    // log (snapshotted onto the ResultEntry at finish).
+    m.engineCounts = m.engineCounts ?? {};
+    m.engineCounts[engineSource] = (m.engineCounts[engineSource] ?? 0) + 1;
     console.log(
       `t=${tableId} move ${fromSq}→${toSq} engine=${engineSource} ` +
       `color=${ourColor} piece=${movedPiece?.piece_type ?? "?"} ` +
@@ -3003,16 +3243,26 @@ export class BotDriver extends DurableObject<Env> {
       `cp=${moveCp ?? "?"} mate=${moveMate ?? "?"} thinkMs=${moveThinkMs ?? "?"}`,
     );
 
-    // Cache fresh engine verdicts (skip cache hits and random fallback) so
-    // future hits on the same FEN reuse the result. UCI is just from+to;
-    // lookupUciMove ignores the promo char, matching how the bot already
-    // delegates the promoted-piece choice to BGA's default.
+    // Cache fresh engine verdicts so future hits on the same FEN reuse the
+    // result. UCI is just from+to; lookupUciMove ignores the promo char,
+    // matching how the bot already delegates the promoted-piece choice to
+    // BGA's default.
+    //
+    // Only REMOTE Stockfish/lichess verdicts may enter the cache
+    // (isCacheableEngine): cache hits, the random fallback, AND the local
+    // js-chess-engine are all excluded, so the shared cache never serves a
+    // weak local move into a grandmaster game. This is the guarantee that
+    // "only requests to Stockfish engines or lichess enter the cache".
+    //
+    // Also skip when the repetition guard deviated from the engine's top move
+    // (avoidedRepetition): that pick is specific to THIS game's move history,
+    // so caching it would pollute the shared cache with a context-bound move.
     //
     // Precedence-gated: only write if the new engine ranks at least as
     // well as whatever the cache already holds. Otherwise a one-off run
     // where the top engine was offline would downgrade a previously
     // cached top-engine verdict.
-    if (!useDifficulty && engineSource !== "random-fallback" && !engineSource.startsWith("cache:")) {
+    if (!useDifficulty && !avoidedRepetition && isCacheableEngine(engineSource)) {
       const newRank = enginePrecedenceRank(engineSource);
       const cachedRank = cached ? enginePrecedenceRank(cached.engine) : Number.POSITIVE_INFINITY;
       if (newRank <= cachedRank) {
@@ -3025,6 +3275,21 @@ export class BotDriver extends DurableObject<Env> {
     }
     m.lastMoveFrom = fromSq;
     m.lastMoveTo = toSq;
+    // Record the placement we just handed the opponent for the repetition
+    // guard. The bot's own irreversible moves (captures / pawn pushes) make
+    // every earlier position unreachable, so reset the window on those —
+    // older placements can never recur and would only risk a false veto.
+    // Otherwise append and trim to REPETITION_HISTORY_CAP as a backstop.
+    const playedPlacement = placementAfterMove(parsed.pieces, chosen.pieceId, chosen.dest);
+    if (playedPlacement) {
+      const irreversible = isCapture || movedPiece?.piece_type === "pawn";
+      const hist = irreversible ? [] : (m.posHistory ?? []);
+      hist.push(playedPlacement);
+      if (hist.length > REPETITION_HISTORY_CAP) {
+        hist.splice(0, hist.length - REPETITION_HISTORY_CAP);
+      }
+      m.posHistory = hist;
+    }
     // Optimistic: bot just played, so logically it's the opponent's move
     // even while BGA's HTML lag still echoes activePlayer=us. Without this,
     // the gallery shows "bot to move" until the next tick after the lag
