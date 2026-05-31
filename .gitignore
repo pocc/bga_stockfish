@@ -33,3 +33,6 @@ build/
 
 # Editor backups
 *.bak
+
+# Throwaway one-off scripts + captured game data (never committed)
+scratch/

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "predeploy": "npm run test:run",
+    "predeploy": "npm run typecheck && npm run test:run",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
