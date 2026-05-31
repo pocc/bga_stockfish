@@ -2,6 +2,9 @@ import { DurableObject } from "cloudflare:workers";
 import { Chess } from "chess.js";
 import { Game } from "js-chess-engine";
 import type { Env } from "./index";
+import {
+  ENGINE_PRECEDENCE, enginePrecedenceRank, LOCAL_ENGINE, isCacheableEngine,
+} from "./engine-precedence";
 
 interface BestMoveRequest {
   fen: string;
@@ -64,31 +67,11 @@ const CONTAINER_TIMEOUT_MS = 5_000;
 const LICHESS_CLOUD_TIMEOUT_MS = 2_000;
 const STOCKFISH_ONLINE_TIMEOUT_MS = 5_000;
 const RAPIDAPI_STOCKFISH_TIMEOUT_MS = 5_000;
-/** Precedence for picking the winner among completed engines. Lower index
- *  beats higher. Engines not in the list lose to engines in the list.
- *  lichess-cloud-eval sits at #0 because when it hits it returns
- *  community-cached evals at very deep nominal depths (typically 30-75+);
- *  it misses for most non-opening positions, in which case the next engine
- *  wins. stockfish.online ranks above chess-api.com because move-log data
- *  showed it both more available (~100% vs ~74% — chess-api intermittently
- *  blows the 5s ceiling) and deeper on average (always depth 15 vs ~13-15).
- *  stockfish-container is dormant (binding is commented out in
- *  wrangler.toml) but kept here so re-enabling is just an uncomment. */
-export const ENGINE_PRECEDENCE = [
-  "lichess-cloud-eval",
-  "stockfish.online",
-  "chess-api.com",
-  "rapidapi-stockfish-16",
-  "stockfish-container",
-  "js-chess-engine (local DO)",
-];
-
-/** Rank of an engine in ENGINE_PRECEDENCE (lower = stronger). Unknown
- *  engines sort last so they never displace a ranked cache entry. */
-export function enginePrecedenceRank(engine: string): number {
-  const i = ENGINE_PRECEDENCE.indexOf(engine);
-  return i < 0 ? Number.POSITIVE_INFINITY : i;
-}
+// Engine precedence + cache-eligibility helpers live in a pure module
+// (./engine-precedence) so unit tests can import them without
+// `cloudflare:workers`. Imported at the top for this file's own use and
+// re-exported here so existing `from "./stockfish-do"` imports keep working.
+export { ENGINE_PRECEDENCE, enginePrecedenceRank, LOCAL_ENGINE, isCacheableEngine };
 
 interface ChessApiResp {
   type?: string;
