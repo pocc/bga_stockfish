@@ -669,7 +669,7 @@ function render(s) {
 
   renderStats(s);
 
-  document.getElementById("invites").innerHTML = renderInvites(s.openInvites);
+  document.getElementById("invites").innerHTML = renderInvites(s);
   // Only repaint the games section if the new snapshot would render
   // something. If a tick momentarily yields no live games (BGA flake,
   // reconcile miss) we leave the prior gallery in place rather than
@@ -779,12 +779,57 @@ function tableLink(id, gameserver) {
   return '<a href="' + bgaUrl(id, gameserver) + '" target="_blank" class="mono">' + esc(id) + '</a>';
 }
 
-function renderInvites(invites) {
+// A live count-up timer for the "still launching" invite state. Renders the
+// elapsed time since sinceMs and carries data-since so tickCountups() can
+// advance it every second between the (10s) status polls.
+function countup(sinceMs) {
+  if (!sinceMs) return '<span class="muted">—</span>';
+  return '<span class="countup mono" data-since="' + sinceMs + '">'
+    + fmtClock((Date.now() - sinceMs) / 1000) + '</span>';
+}
+
+// Classify an open-invite slot into one of three visible states so a stuck
+// launch is obvious at a glance:
+//   - published invite (open/asyncopen): link to the joinable table + "Xm ago"
+//     — the normal "waiting for a human" state.
+//   - consumed into a live / just-finished game (play/asyncplay/finished, or
+//     the memo is finished/conceded): a LINK to that game instead of "—".
+//     There is no open invite while a realtime game is live (one realtime game
+//     per account), so the slot points at the ongoing table.
+//   - created but not yet visible to players (setup/init, or not in the lobby
+//     snapshot yet): "Loading…" + a count-up timer. The timer climbs every
+//     second and turns amber (>30s) then red (>120s), so a hung setup stands
+//     out (the backend reaps a truly stuck launch at 15min).
+function inviteStateCells(v, seen, s) {
+  if (!v.id) {
+    return '<td><span class="muted">—</span></td><td class="muted"></td>';
+  }
+  const t = seen.get(v.id);
+  const m = (s.tables || {})[v.id] || {};
+  const status = t && t.status;
+  const created = v.createdAt ? fmtTime(v.createdAt) : "";
+  const live = status === "play" || status === "asyncplay";
+  const done = status === "finished" || status === "asyncfinished" || m.finished || m.conceded;
+  if (status === "open" || status === "asyncopen") {
+    return '<td>' + tableLink(v.id) + '</td><td class="muted">' + created + '</td>';
+  }
+  if (live || done) {
+    const tag = done ? "finished" : "in game";
+    return '<td>' + tableLink(v.id)
+      + ' <span class="muted" style="font-size:11px;">' + tag + '</span></td>'
+      + '<td class="muted">' + created + '</td>';
+  }
+  return '<td><span class="muted">Loading… </span>' + countup(v.createdAt)
+    + '</td><td class="muted">' + created + '</td>';
+}
+
+function renderInvites(s) {
+  const invites = s && s.openInvites;
   if (!invites) return "<span class='muted'>none</span>";
+  const seen = new Map((s.lastTablesSeen || []).map(t => [t.id, t]));
   const rows = ["realtime", "async"].map(mode => {
     const v = invites[mode] || {};
-    const idCell = v.id ? tableLink(v.id) : "<span class='muted'>—</span>";
-    return '<tr><td>' + mode + '</td><td>' + idCell + '</td><td class="muted">' + (v.createdAt ? fmtTime(v.createdAt) : "") + '</td></tr>';
+    return '<tr><td>' + mode + '</td>' + inviteStateCells(v, seen, s) + '</tr>';
   }).join("");
   return '<table><thead><tr><th>Mode</th><th>Table</th><th>Created</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
@@ -1514,8 +1559,25 @@ function renderErrors(errors) {
     + pager(all.length, ERRORS_PAGE_SIZE, errorsPage, "setErrorsPage", "errors");
 }
 
+// Advance the "Loading…" invite count-up timers every second (the status
+// poll is only every 10s). A normal setup clears within a few seconds; a hung
+// one keeps climbing and goes amber (>30s) then red (>120s) so it's obvious.
+function tickCountups() {
+  const now = Date.now();
+  document.querySelectorAll(".countup").forEach(el => {
+    const since = Number(el.getAttribute("data-since"));
+    if (!since) return;
+    const secs = (now - since) / 1000;
+    el.textContent = fmtClock(secs);
+    el.classList.toggle("muted", secs < 30);
+    el.classList.toggle("warn", secs >= 30 && secs < 120);
+    el.classList.toggle("err", secs >= 120);
+  });
+}
+
 load();
 setInterval(load, 10000);
+setInterval(tickCountups, 1000);
 </script>
 </body>
 </html>`;
