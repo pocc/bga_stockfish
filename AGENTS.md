@@ -211,6 +211,19 @@ Fix lives next to the reconcile loop in `tick()`. Each memo tracks
 bot records a `reconcileMiss` row in `recentErrors` whenever this
 fires so you can see in `/bot/status` why a memo was dropped.
 
+**This GC applies to realtime games only.** Async (turn-based) games
+fail OPEN: when `m.realtime === false` the bot never marks the memo
+finished on reconcile-miss, it just leaves it live. A turn-based game
+can legitimately sit idle for hours or days, so a null `getTableInfo`
+is almost always a transient BGA flake, not a real finish — and
+marking it finished makes the bot stop moving and forfeit the game on
+the clock (this cost us table 856600921, recorded as a bogus 3-move
+loss). The memo is left for the normal finish handler to tally when the
+table reappears as `asyncfinished`. A blocked `createTable` is
+recoverable; a forfeited live game is not. The async case logs a single
+`reconcileMiss` row at the threshold (not per-tick) so a permanently-
+missing async memo can't flood the error log.
+
 Don't lower the threshold to 1: BGA occasionally returns null for a
 single tick on a table that's still live, and bouncing the memo would
 re-trigger every downstream lifecycle action (hello message, etc.) the

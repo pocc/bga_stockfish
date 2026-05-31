@@ -4,7 +4,9 @@ import {
   isLivePlayStatus,
   isFinishedStatus,
   gamemodeOf,
+  inviteSlotModeOf,
   GAMEMODES,
+  isBenignCreateTableError,
 } from "../src/bot-status";
 
 /**
@@ -63,5 +65,76 @@ describe("status helpers", () => {
 
   test("GAMEMODES covers exactly realtime + async", () => {
     expect([...GAMEMODES].sort()).toEqual(["async", "realtime"]);
+  });
+});
+
+/**
+ * Regression: a bot-owned table briefly reports `setup`/`init` after
+ * createTable, before BGA promotes it to `open`. The invite-slot adoption
+ * pass used to call gamemodeOf() (returns null for setup/init) and skip the
+ * table; if the slot was also null at that moment (DO restart, or the
+ * oppSeated transient-clear path that's since been removed), the table sat
+ * orphaned in BGA's records and every subsequent createTable failed with
+ * "you are already at a real-time table about to start". inviteSlotModeOf
+ * pins setup/init to realtime so the slot reclaims the orphan and the
+ * 15-minute setup-timeout path can reap it.
+ */
+describe("inviteSlotModeOf", () => {
+  test("open / asyncopen match gamemodeOf", () => {
+    expect(inviteSlotModeOf("open")).toBe("realtime");
+    expect(inviteSlotModeOf("asyncopen")).toBe("async");
+  });
+
+  test("setup and init are treated as realtime (not null)", () => {
+    expect(inviteSlotModeOf("setup")).toBe("realtime");
+    expect(inviteSlotModeOf("init")).toBe("realtime");
+    expect(gamemodeOf("setup")).toBeNull();
+    expect(gamemodeOf("init")).toBeNull();
+  });
+
+  test("non-joinable statuses still resolve to null", () => {
+    expect(inviteSlotModeOf("play")).toBeNull();
+    expect(inviteSlotModeOf("asyncplay")).toBeNull();
+    expect(inviteSlotModeOf("finished")).toBeNull();
+    expect(inviteSlotModeOf("asyncfinished")).toBeNull();
+    expect(inviteSlotModeOf("totally_made_up")).toBeNull();
+  });
+});
+
+describe("isBenignCreateTableError", () => {
+  test("the 'about to start' feException is benign", () => {
+    const msg =
+      'createTable failed gamemode=realtime: {"status":"0","exception":' +
+      '"feException","error":"You are already at a real-time table about ' +
+      'to start! <a href=\\"/table?table=859987695\\">See this game</a>",' +
+      '"expected":1,"code":100}';
+    expect(isBenignCreateTableError(msg)).toBe(true);
+  });
+
+  test("a 'game in progress at another table' refusal is benign", () => {
+    const msg =
+      'createTable failed gamemode=realtime: {"status":"0","error":' +
+      '"You have a game in progress at another table","code":100}';
+    expect(isBenignCreateTableError(msg)).toBe(true);
+  });
+
+  test("an mmstarted envelope (no table issued) is benign", () => {
+    const msg =
+      'createTable failed gamemode=async: {"status":1,"data":' +
+      '{"mmstarted":true,"mode":"realtime"}}';
+    expect(isBenignCreateTableError(msg)).toBe(true);
+  });
+
+  test("an HTML error page is NOT benign (stays logged)", () => {
+    const msg =
+      "createTable non-json: <html>\n    <head>\n        <style " +
+      'type="text/css">\n            html { min-height: 100%; }';
+    expect(isBenignCreateTableError(msg)).toBe(false);
+  });
+
+  test("a generic/unknown failure is NOT benign", () => {
+    expect(isBenignCreateTableError("Error: fetch failed")).toBe(false);
+    expect(isBenignCreateTableError("createTable failed gamemode=realtime: " +
+      '{"status":"0","error":"Game not available"}')).toBe(false);
   });
 });
