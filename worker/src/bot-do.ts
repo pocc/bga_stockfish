@@ -532,6 +532,14 @@ interface ResultEntry {
   parsedScore: number | null;
   /** Which counter we incremented: "win" / "loss" / "draw" / "none". */
   tally: "win" | "loss" | "draw" | "none";
+  /** Why a non-scored game ended, for the dashboard's troubleshooting table.
+   *  Only set on tally==="none" entries we record for games that never
+   *  produced a clean W/L/D: a short code such as a ConcedeReason
+   *  ("errors" / "tableAge" / "lostSeat" / "oppQuit" / "opponentInactivity")
+   *  or a premium-gate void ("premium:realtime-free" / "premium:async-limit").
+   *  Undefined on scored games and on legacy "none" entries (an unparseable
+   *  BGA finish score). */
+  reason?: string;
   /** Snapshot of game stats at finish, for the past-games table. All
    *  optional — entries written before these fields existed leave them
    *  undefined, and the dashboard renders a dash. */
@@ -2076,6 +2084,50 @@ export class BotDriver extends DurableObject<Env> {
       `ageMs=${gameAgeMs ?? "?"} errorCount=${m.errorCount ?? 0} ` +
       `lastMove=${lastMove}`,
     );
+    this.recordNonResult(tableId, m, "conceded", reason);
+  }
+
+  /**
+   * Record a NON-scored game into recentResults with tally "none" and a
+   * `reason` code, so games that ended without a clean win/loss/draw (we
+   * conceded, the opponent quit, we aborted, or a premium-gate void) surface
+   * in the dashboard's troubleshooting table instead of vanishing into the
+   * logs. Shares the cap/trim with scored results. Stats (wins/losses/draws)
+   * are untouched — recomputeStats skips non-W/L/D entries.
+   */
+  private recordNonResult(
+    tableId: string,
+    m: TableMemo,
+    status: string,
+    reason: string,
+  ): void {
+    const now = Date.now();
+    const entry: ResultEntry = {
+      ts: now,
+      tableId,
+      status,
+      rawScore: null,
+      parsedScore: null,
+      tally: "none",
+      reason,
+      durationMs: m.startedAt != null ? now - m.startedAt : undefined,
+      moveCount: m.moveCount,
+      engineCounts: m.engineCounts,
+      botColor: m.botColor,
+      oppName: m.oppName,
+      oppId: m.oppId,
+      difficulty: m.effectiveDifficulty ?? m.difficulty ?? "grandmaster",
+      oppLanguage: m.oppLanguage,
+      oppPremium: m.oppPremium,
+      realtime: m.realtime,
+    };
+    if (!this.status.recentResults) this.status.recentResults = [];
+    this.status.recentResults.push(entry);
+    if (this.status.recentResults.length > RECENT_RESULTS_CAP) {
+      this.status.recentResults.splice(
+        0, this.status.recentResults.length - RECENT_RESULTS_CAP,
+      );
+    }
   }
 
   /** Append a premium nudge to the rolling log (trim to PREMIUM_LOG_CAP). */
@@ -2200,6 +2252,11 @@ export class BotDriver extends DurableObject<Env> {
     const now = Date.now();
     m.finished = true;
     m.finishedAt = now;
+    // realtime games are blocked as "realtime-free"; async games (2nd+
+    // concurrent) as "async-limit" — see decidePremiumBlock. m.realtime is
+    // authoritative here, so we can recover the reason without storing it.
+    const blockReason = m.realtime === true ? "realtime-free" : "async-limit";
+    this.recordNonResult(tableId, m, "premium-blocked", `premium:${blockReason}`);
     console.log(
       `bot:premiumKick ts=${new Date(now).toISOString()} t=${tableId} ` +
       `afterMs=${now - m.premiumNudgedAt}`,

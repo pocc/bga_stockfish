@@ -630,6 +630,11 @@ function landingHtml(): string {
     <summary style="cursor: pointer; color: var(--accent); font-size: 13px;">Recent errors</summary>
     <div id="errors" class="muted" style="margin-top: 12px;">…</div>
   </details>
+  <details style="margin-top: 8px;">
+    <summary style="cursor: pointer; color: var(--accent); font-size: 13px;">Non-scored games (concedes, opponent quits, aborts, premium-gate voids)</summary>
+    <p class="sub" style="margin: 8px 0 0;">Games that never produced a clean win/loss/draw, kept out of Past Games (and the win-rate stats) so odd terminations stay auditable here.</p>
+    <div id="nonresults" class="muted" style="margin-top: 12px;">…</div>
+  </details>
 
   <footer>
     Worker + Durable Objects on Cloudflare.
@@ -708,6 +713,7 @@ function render(s) {
   }
   document.getElementById("moves").innerHTML = renderMoves(s.recentMoves);
   document.getElementById("results").innerHTML = renderResults(s.recentResults);
+  document.getElementById("nonresults").innerHTML = renderNonResults(s.recentResults);
   document.getElementById("engines").innerHTML = renderEngines((s.stats || {}).engineUses);
   document.getElementById("languages").innerHTML = renderLanguages(s.recentResults);
   document.getElementById("premium").innerHTML = renderPremium(s.recentResults);
@@ -894,8 +900,9 @@ const GAMES_PAGE_SIZE = { gallery: 8, table: 20 };
 const MOVES_PAGE_SIZE = 10;
 const ERRORS_PAGE_SIZE = 10;
 const RESULTS_PAGE_SIZE = 10;
+const NONRESULTS_PAGE_SIZE = 10;
 const MOVES_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-let gamesPage = 1, movesPage = 1, errorsPage = 1, resultsPage = 1;
+let gamesPage = 1, movesPage = 1, errorsPage = 1, resultsPage = 1, nonResultsPage = 1;
 function setGamesPage(p) {
   gamesPage = Math.max(1, p | 0);
   if (window.__lastStatus) document.getElementById("games").innerHTML = renderGames(window.__lastStatus);
@@ -911,6 +918,10 @@ function setErrorsPage(p) {
 function setResultsPage(p) {
   resultsPage = Math.max(1, p | 0);
   if (window.__lastStatus) document.getElementById("results").innerHTML = renderResults(window.__lastStatus.recentResults);
+}
+function setNonResultsPage(p) {
+  nonResultsPage = Math.max(1, p | 0);
+  if (window.__lastStatus) document.getElementById("nonresults").innerHTML = renderNonResults(window.__lastStatus.recentResults);
 }
 
 function renderGames(s) {
@@ -1392,14 +1403,22 @@ function renderMoves(moves) {
     + pager(all.length, MOVES_PAGE_SIZE, movesPage, "setMovesPage", "moves (24h)");
 }
 
+// A clean, BGA-scored game (win/loss/draw). Everything else (tally "none":
+// concedes, opponent-quits, aborts, premium-gate voids, unparseable finishes)
+// is split out into the troubleshooting table — see renderNonResults.
+function isScored(r) {
+  return r.tally === "win" || r.tally === "loss" || r.tally === "draw";
+}
+
 function renderResults(results) {
-  if (!results || results.length === 0) {
+  // Only clean win/loss/draw games belong in Past Games; non-scored games
+  // live in the "Non-scored games" troubleshooting table under Technical
+  // details so they don't muddy the win-rate view.
+  const all = (results || []).filter(isScored).reverse();
+  if (all.length === 0) {
     return "<span class='muted'>no finished games yet</span>";
   }
-  // Newest first, paginated. Concedes never enter this list - they are
-  // logged separately via bot:concede console lines (see concedeTable in
-  // bot-do.ts).
-  const all = results.slice().reverse();
+  // Newest first, paginated.
   const page = paginate(all, RESULTS_PAGE_SIZE, resultsPage);
   const dash = '<span class="muted">—</span>';
   const rows = page.map(r => {
@@ -1448,6 +1467,66 @@ function renderResults(results) {
     + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Lang</th><th>Color</th><th>Difficulty</th><th>Moves</th><th>Duration</th><th>Tally</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, RESULTS_PAGE_SIZE, resultsPage, "setResultsPage", "games");
+}
+
+// Human-readable label for a non-scored game's reason code (see
+// recordNonResult / ConcedeReason in bot-do.ts).
+const NONRESULT_REASONS = {
+  "errors": "Bot errored out",
+  "tableAge": "Game expired",
+  "lostSeat": "Lost seat",
+  "oppQuit": "Opponent quit",
+  "opponentInactivity": "Opponent inactive",
+  "premium:realtime-free": "Premium gate: realtime",
+  "premium:async-limit": "Premium gate: 2nd async",
+};
+function nonResultReason(r) {
+  if (r.reason) return NONRESULT_REASONS[r.reason] || r.reason;
+  // Legacy "none" entries (a BGA finish whose score didn't parse to 0/0.5/1)
+  // carry no reason code; surface the raw score so it can still be triaged.
+  return "Unscored finish (raw: " + (r.rawScore == null ? "null" : r.rawScore) + ")";
+}
+
+// Troubleshooting table: every game that did NOT end in a clean win/loss/draw
+// — concedes, opponent-quits, aborts, premium-gate voids, unparseable BGA
+// finishes. Kept out of Past Games (and the win-rate stats) but logged here so
+// odd terminations are auditable.
+function renderNonResults(results) {
+  const all = (results || []).filter(r => !isScored(r)).reverse();
+  if (all.length === 0) {
+    return "<span class='muted'>no non-scored games — every finished game was a clean win/loss/draw</span>";
+  }
+  const page = paginate(all, NONRESULTS_PAGE_SIZE, nonResultsPage);
+  const dash = '<span class="muted">—</span>';
+  const rows = page.map(r => {
+    const oppNameDec = decodeName(r.oppName);
+    const opp = r.oppName
+      ? (r.oppId
+        ? '<a href="https://boardgamearena.com/player?id=' + esc(r.oppId) + '" target="_blank" rel="noopener">' + esc(oppNameDec) + '</a>'
+        : esc(oppNameDec))
+      : dash;
+    const reason = '<span class="pill warn" title="' + esc('status: ' + (r.status || "?")) + '">' + esc(nonResultReason(r)) + '</span>';
+    const diff = '<span class="mono">' + esc(r.difficulty || "grandmaster") + '</span>';
+    const moves = r.moveCount == null ? dash : '<span class="mono">' + esc(r.moveCount) + '</span>';
+    const dur = r.durationMs == null ? dash : '<span class="mono">' + esc(fmtClock(r.durationMs / 1000)) + '</span>';
+    const live = r.realtime === true
+      ? '<span class="livedot" title="Realtime game">●</span>'
+      : r.realtime === false ? '' : dash;
+    return '<tr>'
+      + '<td class="muted">' + fmtTime(r.ts) + '</td>'
+      + '<td>' + tableLink(r.tableId) + '</td>'
+      + '<td style="text-align:center">' + live + '</td>'
+      + '<td>' + opp + '</td>'
+      + '<td>' + reason + '</td>'
+      + '<td>' + diff + '</td>'
+      + '<td>' + moves + '</td>'
+      + '<td>' + dur + '</td>'
+      + '</tr>';
+  }).join("");
+  return '<table><thead><tr>'
+    + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Reason</th><th>Difficulty</th><th>Moves</th><th>Duration</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    + pager(all.length, NONRESULTS_PAGE_SIZE, nonResultsPage, "setNonResultsPage", "nonresults");
 }
 
 function renderEngineCell(r, isChosen, isRejectedWinner) {
