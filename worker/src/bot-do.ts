@@ -20,7 +20,7 @@ import type { Env } from "./index";
 import { BGAClient, type Cookie, type RawTableInfo } from "./bga-client";
 import {
   parseGameHtml, parseOpponent, buildFen, lookupUciMove, anyLegalMove, xyToSq,
-  placementAfterMove, chooseRepetitionAwareMove,
+  placementAfterMove, chooseRepetitionAwareMove, shouldSkipMoveForNeutralized,
   type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
@@ -37,6 +37,10 @@ import {
 } from "./bot-status";
 import { enginePrecedenceRank, isCacheableEngine } from "./stockfish-do";
 import { parseGameLog, reconstructMoves } from "./game-log";
+import {
+  buildPremiumLink, buildGameLink, isSecondaryAsyncGame, primaryAsyncGameId,
+  decidePremiumBlock, type PremiumBlockReason, type GateMode,
+} from "./premium";
 
 const TICK_MS = 5_000;
 /** Faster tick used ONLY while a realtime invite is open and still waiting
@@ -161,6 +165,14 @@ const RECENT_MOVES_CAP = 500;
  *  tally so we can audit which raw score BGA reported per game without
  *  spelunking the GC'd memo. Used to diagnose "draws stayed 0" bugs. */
 const RECENT_RESULTS_CAP = 500;
+/** Cap on each of the rolling premium-engagement logs (nudges + clicks).
+ *  Kept generous so the "we drive BGA memberships" evidence is durable. */
+const PREMIUM_LOG_CAP = 1000;
+/** Grace between sending the "upgrade to BGA Premium" nudge and actually
+ *  voiding the table, so the bounced member has time to READ the message
+ *  before the game vanishes. The kick is deferred to a later tick (we never
+ *  block the tick on a 30s sleep — that would freeze every other live game). */
+const PREMIUM_KICK_DELAY_MS = 30_000;
 /** Max attempts to fetch a finished game's archive move log. BGA's replay
  *  log can lag a few seconds behind the `finished` flip, so the capture
  *  retries across ticks (the memo lingers until BGA drops the table from
@@ -236,6 +248,18 @@ interface TableMemo {
   /** Marked true after we send the concede chat + resign. Once set, we
    *  stop touching this table — handleTable becomes a no-op for it. */
   conceded?: boolean;
+  /** Marked true the moment the premium gate sends a free member the upgrade
+   *  nudge. Makes handleTable a no-op for the table (no greet, no move), but
+   *  it is NOT a played game: no GG, no result entry, no concede stat. The
+   *  actual void (leaveTable) is deferred — see premiumNudgedAt. */
+  premiumBlocked?: boolean;
+  /** Wall-clock ms the upgrade nudge was sent. The table is voided
+   *  PREMIUM_KICK_DELAY_MS later (on a subsequent tick) so the member can
+   *  read the message first. Unset until the nudge fires. */
+  premiumNudgedAt?: number;
+  /** True once the deferred void (leaveTable) has actually run, so we don't
+   *  leave the table twice. */
+  premiumKicked?: boolean;
   /** Consecutive ticks where the per-id reconcile lookup returned null
    *  (BGA can't find the table anymore). Reset to 0 whenever the table
    *  reappears. Used to GC memos that linger forever after a table
@@ -388,6 +412,7 @@ interface TableMemo {
       | "no-parse"
       | "opp-turn"
       | "no-dests"
+      | "skip-opp-neutralized"
       | "no-engine-move"
       | "no-fallback-move"
       | "select-cell-failed"
@@ -552,6 +577,45 @@ interface ResultEntry {
   engineCounts?: Record<string, number>;
 }
 
+/**
+ * One "upgrade to BGA Premium" nudge the bot sent a free member after
+ * bouncing them off a limited resource (a realtime game, or a 2nd
+ * concurrent async game). Captured so we can show BGA, with data, that the
+ * bot drives membership interest: who we nudged and when.
+ */
+interface PremiumNudge {
+  /** Wall-clock time the nudge chat was sent. */
+  ts: number;
+  /** Opponent's BGA player id. */
+  uid: string;
+  /** Opponent display name at the time, best-effort. */
+  name?: string;
+  /** Table the nudge was sent on. */
+  tableId: string;
+  /** Which limited resource they hit. */
+  mode: GateMode;
+  /** Why we blocked: "realtime-free" or "async-limit". */
+  reason: PremiumBlockReason;
+  /** Opponent's BGA interface language the message was localized to. */
+  lang?: string;
+}
+
+/**
+ * One click on a premium upgrade link, recorded by the worker's
+ * /go/premium endpoint and forwarded into the DO. Demonstrates the nudge
+ * converted to interest (a click-through toward BGA's membership page).
+ */
+interface PremiumClick {
+  /** Wall-clock time the click was logged. */
+  ts: number;
+  /** Opponent's BGA player id from the link (u=), if present. */
+  uid?: string;
+  /** Table id the link was minted for (t=), if present. */
+  tableId?: string;
+  /** Mode the link was minted for (m=), if present. */
+  mode?: string;
+}
+
 interface BotStatus {
   loggedIn: boolean;
   uid: string | null;
@@ -566,6 +630,14 @@ interface BotStatus {
   /** Rolling log of game results (one entry per finished tally). Persists
    *  past memo GC so we can audit how BGA scored each game. */
   recentResults?: ResultEntry[];
+  /** Rolling log of "upgrade to premium" nudges we sent to free members we
+   *  bounced off a limited resource (realtime / 2nd async). Persisted so we
+   *  can demonstrate to BGA that the bot drives membership interest. Capped
+   *  at PREMIUM_LOG_CAP. */
+  premiumNudges?: PremiumNudge[];
+  /** Rolling log of clicks on the premium link (recorded by /go/premium on
+   *  the worker, forwarded into the DO). Capped at PREMIUM_LOG_CAP. */
+  premiumClicks?: PremiumClick[];
   /** Lifetime counters (won't reset across DO restarts since they're persisted). */
   stats: BotStats;
   tables: Record<string, TableMemo>;
@@ -591,6 +663,7 @@ export class BotDriver extends DurableObject<Env> {
     loggedIn: false, uid: null, running: false,
     lastTickAt: null, lastErr: null,
     recentErrors: [], recentMoves: [], recentResults: [],
+    premiumNudges: [], premiumClicks: [],
     stats: { wins: 0, losses: 0, draws: 0, concedes: 0, engineUses: {}, byDifficulty: emptyDifficultyTally() },
     tables: {},
     openInvites: { realtime: emptyInvite(), async: emptyInvite() },
@@ -654,6 +727,19 @@ export class BotDriver extends DurableObject<Env> {
     if (url.pathname === "/status") {
       await this.boot();
       return Response.json(this.status);
+    }
+    if (url.pathname === "/premium-click") {
+      // The worker's /go/premium endpoint logs a click here before 302ing
+      // the user to BGA's membership page. Carries the who/where/mode the
+      // upgrade link was minted with (u/t/m), all optional.
+      await this.boot();
+      await this.appendPremiumClick({
+        ts: Date.now(),
+        uid: url.searchParams.get("u") ?? undefined,
+        tableId: url.searchParams.get("t") ?? undefined,
+        mode: url.searchParams.get("m") ?? undefined,
+      });
+      return Response.json({ ok: true });
     }
     if (url.pathname === "/cleanup") {
       await this.boot();
@@ -1376,6 +1462,10 @@ export class BotDriver extends DurableObject<Env> {
       (await storage.get<MoveEntry[]>("recentMoves")) ?? [];
     this.status.recentResults =
       (await storage.get<ResultEntry[]>("recentResults")) ?? [];
+    this.status.premiumNudges =
+      (await storage.get<PremiumNudge[]>("premiumNudges")) ?? [];
+    this.status.premiumClicks =
+      (await storage.get<PremiumClick[]>("premiumClicks")) ?? [];
     // Backfill per-difficulty counters for blobs persisted before the field
     // existed. Derived from recentResults (same source resyncStats uses), so
     // it's only as deep as the retained log — good enough for the dashboard
@@ -1745,6 +1835,8 @@ export class BotDriver extends DurableObject<Env> {
     await this.putIfChanged("recentErrors", this.status.recentErrors);
     await this.putIfChanged("recentMoves", this.status.recentMoves);
     await this.putIfChanged("recentResults", this.status.recentResults ?? []);
+    await this.putIfChanged("premiumNudges", this.status.premiumNudges ?? []);
+    await this.putIfChanged("premiumClicks", this.status.premiumClicks ?? []);
 
     try { await this.maybeCreateOpenInvite(tables); }
     catch (e) { this.recordError("openInvite", e); }
@@ -1983,6 +2075,134 @@ export class BotDriver extends DurableObject<Env> {
       `reason=${reason} opp=${safeOpp} color=${m.botColor ?? "?"} ` +
       `ageMs=${gameAgeMs ?? "?"} errorCount=${m.errorCount ?? 0} ` +
       `lastMove=${lastMove}`,
+    );
+  }
+
+  /** Append a premium nudge to the rolling log (trim to PREMIUM_LOG_CAP). */
+  private recordPremiumNudge(n: PremiumNudge): void {
+    if (!this.status.premiumNudges) this.status.premiumNudges = [];
+    this.status.premiumNudges.push(n);
+    if (this.status.premiumNudges.length > PREMIUM_LOG_CAP) {
+      this.status.premiumNudges.splice(
+        0, this.status.premiumNudges.length - PREMIUM_LOG_CAP,
+      );
+    }
+  }
+
+  /** Append a premium-link click (recorded by the worker's /go/premium) and
+   *  persist immediately — this path runs outside the tick's persist cycle. */
+  private async appendPremiumClick(c: PremiumClick): Promise<void> {
+    if (!this.status.premiumClicks) this.status.premiumClicks = [];
+    this.status.premiumClicks.push(c);
+    if (this.status.premiumClicks.length > PREMIUM_LOG_CAP) {
+      this.status.premiumClicks.splice(
+        0, this.status.premiumClicks.length - PREMIUM_LOG_CAP,
+      );
+    }
+    await this.ctx.storage.put("premiumClicks", this.status.premiumClicks);
+  }
+
+  /**
+   * Premium gate. The bot's playing time is the scarce resource: it has a
+   * single realtime slot and can only sanely juggle so many async games, so
+   * realtime and 2nd-or-later concurrent async games are reserved for BGA
+   * Premium members. When a FREE member lands on one of those, send the
+   * localized "upgrade to BGA Premium" nudge, log it (so we can show BGA, with
+   * data, that the bot drives memberships), and mark the memo so we never
+   * greet / move / tally it. Returns true when the table was blocked.
+   *
+   * The actual void (leaveTable → neutralized, NO win awarded) is DEFERRED by
+   * PREMIUM_KICK_DELAY_MS so the bounced member has time to read the message
+   * before the game vanishes — see maybeKickPremiumBlocked. We never block the
+   * tick on a 30s sleep (that would freeze every other live game); the kick
+   * fires on a later tick.
+   *
+   * Membership (`is_premium`) is only readable from the live game page, so the
+   * earliest we can decide is the first play tick. Blocking here voids the game
+   * before any move is played — the closest practical realization of "don't
+   * start a game we shouldn't" given no pre-launch premium signal exists.
+   *
+   * Fails OPEN: unknown membership (oppPremium === undefined) never blocks, so
+   * a paying member is never wrongly turned away.
+   */
+  private async enforcePremiumGate(tableId: string, m: TableMemo): Promise<boolean> {
+    if (!this.client) return false;
+    // Already nudged: stay idempotent, and run the deferred void if it's due.
+    if (m.premiumBlocked) {
+      await this.maybeKickPremiumBlocked(tableId, m);
+      return true;
+    }
+    const isRealtime = m.realtime === true;
+    const secondaryAsync = !isRealtime
+      && !!m.oppId
+      && isSecondaryAsyncGame(this.status.tables, m.oppId, tableId);
+    const reason = decidePremiumBlock({
+      isRealtime,
+      oppPremium: m.oppPremium,
+      secondaryAsync,
+    });
+    if (!reason) return false;
+
+    const mode: GateMode = isRealtime ? "realtime" : "async";
+    const uid = m.oppId ?? "";
+    const link = buildPremiumLink(uid, tableId, mode);
+    const now = Date.now();
+    let msg = tr("premiumGate", m.oppLanguage, { link });
+    // For the 2nd-async block, point them at the one async game they may keep
+    // (their oldest active async game with the bot), so they're not left
+    // wondering where their allowed game went.
+    if (reason === "async-limit") {
+      const primaryId = primaryAsyncGameId(this.status.tables, uid);
+      if (primaryId && primaryId !== tableId) {
+        const gameLink = buildGameLink(primaryId);
+        msg += " " + tr("premiumGateAsyncOther", m.oppLanguage, { gameLink });
+      }
+    }
+    await this.sendChat(tableId, msg);
+    this.recordPremiumNudge({
+      ts: now, uid, name: m.oppName, tableId, mode, reason,
+      lang: m.oppLanguage,
+    });
+    // Flag the memo now so we stop greeting/moving immediately, but DEFER the
+    // void: the opponent gets PREMIUM_KICK_DELAY_MS to read the message, then
+    // a later tick voids the table (maybeKickPremiumBlocked). We deliberately
+    // do NOT set finished yet — the game is still live during the read window.
+    m.premiumBlocked = true;
+    m.premiumNudgedAt = now;
+    const safeOpp = (m.oppName ?? "").replace(/\s+/g, "_") || "?";
+    console.log(
+      `bot:premiumGate ts=${new Date(now).toISOString()} t=${tableId} ` +
+      `mode=${mode} reason=${reason} uid=${uid || "?"} opp=${safeOpp} ` +
+      `lang=${m.oppLanguage ?? "en"} kickInMs=${PREMIUM_KICK_DELAY_MS}`,
+    );
+    return true;
+  }
+
+  /**
+   * Deferred half of the premium gate: once PREMIUM_KICK_DELAY_MS has elapsed
+   * since the nudge, void the table (leaveTable → neutralized, no win awarded)
+   * and mark it finished so the per-tick GC drops the memo. No-op until the
+   * read-grace window passes, and idempotent via premiumKicked so a table is
+   * never left twice. Called every tick a premium-blocked table is still in
+   * the snapshot.
+   */
+  private async maybeKickPremiumBlocked(tableId: string, m: TableMemo): Promise<void> {
+    if (!this.client || m.premiumKicked) return;
+    if (m.premiumNudgedAt == null) return; // nudge hasn't fired yet
+    if (Date.now() - m.premiumNudgedAt < PREMIUM_KICK_DELAY_MS) return; // let them read it
+    m.premiumKicked = true;
+    // Void the table: neutralized=true, so neither side is awarded a win and
+    // the game never counts. Best-effort — a failed leave still marks the memo
+    // finished so we stop touching it.
+    await this.client.leaveTable(tableId).catch((e) => {
+      this.recordError("premiumLeave", e, tableId);
+    });
+    const now = Date.now();
+    m.finished = true;
+    m.finishedAt = now;
+    console.log(
+      `bot:premiumKick ts=${new Date(now).toISOString()} t=${tableId} ` +
+      `afterMs=${now - m.premiumNudgedAt}`,
     );
   }
 
@@ -2273,6 +2493,14 @@ export class BotDriver extends DurableObject<Env> {
     if (!this.client || !this.uid) return;
     const m = this.getMemo(t.id);
     if (m.conceded) return;
+    // A premium-blocked table was already nudged; never greet/move/tally it.
+    // The void is deferred so the member can read the nudge, so keep driving
+    // the kick each tick — it fires once the read-grace window passes, then
+    // the per-tick GC drops the memo.
+    if (m.premiumBlocked) {
+      await this.maybeKickPremiumBlocked(t.id, m);
+      return;
+    }
 
     // Auto-concede games older than MAX_TABLE_AGE_MS. Only fires on live
     // play statuses so we don't resign an unstarted invite or a finished
@@ -2440,6 +2668,9 @@ export class BotDriver extends DurableObject<Env> {
           const html = await this.client.fetchGamePage(m.gameserver, t.id);
           this.refreshOpponent(m, html);
         } catch { /* fall back to English */ }
+        // Premium gate runs BEFORE the greeting: a free member bounced off a
+        // limited resource gets the upgrade nudge, not a "good luck" opener.
+        if (await this.enforcePremiumGate(t.id, m)) return;
         await this.maybeGreet(t.id, m, t.status === "play");
       }
 
@@ -2724,6 +2955,15 @@ export class BotDriver extends DurableObject<Env> {
     // page (greeting-time detection can miss it if the lobby snapshot hadn't
     // resolved the seat yet, and it corrects stale names after a rename).
     this.refreshOpponent(m, html);
+    // Premium gate before greet/move — but ONLY up to first contact (!saidHi),
+    // so it applies to games we haven't greeted yet (new joins) and never
+    // disrupts a game already in progress. handleTable's live-play branch also
+    // gates (likewise !saidHi), but a fast realtime game is often driven
+    // entirely by websocket push reactions (reactToPush → here) which bypass
+    // that branch, so without this a new free member could slip past the gate
+    // and get played. A blocked game keeps saidHi=false (we bounce before
+    // greeting), so the deferred void still gets driven here on the push path.
+    if (!m.saidHi && await this.enforcePremiumGate(tableId, m)) return;
     // Greet from the common move path too. handleTable's live-play branch
     // also greets, but a fast realtime game is often driven entirely by
     // websocket push reactions (reactToPush → here) which bypass that
@@ -3025,6 +3265,26 @@ export class BotDriver extends DurableObject<Env> {
       m.lastMoveAttempt = {
         ts: Date.now(), result: "no-dests", activePlayer: parsed.activePlayer,
       };
+      return;
+    }
+
+    // Skip-on-neutralized guard. When the opponent has been flagged
+    // neutralized/zombie (abandoned or timed out), BGA can freeze the turn
+    // mid-position — sometimes in an *illegal* state (e.g. the bot is in
+    // check yet it's marked our turn). Every engine rejects the illegal FEN,
+    // and in difficulty mode there's no remote race to fall back on, so we'd
+    // otherwise drop to a random legal move and shovel garbage into a dead
+    // game throughout the OPP_QUIT_CONFIRM_MS concede grace (that's the "3
+    // random moves" failure). Don't move at all: the neutralized block above
+    // sets/clears m.oppQuitSince each tick and will concede the table once
+    // the flag persists. parseGameNeutralized is a direct HTML read kept as
+    // defense-in-depth (catches game_result_neutralized that parsed misses).
+    if (shouldSkipMoveForNeutralized(m.oppQuitSince, html)) {
+      m.lastMoveAttempt = {
+        ts: Date.now(), result: "skip-opp-neutralized",
+        activePlayer: parsed.activePlayer,
+      };
+      console.log(`t=${tableId} skip move — opponent flagged neutralized/abandoned`);
       return;
     }
 

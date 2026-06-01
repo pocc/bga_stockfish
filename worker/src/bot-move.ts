@@ -172,6 +172,31 @@ export function parseGameNeutralized(html: string): boolean {
 }
 
 /**
+ * Decide whether the bot should SKIP making a move this tick because the
+ * opponent has been flagged as gone. Two independent signals, OR'd:
+ *
+ *   - `oppQuitSince`: the live-gamestate neutralized/zombie detector in the
+ *     move loop has already stamped this (and clears it the moment the flag
+ *     lifts), so a truthy value means "flagged right now, in the concede
+ *     grace window".
+ *   - `parseGameNeutralized(html)`: a direct HTML read, kept as
+ *     defense-in-depth for `game_result_neutralized` that the live parse
+ *     can miss.
+ *
+ * When either fires we must NOT move: BGA can freeze the turn in an illegal
+ * position on abandon, every engine rejects the illegal FEN, and in
+ * difficulty mode (no remote race) we'd otherwise fall through to a random
+ * legal move and dump garbage into a dead game until the concede grace
+ * elapses. Pure so the "flagged game produces no move" rule is unit-testable.
+ */
+export function shouldSkipMoveForNeutralized(
+  oppQuitSince: number | null | undefined,
+  html: string,
+): boolean {
+  return Boolean(oppQuitSince) || parseGameNeutralized(html);
+}
+
+/**
  * Decode the \\u-escaped JSON string escapes BGA leaves in player names that
  * we pull straight out of the page HTML by regex (e.g. "laglo\\u00efre" →
  * "lagloïre"). The captured text came from a JSON string literal, so we

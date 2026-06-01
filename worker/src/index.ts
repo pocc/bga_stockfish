@@ -1,6 +1,7 @@
 import { StockfishEngine } from "./stockfish-do";
 import { BotDriver } from "./bot-do";
 import { StockfishContainer } from "./container-do";
+import { BGA_PREMIUM_URL } from "./premium";
 
 export { StockfishEngine, BotDriver, StockfishContainer };
 
@@ -124,6 +125,28 @@ export default {
     // Bot status is public so the dashboard at / can poll it.
     if (url.pathname === "/bot/status" && req.method === "GET") {
       return botStub(env).fetch("https://do/status");
+    }
+
+    // Premium upgrade redirect. The bot's "upgrade to BGA Premium" nudge
+    // links here (carrying u=opponent, t=table, m=mode) so the click is
+    // logged in the DO — evidence we drive BGA memberships — before we 302
+    // the user on to BGA's membership page. Public + best-effort: a logging
+    // failure must never block the redirect.
+    if (url.pathname === "/go/premium") {
+      const forwarded = new URLSearchParams();
+      for (const k of ["u", "t", "m"]) {
+        const v = url.searchParams.get(k);
+        if (v) forwarded.set(k, v);
+      }
+      const qs = forwarded.toString();
+      try {
+        await botStub(env).fetch(
+          qs ? `https://do/premium-click?${qs}` : "https://do/premium-click",
+        );
+      } catch {
+        /* logging is best-effort — fall through to the redirect */
+      }
+      return Response.redirect(BGA_PREMIUM_URL, 302);
     }
     // Debug: dump parsed game state for a tracked table id. Gated behind the
     // admin secret — it triggers a BGA login + game-page fetch, so leaving it

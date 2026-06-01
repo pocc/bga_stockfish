@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   parseOpponent, parseGameNeutralized, buildFen, parseGameHtml,
-  placementAfterMove, chooseRepetitionAwareMove,
+  placementAfterMove, chooseRepetitionAwareMove, shouldSkipMoveForNeutralized,
   type Piece, type Destination, type MoveCandidate,
 } from "../src/bot-move";
 import { isCacheableEngine, CACHEABLE_ENGINES } from "../src/engine-precedence";
@@ -85,6 +85,34 @@ describe("parseGameNeutralized", () => {
 
   test("true when a specific player was neutralized", () => {
     expect(parseGameNeutralized('"game_result_neutralized":"0","neutralized_player_id":"22430351"')).toBe(true);
+  });
+});
+
+describe("shouldSkipMoveForNeutralized", () => {
+  const clean = '"game_result_neutralized":"0","neutralized_player_id":"0"';
+
+  test("plays normally when nothing is flagged", () => {
+    // Not flagged and clean HTML → move (skip == false).
+    expect(shouldSkipMoveForNeutralized(null, clean)).toBe(false);
+    expect(shouldSkipMoveForNeutralized(undefined, clean)).toBe(false);
+    expect(shouldSkipMoveForNeutralized(0, clean)).toBe(false);
+  });
+
+  test("skips the move while the opponent is flagged in the concede grace", () => {
+    // oppQuitSince stamped by the live neutralized detector → no move, even
+    // if the HTML hasn't surfaced game_result_neutralized yet.
+    expect(shouldSkipMoveForNeutralized(Date.now(), clean)).toBe(true);
+  });
+
+  test("skips the move when the page HTML itself shows neutralized", () => {
+    // Defense-in-depth: never stamped oppQuitSince, but the page says the
+    // game is void → still no move (this is the "3 random moves" regression).
+    expect(
+      shouldSkipMoveForNeutralized(null, '"game_result_neutralized":"1","neutralized_player_id":"0"'),
+    ).toBe(true);
+    expect(
+      shouldSkipMoveForNeutralized(null, '"neutralized_player_id":"22430351"'),
+    ).toBe(true);
   });
 });
 

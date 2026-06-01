@@ -29,7 +29,9 @@ export type MsgKey =
   | "oldGameConcede"
   | "drawDecline"
   | "difficultySet"
-  | "difficultyGrandmaster";
+  | "difficultyGrandmaster"
+  | "premiumGate"
+  | "premiumGateAsyncOther";
 
 /** The 41 interface-language codes BGA supports. */
 export const SUPPORTED_LANGS = [
@@ -542,6 +544,119 @@ const TRANSLATIONS: Record<string, Partial<Record<MsgKey, string>>> = {
     "difficultyGrandmaster": "ตั้งระดับความยากเป็นแกรนด์มาสเตอร์ (Stockfish เต็มรูปแบบ) แล้ว ขอให้โชคดี!"
   }
 };
+
+/**
+ * The premium-gate nudge, in all 41 BGA interface languages. Kept as one
+ * consolidated map (rather than a line in each language block above) so the
+ * full set is easy to review/translate in one place; it's merged into
+ * TRANSLATIONS below so `t("premiumGate", lang, { link })` resolves exactly
+ * like every other key. "{link}" is the per-user upgrade URL (it routes
+ * through the worker so the click is logged, then redirects to BGA Premium).
+ * "BGA Premium" and "Stockfish" stay untranslated; no em-dashes anywhere.
+ */
+const PREMIUM_GATE: Record<string, string> = {
+  "en": "Sorry! Realtime games and several games at once are reserved for BGA Premium members, because my playing time is a limited resource. Free members can always play one asynchronous (turn-based) game with me at a time, which is unlimited over time. To unlock realtime and simultaneous games, upgrade to BGA Premium here: {link} Thanks for understanding, and good luck!",
+  "fr": "Désolé ! Les parties en temps réel et plusieurs parties à la fois sont réservées aux membres BGA Premium, car mon temps de jeu est une ressource limitée. Les membres gratuits peuvent toujours jouer une partie asynchrone (au tour par tour) à la fois avec moi, ce qui est illimité dans le temps. Pour débloquer le temps réel et les parties simultanées, passez à BGA Premium ici : {link} Merci de votre compréhension, et bonne chance !",
+  "es": "¡Lo siento! Las partidas en tiempo real y varias partidas a la vez están reservadas a los miembros BGA Premium, porque mi tiempo de juego es un recurso limitado. Los miembros gratuitos siempre pueden jugar una partida asíncrona (por turnos) conmigo a la vez, lo cual es ilimitado con el tiempo. Para desbloquear el tiempo real y las partidas simultáneas, hazte BGA Premium aquí: {link} ¡Gracias por tu comprensión y buena suerte!",
+  "pt": "Desculpe! Partidas em tempo real e várias partidas ao mesmo tempo são reservadas a membros BGA Premium, porque o meu tempo de jogo é um recurso limitado. Membros gratuitos podem sempre jogar uma partida assíncrona (por turnos) comigo de cada vez, o que é ilimitado ao longo do tempo. Para desbloquear o tempo real e partidas simultâneas, torne-se BGA Premium aqui: {link} Obrigado pela compreensão e boa sorte!",
+  "it": "Spiacente! Le partite in tempo reale e più partite contemporaneamente sono riservate ai membri BGA Premium, perché il mio tempo di gioco è una risorsa limitata. I membri gratuiti possono sempre giocare una partita asincrona (a turni) con me alla volta, il che è illimitato nel tempo. Per sbloccare il tempo reale e le partite simultanee, passa a BGA Premium qui: {link} Grazie per la comprensione e buona fortuna!",
+  "de": "Entschuldigung! Echtzeitpartien und mehrere Partien gleichzeitig sind BGA-Premium-Mitgliedern vorbehalten, denn meine Spielzeit ist eine begrenzte Ressource. Kostenlose Mitglieder können jederzeit eine asynchrone (zugbasierte) Partie mit mir spielen, was zeitlich unbegrenzt ist. Um Echtzeit und gleichzeitige Partien freizuschalten, werde hier BGA Premium: {link} Danke für dein Verständnis und viel Glück!",
+  "nl": "Sorry! Realtimespellen en meerdere spellen tegelijk zijn voorbehouden aan BGA Premium-leden, omdat mijn speeltijd een beperkte hulpbron is. Gratis leden kunnen altijd één asynchroon (beurtgebaseerd) spel tegelijk met mij spelen, wat onbeperkt is in de tijd. Om realtime en gelijktijdige spellen te ontgrendelen, word hier BGA Premium: {link} Bedankt voor je begrip en veel succes!",
+  "ru": "Извините! Игры в реальном времени и несколько игр одновременно доступны только участникам BGA Premium, потому что моё игровое время ограничено. Бесплатные участники всегда могут играть со мной в одну асинхронную (пошаговую) игру за раз, и это не ограничено по времени. Чтобы открыть реальное время и одновременные игры, оформите BGA Premium здесь: {link} Спасибо за понимание и удачи!",
+  "uk": "Вибачте! Ігри в реальному часі та кілька ігор одночасно доступні лише учасникам BGA Premium, адже мій ігровий час обмежений. Безкоштовні учасники завжди можуть грати зі мною в одну асинхронну (покрокову) гру за раз, і це необмежено в часі. Щоб відкрити реальний час і одночасні ігри, оформіть BGA Premium тут: {link} Дякую за розуміння та удачі!",
+  "pl": "Przepraszam! Gry w czasie rzeczywistym i kilka gier naraz są zarezerwowane dla członków BGA Premium, ponieważ mój czas gry to ograniczony zasób. Darmowi członkowie zawsze mogą grać ze mną w jedną grę asynchroniczną (turową) naraz, co jest nieograniczone w czasie. Aby odblokować czas rzeczywisty i jednoczesne gry, przejdź na BGA Premium tutaj: {link} Dziękuję za zrozumienie i powodzenia!",
+  "cs": "Promiň! Hry v reálném čase a více her najednou jsou vyhrazeny členům BGA Premium, protože můj herní čas je omezený zdroj. Členové zdarma si se mnou mohou kdykoli zahrát jednu asynchronní (tahovou) hru naráz, což je časově neomezené. Pro odemčení reálného času a souběžných her přejdi na BGA Premium zde: {link} Děkuji za pochopení a hodně štěstí!",
+  "sk": "Prepáč! Hry v reálnom čase a viac hier naraz sú vyhradené pre členov BGA Premium, pretože môj herný čas je obmedzený zdroj. Členovia zadarmo si so mnou môžu kedykoľvek zahrať jednu asynchrónnu (ťahovú) hru naraz, čo je časovo neobmedzené. Na odomknutie reálneho času a súbežných hier prejdi na BGA Premium tu: {link} Ďakujem za pochopenie a veľa šťastia!",
+  "sl": "Oprosti! Igre v realnem času in več iger hkrati so na voljo le članom BGA Premium, ker je moj čas igranja omejen vir. Brezplačni člani lahko z mano vedno igrajo eno asinhrono (potezno) igro naenkrat, kar je časovno neomejeno. Za odklep realnega časa in hkratnih iger nadgradi na BGA Premium tukaj: {link} Hvala za razumevanje in veliko sreče!",
+  "sr": "Извини! Игре у реалном времену и више игара одједном резервисане су за BGA Premium чланове, јер је моје време за игру ограничен ресурс. Бесплатни чланови увек могу да играју једну асинхрону (потезну) игру са мном у датом тренутку, што је временски неограничено. Да откључаш реално време и истовремене игре, пређи на BGA Premium овде: {link} Хвала на разумевању и срећно!",
+  "hr": "Oprosti! Igre u stvarnom vremenu i više igara odjednom rezervirane su za BGA Premium članove jer je moje vrijeme za igru ograničen resurs. Besplatni članovi uvijek mogu sa mnom igrati jednu asinkronu (poteznu) igru odjednom, što je vremenski neograničeno. Da otključaš stvarno vrijeme i istovremene igre, prijeđi na BGA Premium ovdje: {link} Hvala na razumijevanju i sretno!",
+  "bg": "Съжалявам! Игрите в реално време и няколко игри едновременно са запазени за членовете на BGA Premium, защото времето ми за игра е ограничен ресурс. Безплатните членове винаги могат да играят с мен по една асинхронна (ход по ход) игра наведнъж, което е неограничено във времето. За да отключиш реалното време и едновременните игри, премини към BGA Premium тук: {link} Благодаря за разбирането и успех!",
+  "ro": "Îmi pare rău! Jocurile în timp real și mai multe jocuri simultan sunt rezervate membrilor BGA Premium, deoarece timpul meu de joc este o resursă limitată. Membrii gratuiti pot juca oricând cu mine un singur joc asincron (pe ture) pe rând, ceea ce este nelimitat în timp. Pentru a debloca timpul real și jocurile simultane, treci la BGA Premium aici: {link} Mulțumesc pentru înțelegere și mult noroc!",
+  "hu": "Bocsánat! A valós idejű játékok és az egyszerre több játék a BGA Premium tagoknak van fenntartva, mert a játékidőm korlátozott erőforrás. Az ingyenes tagok bármikor játszhatnak velem egyszerre egy aszinkron (körökre osztott) játékot, ami időben korlátlan. A valós idő és az egyidejű játékok feloldásához válts BGA Premiumra itt: {link} Köszönöm a megértést, és sok sikert!",
+  "el": "Συγγνώμη! Τα παιχνίδια σε πραγματικό χρόνο και πολλά παιχνίδια ταυτόχρονα προορίζονται για τα μέλη BGA Premium, επειδή ο χρόνος παιχνιδιού μου είναι περιορισμένος πόρος. Τα δωρεάν μέλη μπορούν πάντα να παίζουν μαζί μου ένα ασύγχρονο (με σειρά) παιχνίδι τη φορά, το οποίο είναι απεριόριστο στον χρόνο. Για να ξεκλειδώσεις τον πραγματικό χρόνο και τα ταυτόχρονα παιχνίδια, κάνε αναβάθμιση σε BGA Premium εδώ: {link} Ευχαριστώ για την κατανόηση και καλή τύχη!",
+  "tr": "Üzgünüm! Gerçek zamanlı oyunlar ve aynı anda birden fazla oyun BGA Premium üyelerine ayrılmıştır, çünkü oyun sürem sınırlı bir kaynaktır. Ücretsiz üyeler benimle her zaman aynı anda bir asenkron (sıra tabanlı) oyun oynayabilir, ki bu zaman içinde sınırsızdır. Gerçek zamanı ve eşzamanlı oyunları açmak için buradan BGA Premium'a geç: {link} Anlayışın için teşekkürler ve bol şans!",
+  "ar": "آسف! المباريات الفورية ولعب عدة مباريات في وقت واحد مخصّصة لأعضاء BGA Premium، لأن وقت لعبي مورد محدود. يمكن للأعضاء المجانيين دائمًا أن يلعبوا معي مباراة واحدة غير متزامنة (بالأدوار) في كل مرة، وهذا غير محدود بمرور الوقت. لفتح اللعب الفوري والمباريات المتزامنة، انتقل إلى BGA Premium هنا: {link} شكرًا لتفهّمك وحظًا موفقًا!",
+  "he": "מצטער! משחקים בזמן אמת וכמה משחקים בו זמנית שמורים לחברי BGA Premium, מפני שזמן המשחק שלי הוא משאב מוגבל. חברים חינמיים יכולים תמיד לשחק איתי משחק אסינכרוני (תורי) אחד בכל פעם, וזה ללא הגבלה לאורך זמן. כדי לפתוח משחק בזמן אמת ומשחקים בו זמנית, שדרג ל-BGA Premium כאן: {link} תודה על ההבנה ובהצלחה!",
+  "fa": "ببخشید! بازی‌های هم‌زمان (real-time) و چند بازی به‌طور هم‌زمان مخصوص اعضای BGA Premium است، چون زمان بازی من منبعی محدود است. اعضای رایگان همیشه می‌توانند هر بار یک بازی ناهم‌زمان (نوبتی) با من انجام دهند که در طول زمان نامحدود است. برای باز کردن بازی هم‌زمان و چند بازی هم‌زمان، از اینجا به BGA Premium ارتقا دهید: {link} ممنون از درکتان و موفق باشید!",
+  "ja": "ごめんなさい！リアルタイム対局や同時に複数の対局は、私のプレイ時間が限られた資源であるため、BGA Premium 会員専用です。無料会員の方も、いつでも私と非同期（ターン制）の対局を同時に1局だけプレイでき、これは時間的に無制限です。リアルタイムと同時対局を解放するには、こちらから BGA Premium にアップグレードしてください：{link} ご理解ありがとうございます、頑張ってください！",
+  "ko": "죄송합니다! 실시간 게임과 동시에 여러 게임을 두는 것은 제 플레이 시간이 한정된 자원이기 때문에 BGA Premium 회원 전용입니다. 무료 회원도 언제든지 저와 한 번에 하나의 비동기(턴제) 게임을 둘 수 있으며, 이는 시간상 무제한입니다. 실시간 및 동시 게임을 잠금 해제하려면 여기에서 BGA Premium으로 업그레이드하세요: {link} 이해해 주셔서 감사하고 행운을 빕니다!",
+  "zh": "抱歉！实时对局以及同时进行多盘对局仅向 BGA Premium 会员开放，因为我的对弈时间是有限的资源。免费会员随时可以与我进行一盘异步（回合制）对局，这在时间上是无限的。要解锁实时对局和同时多盘对局，请在此升级到 BGA Premium：{link} 感谢理解，祝你好运！",
+  "th": "ขอโทษนะครับ! เกมเรียลไทม์และการเล่นหลายเกมพร้อมกันสงวนไว้สำหรับสมาชิก BGA Premium เพราะเวลาเล่นของผมเป็นทรัพยากรที่จำกัด สมาชิกฟรีสามารถเล่นเกมแบบอะซิงโครนัส (ผลัดกันเดิน) กับผมได้ครั้งละหนึ่งเกมเสมอ ซึ่งไม่จำกัดเมื่อเวลาผ่านไป หากต้องการปลดล็อกเรียลไทม์และการเล่นพร้อมกันหลายเกม อัปเกรดเป็น BGA Premium ได้ที่นี่: {link} ขอบคุณที่เข้าใจ และขอให้โชคดี!",
+  "vi": "Xin lỗi! Các ván thời gian thực và chơi nhiều ván cùng lúc dành riêng cho thành viên BGA Premium, vì thời gian chơi của tôi là nguồn lực có hạn. Thành viên miễn phí luôn có thể chơi với tôi một ván bất đồng bộ (theo lượt) tại một thời điểm, điều này là không giới hạn theo thời gian. Để mở khóa thời gian thực và nhiều ván cùng lúc, hãy nâng cấp lên BGA Premium tại đây: {link} Cảm ơn bạn đã thông cảm và chúc may mắn!",
+  "id": "Maaf! Permainan waktu nyata dan beberapa permainan sekaligus hanya untuk anggota BGA Premium, karena waktu bermain saya adalah sumber daya terbatas. Anggota gratis selalu bisa memainkan satu permainan asinkron (bergiliran) dengan saya dalam satu waktu, yang tidak terbatas seiring waktu. Untuk membuka waktu nyata dan permainan bersamaan, tingkatkan ke BGA Premium di sini: {link} Terima kasih atas pengertiannya dan semoga berhasil!",
+  "ms": "Maaf! Permainan masa nyata dan beberapa permainan serentak dikhaskan untuk ahli BGA Premium, kerana masa bermain saya ialah sumber yang terhad. Ahli percuma sentiasa boleh bermain satu permainan tak segerak (giliran) dengan saya pada satu masa, yang tidak terhad dari semasa ke semasa. Untuk membuka masa nyata dan permainan serentak, naik taraf ke BGA Premium di sini: {link} Terima kasih atas kefahaman anda dan semoga berjaya!",
+  "fi": "Anteeksi! Reaaliaikaiset pelit ja useat pelit yhtä aikaa on varattu BGA Premium -jäsenille, koska peliaikani on rajallinen voimavara. Ilmaiset jäsenet voivat aina pelata kanssani yhden asynkronisen (vuoropohjaisen) pelin kerrallaan, mikä on ajallisesti rajatonta. Avataksesi reaaliaikaiset ja samanaikaiset pelit, päivitä BGA Premiumiin täältä: {link} Kiitos ymmärryksestäsi ja onnea matkaan!",
+  "sv": "Förlåt! Spel i realtid och flera spel samtidigt är reserverade för BGA Premium-medlemmar, eftersom min speltid är en begränsad resurs. Gratismedlemmar kan alltid spela ett asynkront (turbaserat) spel med mig åt gången, vilket är obegränsat över tid. För att låsa upp realtid och samtidiga spel, uppgradera till BGA Premium här: {link} Tack för din förståelse och lycka till!",
+  "no": "Beklager! Sanntidsspill og flere spill samtidig er forbeholdt BGA Premium-medlemmer, fordi spilletiden min er en begrenset ressurs. Gratismedlemmer kan alltid spille ett asynkront (turbasert) spill med meg om gangen, noe som er ubegrenset over tid. For å låse opp sanntid og samtidige spill, oppgrader til BGA Premium her: {link} Takk for forståelsen, og lykke til!",
+  "da": "Undskyld! Realtidsspil og flere spil på én gang er forbeholdt BGA Premium-medlemmer, fordi min spilletid er en begrænset ressource. Gratismedlemmer kan altid spille ét asynkront (turbaseret) spil med mig ad gangen, hvilket er ubegrænset over tid. For at låse op for realtid og samtidige spil, opgrader til BGA Premium her: {link} Tak for din forståelse, og held og lykke!",
+  "ca": "Ho sento! Les partides en temps real i diverses partides alhora estan reservades als membres BGA Premium, perquè el meu temps de joc és un recurs limitat. Els membres gratuïts sempre poden jugar amb mi una partida asíncrona (per torns) cada vegada, cosa que és il·limitada amb el temps. Per desbloquejar el temps real i les partides simultànies, passa a BGA Premium aquí: {link} Gràcies per la teva comprensió i bona sort!",
+  "gl": "Síntoo! As partidas en tempo real e varias partidas á vez están reservadas aos membros BGA Premium, porque o meu tempo de xogo é un recurso limitado. Os membros gratuítos sempre poden xogar comigo unha partida asíncrona (por quendas) de cada vez, o que é ilimitado co tempo. Para desbloquear o tempo real e as partidas simultáneas, pasa a BGA Premium aquí: {link} Grazas pola túa comprensión e boa sorte!",
+  "br": "Digarez! Ar c'hoarioù war-eeun ha meur a c'hoari war un dro a zo miret evit izili BGA Premium, rak un danvez bevennet eo va amzer c'hoari. Gallout a ra an izili digoust c'hoari ganin ur c'hoari dizenkronel (dre zroioù) bep tro, ar pezh a zo hep bevenn en amzer. Evit dibrennañ ar c'hoari war-eeun hag ar c'hoarioù war un dro, tremen da BGA Premium amañ: {link} Trugarez evit ho komprenezon, ha chañs vat!",
+  "be": "Прабачце! Гульні ў рэальным часе і некалькі гульняў адначасова даступныя толькі ўдзельнікам BGA Premium, бо мой час гульні абмежаваны рэсурс. Бясплатныя ўдзельнікі заўсёды могуць гуляць са мной у адну асінхронную (пакрокавую) гульню за раз, і гэта неабмежавана ў часе. Каб адкрыць рэальны час і адначасовыя гульні, перайдзіце на BGA Premium тут: {link} Дзякуй за разуменне і поспехаў!",
+  "et": "Vabandust! Reaalajas mängud ja mitu mängu korraga on mõeldud BGA Premium liikmetele, sest minu mänguaeg on piiratud ressurss. Tasuta liikmed saavad alati minuga korraga mängida ühe asünkroonse (käigupõhise) mängu, mis on ajas piiramatu. Reaalaja ja samaaegsete mängude avamiseks uuenda siin BGA Premiumiks: {link} Tänan mõistmast ja edu!",
+  "lt": "Atsiprašau! Žaidimai realiu laiku ir keli žaidimai vienu metu skirti tik BGA Premium nariams, nes mano žaidimo laikas yra ribotas išteklius. Nemokami nariai visada gali su manimi žaisti vieną asinchroninį (ėjimais grįstą) žaidimą vienu metu, o tai laikui bėgant neribota. Norėdami atrakinti realų laiką ir vienalaikius žaidimus, pereikite prie BGA Premium čia: {link} Ačiū už supratimą ir sėkmės!",
+  "lv": "Atvainojos! Reāllaika spēles un vairākas spēles vienlaikus ir paredzētas BGA Premium dalībniekiem, jo mans spēlēšanas laiks ir ierobežots resurss. Bezmaksas dalībnieki vienmēr var spēlēt ar mani vienu asinhrono (gājienu) spēli vienlaikus, kas laika gaitā ir neierobežota. Lai atbloķētu reāllaiku un vienlaicīgas spēles, jaunini uz BGA Premium šeit: {link} Paldies par sapratni un veiksmi!",
+};
+// Merge the consolidated premium-gate strings into TRANSLATIONS so `t()`
+// resolves them like any other key (English remains the fallback for any
+// locale not covered here).
+for (const [lang, msg] of Object.entries(PREMIUM_GATE)) {
+  (TRANSLATIONS[lang] ??= {}).premiumGate = msg;
+}
+
+/**
+ * Appended to the premium-gate nudge ONLY for the async-limit case, to point
+ * the free member at the one async game they're allowed to keep (their oldest
+ * active async game with the bot). "{gameLink}" is a direct BGA table URL.
+ * One consolidated map across all 41 languages, merged into TRANSLATIONS like
+ * premiumGate above. No em-dashes anywhere.
+ */
+const PREMIUM_GATE_ASYNC_OTHER: Record<string, string> = {
+  "en": "Please finish this game before starting another async game: {gameLink}",
+  "fr": "Merci de terminer cette partie avant d'en commencer une autre en asynchrone : {gameLink}",
+  "es": "Por favor, termina esta partida antes de empezar otra partida asíncrona: {gameLink}",
+  "pt": "Por favor, termina esta partida antes de começar outra partida assíncrona: {gameLink}",
+  "it": "Per favore, finisci questa partita prima di iniziarne un'altra in asincrono: {gameLink}",
+  "de": "Bitte beende diese Partie, bevor du eine weitere asynchrone Partie startest: {gameLink}",
+  "nl": "Maak dit spel alsjeblieft af voordat je een ander asynchroon spel start: {gameLink}",
+  "ru": "Пожалуйста, завершите эту игру, прежде чем начинать ещё одну асинхронную игру: {gameLink}",
+  "uk": "Будь ласка, завершіть цю гру, перш ніж починати ще одну асинхронну гру: {gameLink}",
+  "pl": "Proszę, dokończ tę grę, zanim zaczniesz kolejną grę asynchroniczną: {gameLink}",
+  "cs": "Prosím, dokonči tuto hru, než začneš další asynchronní hru: {gameLink}",
+  "sk": "Prosím, dokonči túto hru, než začneš ďalšiu asynchrónnu hru: {gameLink}",
+  "sl": "Prosim, dokončaj to igro, preden začneš novo asinhrono igro: {gameLink}",
+  "sr": "Молим те, заврши ову игру пре него што започнеш још једну асинхрону игру: {gameLink}",
+  "hr": "Molim te, završi ovu igru prije nego što započneš još jednu asinkronu igru: {gameLink}",
+  "bg": "Моля, завърши тази игра, преди да започнеш още една асинхронна игра: {gameLink}",
+  "ro": "Te rog termină acest joc înainte de a începe alt joc asincron: {gameLink}",
+  "hu": "Kérlek, fejezd be ezt a játékot, mielőtt új aszinkron játékot kezdesz: {gameLink}",
+  "el": "Παρακαλώ τελείωσε αυτό το παιχνίδι πριν ξεκινήσεις άλλο ασύγχρονο παιχνίδι: {gameLink}",
+  "tr": "Lütfen başka bir asenkron oyuna başlamadan önce bu oyunu bitir: {gameLink}",
+  "ar": "من فضلك أنهِ هذه المباراة قبل أن تبدأ مباراة غير متزامنة أخرى: {gameLink}",
+  "he": "אנא סיים את המשחק הזה לפני שתתחיל משחק אסינכרוני נוסף: {gameLink}",
+  "fa": "لطفاً این بازی را تمام کنید پیش از آنکه بازی ناهم‌زمان دیگری شروع کنید: {gameLink}",
+  "ja": "別の非同期対局を始める前に、まずこの対局を終えてください：{gameLink}",
+  "ko": "다른 비동기 게임을 시작하기 전에 이 게임을 먼저 끝내 주세요: {gameLink}",
+  "zh": "开始另一盘异步对局之前，请先下完这一盘：{gameLink}",
+  "th": "กรุณาเล่นเกมนี้ให้จบก่อนเริ่มเกมแบบอะซิงโครนัสเกมใหม่: {gameLink}",
+  "vi": "Vui lòng hoàn thành ván này trước khi bắt đầu một ván bất đồng bộ khác: {gameLink}",
+  "id": "Tolong selesaikan permainan ini sebelum memulai permainan asinkron lain: {gameLink}",
+  "ms": "Sila habiskan permainan ini sebelum memulakan permainan tak segerak yang lain: {gameLink}",
+  "fi": "Pelaa tämä peli loppuun ennen kuin aloitat uuden asynkronisen pelin: {gameLink}",
+  "sv": "Spela klart det här spelet innan du börjar ett nytt asynkront spel: {gameLink}",
+  "no": "Fullfør dette spillet før du starter et nytt asynkront spill: {gameLink}",
+  "da": "Gør venligst dette spil færdigt, før du starter et nyt asynkront spil: {gameLink}",
+  "ca": "Si us plau, acaba aquesta partida abans de començar-ne una altra d'asíncrona: {gameLink}",
+  "gl": "Por favor, remata esta partida antes de comezar outra partida asíncrona: {gameLink}",
+  "br": "Mar plij, echu ar c'hoari-mañ a-raok kregiñ gant ur c'hoari dizenkronel all: {gameLink}",
+  "be": "Калі ласка, завяршыце гэтую гульню, перш чым пачынаць яшчэ адну асінхронную гульню: {gameLink}",
+  "et": "Palun lõpeta see mäng enne uue asünkroonse mängu alustamist: {gameLink}",
+  "lt": "Prašome baigti šį žaidimą prieš pradedant kitą asinchroninį žaidimą: {gameLink}",
+  "lv": "Lūdzu, pabeidz šo spēli, pirms sāc citu asinhrono spēli: {gameLink}",
+};
+for (const [lang, msg] of Object.entries(PREMIUM_GATE_ASYNC_OTHER)) {
+  (TRANSLATIONS[lang] ??= {}).premiumGateAsyncOther = msg;
+}
 
 /**
  * Resolve a localized message. Falls back to English when the language is
