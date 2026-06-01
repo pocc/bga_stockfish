@@ -164,6 +164,7 @@ export default {
     const mutatingBot = new Set([
       "/bot/start", "/bot/stop", "/bot/tick", "/bot/cleanup",
       "/bot/probe", "/bot/wipe", "/bot/fix-result", "/bot/reconcile-results",
+      "/bot/retally-unscored",
       "/bot/resync-stats", "/bot/resync-engine-uses", "/bot/ws-probe",
       "/bot/purge-cache",
     ]);
@@ -1479,11 +1480,17 @@ const NONRESULT_REASONS = {
   "opponentInactivity": "Opponent inactive",
   "premium:realtime-free": "Premium gate: realtime",
   "premium:async-limit": "Premium gate: 2nd async",
+  // Legacy uncountedReason codes from a since-removed scorer guard.
+  "no-moves": "No moves played",
+  "neutralized": "Neutralized / abandoned",
 };
 function nonResultReason(r) {
   if (r.reason) return NONRESULT_REASONS[r.reason] || r.reason;
-  // Legacy "none" entries (a BGA finish whose score didn't parse to 0/0.5/1)
-  // carry no reason code; surface the raw score so it can still be triaged.
+  // Legacy backlog: a since-removed guard force-marked some scored games
+  // "none" and recorded why in uncountedReason. /bot/retally-unscored
+  // re-tallies the ones with a clean score; the rest surface their reason.
+  if (r.uncountedReason) return NONRESULT_REASONS[r.uncountedReason] || r.uncountedReason;
+  // Truly unscored: a BGA finish whose score didn't parse to 0/0.5/1.
   return "Unscored finish (raw: " + (r.rawScore == null ? "null" : r.rawScore) + ")";
 }
 

@@ -540,6 +540,13 @@ interface ResultEntry {
    *  Undefined on scored games and on legacy "none" entries (an unparseable
    *  BGA finish score). */
   reason?: string;
+  /** Legacy: an earlier build force-marked some finished games tally "none"
+   *  (a since-removed "no moves played" / "neutralized" guard) even though BGA
+   *  had assigned a clean score, recording WHY here ("no-moves" /
+   *  "neutralized"). No longer written by the current scorer; retained only so
+   *  the dashboard can label, and `/bot/retally-unscored` can re-tally, the
+   *  backlog of such entries. */
+  uncountedReason?: string;
   /** Snapshot of game stats at finish, for the past-games table. All
    *  optional — entries written before these fields existed leave them
    *  undefined, and the dashboard renders a dash. */
@@ -860,6 +867,12 @@ export class BotDriver extends DurableObject<Env> {
       const result = await this.reconcileResults(apply);
       return Response.json(result);
     }
+    if (url.pathname === "/retally-unscored") {
+      await this.boot();
+      const apply = url.searchParams.get("apply") === "1";
+      const result = await this.retallyUnscored(apply);
+      return Response.json(result);
+    }
     if (url.pathname === "/resync-stats") {
       await this.boot();
       const apply = url.searchParams.get("apply") === "1";
@@ -1072,6 +1085,70 @@ export class BotDriver extends DurableObject<Env> {
       await this.ctx.storage.put("recentResults", updated);
     }
 
+    return {
+      apply, inspected, candidates, applied,
+      stats: apply ? this.status.stats : undefined,
+    };
+  }
+
+  /**
+   * One-time backlog fix. An earlier build force-marked some finished games
+   * tally "none" (a since-removed "no moves played" / "neutralized" guard)
+   * even though BGA had assigned a definitive score, leaving real wins/losses
+   * uncounted (they showed as "unscored finishes"). Walk recentResults and
+   * re-tally any tally==="none" entry whose rawScore parses to a clean result,
+   * using the SAME rule as the live scorer (1=win, 0.5 or mutual-zero=draw,
+   * 0=loss). Entries whose score doesn't parse stay "none". Dry-run by default;
+   * ?apply=1 commits via fixResult, which rebalances both the top-line and
+   * per-difficulty counters.
+   */
+  private async retallyUnscored(apply: boolean): Promise<{
+    apply: boolean;
+    inspected: number;
+    candidates: Array<{
+      tableId: string; ts: number; rawScore: string | null;
+      oppRawScore: string | null; was?: string;
+      recommendation: "win" | "loss" | "draw";
+    }>;
+    applied: number;
+    stats?: BotStats;
+  }> {
+    const results = this.status.recentResults || [];
+    const candidates: Array<{
+      tableId: string; ts: number; rawScore: string | null;
+      oppRawScore: string | null; was?: string;
+      recommendation: "win" | "loss" | "draw";
+    }> = [];
+    let inspected = 0;
+    for (const r of results) {
+      if (r.tally !== "none") continue;
+      inspected++;
+      const score = r.rawScore == null ? null : Number(r.rawScore);
+      if (score == null || !Number.isFinite(score)) continue; // truly unscored
+      const opp = r.oppRawScore == null ? null : Number(r.oppRawScore);
+      const mutualZero = score === 0 && opp === 0;
+      let rec: "win" | "loss" | "draw" | null = null;
+      if (score === 1) rec = "win";
+      else if (score === 0.5 || mutualZero) rec = "draw";
+      else if (score === 0) rec = "loss";
+      if (!rec) continue;
+      candidates.push({
+        tableId: r.tableId, ts: r.ts, rawScore: r.rawScore,
+        oppRawScore: r.oppRawScore ?? null,
+        was: r.uncountedReason ?? r.reason, recommendation: rec,
+      });
+    }
+    let applied = 0;
+    if (apply) {
+      for (const c of candidates) {
+        const fix = await this.fixResult(c.tableId, c.recommendation);
+        if (fix.ok && fix.after?.tally === c.recommendation) applied++;
+      }
+    }
+    console.log(
+      `bot:retallyUnscored apply=${apply} inspected=${inspected} ` +
+      `candidates=${candidates.length} applied=${applied}`,
+    );
     return {
       apply, inspected, candidates, applied,
       stats: apply ? this.status.stats : undefined,
