@@ -39,7 +39,8 @@ import { enginePrecedenceRank, isCacheableEngine } from "./stockfish-do";
 import { parseGameLog, reconstructMoves } from "./game-log";
 import {
   buildPremiumLink, buildGameLink, isSecondaryAsyncGame, primaryAsyncGameId,
-  decidePremiumBlock, type PremiumBlockReason, type GateMode,
+  decidePremiumBlock, isPremiumGateActive,
+  type PremiumBlockReason, type GateMode,
 } from "./premium";
 
 const TICK_MS = 5_000;
@@ -2231,6 +2232,12 @@ export class BotDriver extends DurableObject<Env> {
     await this.ctx.storage.put("premiumClicks", this.status.premiumClicks);
   }
 
+  /** Counted games so far (wins + losses + draws). Drives the gate-hold check. */
+  private gamesPlayed(): number {
+    const s = this.status.stats;
+    return (s.wins ?? 0) + (s.losses ?? 0) + (s.draws ?? 0);
+  }
+
   /**
    * Premium gate. The bot's playing time is the scarce resource: it has a
    * single realtime slot and can only sanely juggle so many async games, so
@@ -2251,16 +2258,24 @@ export class BotDriver extends DurableObject<Env> {
    * before any move is played — the closest practical realization of "don't
    * start a game we shouldn't" given no pre-launch premium signal exists.
    *
+   * Held OFF during the growth phase (isPremiumGateActive): until the bot has
+   * played 10k counted games, this returns false for everyone.
+   *
    * Fails OPEN: unknown membership (oppPremium === undefined) never blocks, so
    * a paying member is never wrongly turned away.
    */
   private async enforcePremiumGate(tableId: string, m: TableMemo): Promise<boolean> {
     if (!this.client) return false;
     // Already nudged: stay idempotent, and run the deferred void if it's due.
+    // (Any table flagged before the gate was held off still finishes its kick.)
     if (m.premiumBlocked) {
       await this.maybeKickPremiumBlocked(tableId, m);
       return true;
     }
+    // Growth-phase hold: the gate stays OFF until the bot is popular enough
+    // (>= 10k counted games). Until then everyone plays unblocked — which also
+    // avoids the disruptive realtime-kick path entirely.
+    if (!isPremiumGateActive(this.gamesPlayed())) return false;
     const isRealtime = m.realtime === true;
     const secondaryAsync = !isRealtime
       && !!m.oppId

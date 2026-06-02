@@ -36,6 +36,29 @@ export const BGA_TABLE_URL = "https://boardgamearena.com/table?table=";
 export type PremiumBlockReason = "realtime-free" | "async-limit";
 export type GateMode = "realtime" | "async";
 
+/**
+ * The premium gate is held OFF during the bot's growth phase: "get popular
+ * first" — don't nudge anyone toward Premium until the bot has played enough
+ * games to have built a real audience. Until then enforcePremiumGate is a
+ * no-op and every opponent (free or premium) plays unblocked, which also
+ * sidesteps the disruptive realtime-kick path entirely.
+ */
+
+/** Counted games (wins+losses+draws) required before the premium gate turns on. */
+export const PREMIUM_GATE_MIN_GAMES = 10_000;
+
+/**
+ * Is the premium gate live yet? True once the bot has played at least
+ * `minGames` counted games. `minGames` is injectable so the policy is
+ * unit-testable.
+ */
+export function isPremiumGateActive(
+  gamesPlayed: number,
+  minGames: number = PREMIUM_GATE_MIN_GAMES,
+): boolean {
+  return gamesPlayed >= minGames;
+}
+
 /** Minimal structural view of a table memo this module needs — declared
  *  locally so premium.ts never imports bot-do.ts (avoids a cycle). */
 export interface PremiumMemoView {

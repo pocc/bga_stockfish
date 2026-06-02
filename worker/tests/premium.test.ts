@@ -1,7 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
   buildPremiumLink, buildGameLink, isSecondaryAsyncGame, primaryAsyncGameId,
-  decidePremiumBlock, PREMIUM_REDIRECT_ORIGIN, BGA_PREMIUM_URL, BGA_TABLE_URL,
+  decidePremiumBlock, isPremiumGateActive, PREMIUM_GATE_MIN_GAMES,
+  PREMIUM_REDIRECT_ORIGIN, BGA_PREMIUM_URL, BGA_TABLE_URL,
   type PremiumMemoView,
 } from "../src/premium";
 
@@ -137,5 +138,31 @@ describe("isSecondaryAsyncGame", () => {
   test("a table not in the active set is never flagged", () => {
     const tables = { "100": async("opp1") };
     expect(isSecondaryAsyncGame(tables, "opp1", "999")).toBe(false);
+  });
+});
+
+describe("isPremiumGateActive (growth-phase hold)", () => {
+  test("min games threshold is 10k", () => {
+    expect(PREMIUM_GATE_MIN_GAMES).toBe(10_000);
+  });
+
+  test("off well below the threshold (current ~535 games)", () => {
+    expect(isPremiumGateActive(535)).toBe(false);
+    expect(isPremiumGateActive(0)).toBe(false);
+  });
+
+  test("off one game short of the threshold", () => {
+    expect(isPremiumGateActive(9_999)).toBe(false);
+  });
+
+  test("on exactly at the threshold and above", () => {
+    expect(isPremiumGateActive(10_000)).toBe(true);
+    expect(isPremiumGateActive(10_001)).toBe(true);
+    expect(isPremiumGateActive(1_000_000)).toBe(true);
+  });
+
+  test("threshold is injectable for staged rollouts / tests", () => {
+    expect(isPremiumGateActive(100, 100)).toBe(true);
+    expect(isPremiumGateActive(99, 100)).toBe(false);
   });
 });
