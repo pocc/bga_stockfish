@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { chunkChat } from "../src/chat";
+import { chunkChat, chatPaceDelayMs, CHAT_MIN_SPACING_MS } from "../src/chat";
 
 const GREETING =
   "Hi! I'm bot_stockfish, a chess bot on Board Game Arena https://stockfish.ross.gg/ \n" +
@@ -42,5 +42,44 @@ describe("chunkChat", () => {
     const chunks = chunkChat(long, 30);
     for (const c of chunks) expect(c.length).toBeLessThanOrEqual(30);
     expect(chunks.length).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * Regression: 7 production "There is a minimum of 1 second between messages"
+ * rejections. Two separate sendChat() calls (greeting then a reply, or two
+ * reaction chats on one tick) fired <1s apart and BGA dropped the second.
+ * chatPaceDelayMs computes the wait that keeps every send >=CHAT_MIN_SPACING_MS
+ * apart.
+ */
+describe("chatPaceDelayMs", () => {
+  test("no wait when we've never sent a chat", () => {
+    expect(chatPaceDelayMs(1_000_000, 0)).toBe(0);
+  });
+
+  test("waits the remaining gap when the last send was too recent", () => {
+    const now = 1_000_000;
+    // last send 300ms ago → wait the rest of the 1100ms window.
+    expect(chatPaceDelayMs(now, now - 300)).toBe(CHAT_MIN_SPACING_MS - 300);
+  });
+
+  test("no wait once the spacing has fully elapsed", () => {
+    const now = 1_000_000;
+    expect(chatPaceDelayMs(now, now - CHAT_MIN_SPACING_MS)).toBe(0);
+    expect(chatPaceDelayMs(now, now - 5_000)).toBe(0);
+  });
+
+  test("a backwards clock (future lastSentAt) caps the wait at one window, not unbounded", () => {
+    // lastSentAt > now → elapsed is negative; the wait must clamp to minSpacing
+    // so a clock skew can't stall the bot's chat for a long time.
+    expect(chatPaceDelayMs(1_000_000, 1_500_000)).toBe(CHAT_MIN_SPACING_MS);
+  });
+
+  test("the spacing exceeds BGA's 1s floor so clock skew can't undershoot", () => {
+    expect(CHAT_MIN_SPACING_MS).toBeGreaterThan(1_000);
+  });
+
+  test("honors a custom spacing argument", () => {
+    expect(chatPaceDelayMs(1_000, 600, 1_000)).toBe(600);
   });
 });

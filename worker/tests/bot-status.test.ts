@@ -9,6 +9,7 @@ import {
   isBenignCreateTableError,
   shouldFinalizeSeatlessTerminal,
   needsFinishScoreRefetch,
+  inviteSetupAgeMs,
 } from "../src/bot-status";
 
 /**
@@ -205,5 +206,45 @@ describe("needsFinishScoreRefetch", () => {
     expect(needsFinishScoreRefetch("1", null)).toBe(false);
     expect(needsFinishScoreRefetch("0.5", null)).toBe(false);
     expect(needsFinishScoreRefetch("1", "0")).toBe(false);
+  });
+});
+
+/**
+ * Regression: 17 production setupTimeout reaps with opp seated reported ages of
+ * 28-59m despite a 15-min limit. slot.createdAt is reset to `now` on every
+ * re-adoption, and a table flickering out of myTables restarted the clock, so
+ * the realtime slot stayed blocked far past 15m. inviteSetupAgeMs anchors on
+ * the earlier of slot.createdAt and the memo's stable startedAt.
+ */
+describe("inviteSetupAgeMs", () => {
+  const now = 1_000_000_000;
+
+  test("uses the memo's stable startedAt when the slot clock was just reset", () => {
+    // slot.createdAt reset to now (age 0) but the memo has been around 20m.
+    const twentyMin = 20 * 60_000;
+    expect(inviteSetupAgeMs(now, now, now - twentyMin)).toBe(twentyMin);
+  });
+
+  test("uses slot.createdAt when it is the earlier anchor", () => {
+    const thirtyMin = 30 * 60_000;
+    expect(inviteSetupAgeMs(now, now - thirtyMin, now - 5 * 60_000)).toBe(thirtyMin);
+  });
+
+  test("a fresh table (both anchors ~now) has age ~0 and is never reaped early", () => {
+    expect(inviteSetupAgeMs(now, now, now)).toBe(0);
+  });
+
+  test("null slot timestamp falls back to the memo anchor", () => {
+    const tenMin = 10 * 60_000;
+    expect(inviteSetupAgeMs(now, null, now - tenMin)).toBe(tenMin);
+  });
+
+  test("null memo startedAt falls back to the slot anchor", () => {
+    const tenMin = 10 * 60_000;
+    expect(inviteSetupAgeMs(now, now - tenMin, null)).toBe(tenMin);
+  });
+
+  test("both null → age 0 (no anchor yet, don't reap)", () => {
+    expect(inviteSetupAgeMs(now, null, undefined)).toBe(0);
   });
 });

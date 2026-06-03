@@ -24,7 +24,7 @@ import {
   type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
-import { chunkChat } from "./chat";
+import { chunkChat, chatPaceDelayMs } from "./chat";
 import {
   extractCentrifugeAuth, isVisitorId, channelsFor, probeCentrifuge,
   openCentrifugeSocket, parseFrames,
@@ -33,7 +33,7 @@ import {
   isJoinableStatus, isLivePlayStatus, isFinishedStatus,
   gamemodeOf, inviteSlotModeOf, GAMEMODES, decideReconcileMiss,
   isBenignCreateTableError, shouldFinalizeSeatlessTerminal,
-  needsFinishScoreRefetch,
+  needsFinishScoreRefetch, inviteSetupAgeMs,
   type Gamemode,
 } from "./bot-status";
 import { enginePrecedenceRank, isCacheableEngine } from "./stockfish-do";
@@ -709,6 +709,12 @@ export class BotDriver extends DurableObject<Env> {
    *  rewrite was pure write amplification. Empty after a DO restart → the
    *  next tick writes each blob once to re-seed. */
   private persistHashes: Record<string, number> = {};
+  /** Unix ms of the last chat we handed to BGA (any table). BGA rejects two
+   *  chats fired <1s apart, silently dropping the second; sendChat() paces
+   *  every send past this so a greeting + an immediate reply (or two reaction
+   *  chats on one tick) don't collide. In-memory is fine — chat pacing only
+   *  needs to hold within a burst, and a DO restart resets it to "send now". */
+  private lastChatSentAt = 0;
   /** Re-entrancy guard for tick(). DO fetch handlers run concurrently, so
    *  the 1-min cron's POST /tick can overlap an in-flight alarm-driven tick.
    *  Two ticks both seeing "our turn" and racing selectCell is one of the
@@ -1450,10 +1456,18 @@ export class BotDriver extends DurableObject<Env> {
     const chunks = chunkChat(msg, 220);
     let ok = true;
     for (let i = 0; i < chunks.length; i++) {
-      // Pace multi-chunk sends: BGA's say.html silently drops chats fired
-      // back-to-back (flood control), which truncated long greetings to just
-      // the first chunk. A 2s gap per chunk clears BGA's anti-flood window.
-      if (i > 0) await new Promise((r) => setTimeout(r, 2_000));
+      // Pace every send past BGA's anti-flood window. Two failure modes:
+      //   - within one message: BGA drops chunks fired back-to-back, which
+      //     truncated long greetings to just the first chunk (needs ~2s).
+      //   - across messages: a greeting immediately followed by a reply (or
+      //     two reaction chats on one tick) tripped "minimum of 1 second
+      //     between messages" and silently dropped the second.
+      // chatPaceDelayMs covers the cross-call gap from lastChatSentAt; the
+      // larger inter-chunk gap subsumes it for i>0.
+      const gap = i > 0
+        ? 2_000
+        : chatPaceDelayMs(Date.now(), this.lastChatSentAt);
+      if (gap > 0) await new Promise((r) => setTimeout(r, gap));
       try {
         const env = await this.client.chat(tableId, chunks[i]) as { status?: number | string };
         if (env && Number(env.status) !== 1) {
@@ -1463,6 +1477,10 @@ export class BotDriver extends DurableObject<Env> {
       } catch (e) {
         ok = false;
         this.recordError("chatFailed", e, tableId);
+      } finally {
+        // Stamp even on failure: BGA still saw the attempt, so the next send
+        // must pace off this moment regardless of the outcome.
+        this.lastChatSentAt = Date.now();
       }
     }
     return ok;
@@ -2501,7 +2519,14 @@ export class BotDriver extends DurableObject<Env> {
             // blocks every future createTable ("you are already at a
             // real-time table about to start"). Abort regardless of
             // oppSeated.
-            const age = now - (slot.createdAt ?? now);
+            // Anchor the age on the memo's stable startedAt as well as the
+            // slot timestamp: slot.createdAt is reset to `now` whenever an
+            // empty slot re-adopts this table, so a table that flickers out of
+            // myTables and back kept restarting the 15-min clock and sat
+            // 28-59m before reaping. inviteSetupAgeMs takes the earlier anchor.
+            const age = inviteSetupAgeMs(
+              now, slot.createdAt, this.status.tables[slot.id]?.startedAt,
+            );
             if (age <= OPEN_INVITE_SETUP_TIMEOUT_MS) continue;
             this.recordError(
               `setupTimeout:${mode}`,

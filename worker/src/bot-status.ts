@@ -114,6 +114,33 @@ export function inviteSlotModeOf(status: string): Gamemode | null {
   return gamemodeOf(status);
 }
 
+/**
+ * True age of a bot-owned invite table for the setup-timeout reaper.
+ *
+ * The reaper compares this against OPEN_INVITE_SETUP_TIMEOUT_MS (15m) to leave
+ * a wedged setup/init table that's holding the realtime slot. It used to read
+ * the age straight off `slot.createdAt` — but the invite-adoption pass resets
+ * `slot.createdAt = now` every time an empty slot re-adopts a table, and a
+ * table that briefly drops out of `myTables` (a routine BGA flake) nulls the
+ * slot and gets re-adopted the next tick. So the 15-min clock kept restarting
+ * and opp-seated setups sat 28-59m before reaping, holding the realtime slot
+ * (and blocking new realtime invites) far longer than intended.
+ *
+ * Anchor instead on the EARLIER of `slot.createdAt` and the memo's `startedAt`
+ * — the latter is stamped once when the memo is created and never reset, so it
+ * survives the slot flicker and reflects the table's real age. Either input may
+ * be null/undefined (no slot timestamp yet, or no memo), in which case it
+ * falls back to `now` for that side. Pure so it's unit-testable.
+ */
+export function inviteSetupAgeMs(
+  now: number,
+  slotCreatedAt: number | null | undefined,
+  memoStartedAt: number | null | undefined,
+): number {
+  const anchor = Math.min(slotCreatedAt ?? now, memoStartedAt ?? now);
+  return now - anchor;
+}
+
 export interface ReconcileMissDecision {
   /** Flip the memo to finished so the per-tick GC drops it. Realtime only. */
   markFinished: boolean;
