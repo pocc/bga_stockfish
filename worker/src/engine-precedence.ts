@@ -1,11 +1,45 @@
 /**
- * Pure engine-precedence + cache-eligibility helpers.
+ * Pure engine-precedence + cache-eligibility + move-legality helpers.
  *
  * Extracted from stockfish-do.ts so unit tests can import them without
  * dragging in `cloudflare:workers` (stockfish-do.ts is a Durable Object and
  * imports that at module load). stockfish-do.ts re-exports these for its own
  * callers; bot-do.ts imports them through that re-export.
  */
+
+/** A legal move as chess.js reports it (`chess.moves({ verbose: true })`). */
+export interface VerboseMove {
+  from: string;
+  to: string;
+  promotion?: string;
+}
+
+/**
+ * Is `uci` ("e2e4", "e7e8q") present in chess.js's legal-move list for the
+ * current position? The engine race takes the winning move verbatim from
+ * whichever engine resolved first, but a remote API can answer for a slightly
+ * stale/different position and a memory-pressured local search can emit
+ * garbage. Submitting an illegal move makes BGA reject our whole turn
+ * ("You can't expose your king to check…"), which burns the table's error
+ * budget into a needless concede. Gating the winner on chess.js — the legality
+ * ground truth for the exact FEN we searched — means the engine never proposes
+ * a move BGA will refuse. A UCI that omits the promotion piece on a promoting
+ * move is tolerated as a queen promotion (our local engine always appends `q`,
+ * but a bare remote answer shouldn't be discarded).
+ */
+export function isUciLegal(legal: readonly VerboseMove[], uci: string): boolean {
+  if (uci.length < 4) return false;
+  const from = uci.slice(0, 2);
+  const to = uci.slice(2, 4);
+  const promo = uci.slice(4).toLowerCase() || undefined;
+  return legal.some(
+    (m) =>
+      m.from === from &&
+      m.to === to &&
+      ((m.promotion ?? undefined) === promo ||
+        (promo === undefined && m.promotion === "q")),
+  );
+}
 
 /** Engine race order, strongest first. The winner of a parallel race is the
  *  lowest-ranked engine here that returned a usable move. lichess-cloud-eval

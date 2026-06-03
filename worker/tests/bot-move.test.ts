@@ -4,7 +4,9 @@ import {
   placementAfterMove, chooseRepetitionAwareMove, shouldSkipMoveForNeutralized,
   type Piece, type Destination, type MoveCandidate,
 } from "../src/bot-move";
-import { isCacheableEngine, CACHEABLE_ENGINES } from "../src/engine-precedence";
+import {
+  isCacheableEngine, CACHEABLE_ENGINES, isUciLegal, type VerboseMove,
+} from "../src/engine-precedence";
 
 // Player blocks in BGA's game-page HTML look like:
 //   "user_id":"<id>","status":"online","device":"desktop","language":"xx","player_name":"Name"
@@ -351,5 +353,49 @@ describe("parseGameHtml neutralized_player_id", () => {
   test("null / empty-string parse as null", () => {
     expect(parseGameHtml(`${base},"neutralized_player_id":null`)?.neutralizedPlayerId).toBeNull();
     expect(parseGameHtml(`${base},"neutralized_player_id":""`)?.neutralizedPlayerId).toBeNull();
+  });
+});
+
+/**
+ * Regression: an engine OOM/stale answer shipped an illegal move (king left in
+ * check) that BGA refused, burning the table's error budget into a needless
+ * concede. The engine DO now gates every winning move on chess.js's legal list
+ * via isUciLegal; these cover the from/to and promotion matching it relies on.
+ */
+describe("isUciLegal", () => {
+  const legal: VerboseMove[] = [
+    { from: "e2", to: "e4" },
+    { from: "g1", to: "f3" },
+    { from: "e7", to: "e8", promotion: "q" },
+    { from: "e7", to: "e8", promotion: "n" },
+  ];
+
+  test("accepts a plain legal move", () => {
+    expect(isUciLegal(legal, "e2e4")).toBe(true);
+    expect(isUciLegal(legal, "g1f3")).toBe(true);
+  });
+
+  test("rejects a move that isn't in the legal list (the illegal-move bug)", () => {
+    expect(isUciLegal(legal, "e2e5")).toBe(false); // wrong destination
+    expect(isUciLegal(legal, "d2d4")).toBe(false); // piece can't move
+  });
+
+  test("matches the exact promotion piece", () => {
+    expect(isUciLegal(legal, "e7e8q")).toBe(true);
+    expect(isUciLegal(legal, "e7e8n")).toBe(true);
+    expect(isUciLegal(legal, "e7e8r")).toBe(false); // underpromotion not offered
+  });
+
+  test("a promotion UCI missing its suffix is tolerated as a queen promo", () => {
+    expect(isUciLegal(legal, "e7e8")).toBe(true);
+  });
+
+  test("rejects malformed / too-short UCI", () => {
+    expect(isUciLegal(legal, "")).toBe(false);
+    expect(isUciLegal(legal, "e2")).toBe(false);
+  });
+
+  test("an empty legal list rejects everything (game over)", () => {
+    expect(isUciLegal([], "e2e4")).toBe(false);
   });
 });

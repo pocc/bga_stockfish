@@ -4,6 +4,7 @@ import { Game } from "js-chess-engine";
 import type { Env } from "./index";
 import {
   ENGINE_PRECEDENCE, enginePrecedenceRank, LOCAL_ENGINE, isCacheableEngine,
+  isUciLegal,
 } from "./engine-precedence";
 
 interface BestMoveRequest {
@@ -67,6 +68,18 @@ const CONTAINER_TIMEOUT_MS = 5_000;
 const LICHESS_CLOUD_TIMEOUT_MS = 2_000;
 const STOCKFISH_ONLINE_TIMEOUT_MS = 5_000;
 const RAPIDAPI_STOCKFISH_TIMEOUT_MS = 5_000;
+/** js-chess-engine search level for the local fallback inside the grandmaster
+ *  (non-localOnly) race. `game.ai()` is a SYNCHRONOUS minimax that allocates a
+ *  search tree scaling steeply with level; this one DO isolate (keyed per bot)
+ *  serves every concurrent game, so several level-3 searches firing on the
+ *  same tick stacked enough trees to blow the isolate's 128MB ceiling and
+ *  trigger "exceeded its memory limit and was reset" mid-move (which then
+ *  shipped a stale/illegal fallback). In grandmaster mode the local engine is
+ *  only the lowest-precedence last resort — used solely when EVERY remote
+ *  engine fails — so a shallow, cheap search there costs nothing in normal
+ *  play while removing the OOM. Difficulty games (localOnly) keep their
+ *  requested level: that IS the configured playing strength. */
+const GRANDMASTER_LOCAL_LEVEL = 1;
 // Engine precedence + cache-eligibility helpers live in a pure module
 // (./engine-precedence) so unit tests can import them without
 // `cloudflare:workers`. Imported at the top for this file's own use and
@@ -454,7 +467,13 @@ export class StockfishEngine extends DurableObject<Env> {
     }
 
     if (!req.remoteOnly) {
-      const level = Math.min(Math.max(req.level ?? 3, 1), 5);
+      // Difficulty games run ONLY this engine, so honor the requested level
+      // (that's their strength). In the grandmaster race it's a last-resort
+      // fallback behind every remote engine — run it shallow to keep the
+      // shared DO isolate from OOMing (see GRANDMASTER_LOCAL_LEVEL).
+      const level = req.localOnly
+        ? Math.min(Math.max(req.level ?? 3, 1), 5)
+        : GRANDMASTER_LOCAL_LEVEL;
       tasks.push(makeTask("js-chess-engine (local DO)", start, async () => {
         const uci = localBestMove(req.fen, level);
         return { move: uci };
@@ -463,8 +482,17 @@ export class StockfishEngine extends DurableObject<Env> {
 
     const results = await raceWithCeiling(tasks, RACE_CEILING_MS);
 
-    // Successful engines, by completion order.
-    const successful = results.filter((r) => r.ok && r.move);
+    // Successful engines, by completion order — but only those whose move is
+    // actually LEGAL in this exact position. chess.js (`legal`, above) is the
+    // legality ground truth; a remote API answering for a stale position or a
+    // memory-pressured local search can return a move that leaves our king in
+    // check, and submitting it makes BGA reject the whole turn and burns the
+    // table's error budget into a needless concede. Drop illegal winners here
+    // so the bot never proposes a move BGA will refuse; if that empties the
+    // list we fall through to the chess.js random-legal pick below.
+    const successful = results.filter(
+      (r) => r.ok && r.move && isUciLegal(legal, r.move),
+    );
 
     // Pick winner by precedence: chess-api > wasm > container > local.
     let chosen: EngineTaskResult | null = null;
