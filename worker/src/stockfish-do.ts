@@ -6,6 +6,7 @@ import {
   ENGINE_PRECEDENCE, enginePrecedenceRank, LOCAL_ENGINE, isCacheableEngine,
   isUciLegal,
 } from "./engine-precedence";
+import { raceWithCeiling } from "./engine-race";
 
 interface BestMoveRequest {
   fen: string;
@@ -52,34 +53,52 @@ const LICHESS_CLOUD_EVAL_URL = "https://lichess.org/api/cloud-eval";
 const STOCKFISH_ONLINE_URL = "https://stockfish.online/api/s/v2.php";
 const RAPIDAPI_STOCKFISH_URL = "https://chess-stockfish-16-api.p.rapidapi.com/chess/api";
 const RAPIDAPI_STOCKFISH_HOST = "chess-stockfish-16-api.p.rapidapi.com";
-/** Wall-clock ceiling for the parallel engine race. Whichever engines have
- *  returned by this point are considered; we then pick the preferred one by
- *  precedence. */
-const RACE_CEILING_MS = 5_000;
-/** Per-engine timeouts. All capped at RACE_CEILING_MS so a stuck upstream
- *  can't pace the race longer than the ceiling. chess-api was 12s; the
- *  service has been hanging forever on /v1 POSTs, so 5s lets us bail early
- *  and let the local engines win the race. */
-const CHESS_API_TIMEOUT_MS = 5_000;
-const CONTAINER_TIMEOUT_MS = 5_000;
+/** Wall-clock ceiling for the parallel engine race. The race resolves as soon
+ *  as the first *good* (legal, non-local) engine move lands — see the
+ *  acceptEarly predicate in handleBestMove — so the common path returns in
+ *  whatever a remote engine's real latency is (~1-2s). This ceiling is only
+ *  reached when every remote engine is slow or down on the same move; we then
+ *  take whatever has settled, else a random legal move. 60s (up from 5s) lets a
+ *  slow-but-alive Stockfish still land a real move instead of falling back, and
+ *  it's safe because the bot only plays BGA *friendly* games, whose clocks are
+ *  ~90 days (see bot-do OPPONENT_INACTIVITY_LIMIT_MS) — a long think can't flag
+ *  us. The local js-chess-engine never triggers the early resolve, so a fast
+ *  local move can't pre-empt the real engines during this window. */
+const RACE_CEILING_MS = 60_000;
+/** Per-engine fetch timeouts. The remote Stockfish engines get the full race
+ *  window so a slow-but-alive upstream can still land a real move before we
+ *  fall back; the race short-circuits on the FIRST good remote answer, so a
+ *  long per-engine timeout only actually bites when that engine is the lone
+ *  responder. (chess-api was 12s, then 5s while it hung on /v1 POSTs; the
+ *  short-circuit now makes a hung upstream harmless — any other remote ends the
+ *  race and aborts it — so it can have the full window too.) */
+const CHESS_API_TIMEOUT_MS = RACE_CEILING_MS;
+const CONTAINER_TIMEOUT_MS = RACE_CEILING_MS;
 /** Lichess cloud-eval is a DB lookup, not a search — usually <300ms when it
- *  hits, 404 when it misses. Short timeout so a slow lookup doesn't paint
- *  the move log with stalls. */
+ *  hits, 404 when it misses. Short timeout so a slow lookup doesn't hold a
+ *  connection: if it hasn't answered in 2s it isn't going to. */
 const LICHESS_CLOUD_TIMEOUT_MS = 2_000;
-const STOCKFISH_ONLINE_TIMEOUT_MS = 5_000;
-const RAPIDAPI_STOCKFISH_TIMEOUT_MS = 5_000;
-/** js-chess-engine search level for the local fallback inside the grandmaster
- *  (non-localOnly) race. `game.ai()` is a SYNCHRONOUS minimax that allocates a
- *  search tree scaling steeply with level; this one DO isolate (keyed per bot)
- *  serves every concurrent game, so several level-3 searches firing on the
- *  same tick stacked enough trees to blow the isolate's 128MB ceiling and
- *  trigger "exceeded its memory limit and was reset" mid-move (which then
- *  shipped a stale/illegal fallback). In grandmaster mode the local engine is
- *  only the lowest-precedence last resort — used solely when EVERY remote
- *  engine fails — so a shallow, cheap search there costs nothing in normal
- *  play while removing the OOM. Difficulty games (localOnly) keep their
- *  requested level: that IS the configured playing strength. */
-const GRANDMASTER_LOCAL_LEVEL = 1;
+const STOCKFISH_ONLINE_TIMEOUT_MS = RACE_CEILING_MS;
+const RAPIDAPI_STOCKFISH_TIMEOUT_MS = RACE_CEILING_MS;
+/** js-chess-engine search level for the local fallback in a grandmaster game.
+ *  Crucially, the local engine is NOT part of the parallel per-move race (see
+ *  handleBestMove): it runs at most ONCE, synchronously, AFTER every remote
+ *  engine has failed or timed out. That isolation is exactly what lets it be
+ *  strong. `game.ai()` allocates a transposition table that scales steeply with
+ *  level (~0.25MB at level 1, ~20-40MB at level 5), and the original OOM came
+ *  from that table stacking across many concurrent games when the local engine
+ *  ran in the race on every move — several at once blew the shared isolate's
+ *  128MB ceiling ("exceeded its memory limit and was reset"). As a rare,
+ *  serialized last resort, only one such search is ever live at a time, so the
+ *  spike is bounded and level 5 (top strength, ~150ms measured) is safe here.
+ *  Difficulty (localOnly) games set their level from the opponent's choice. */
+const GRANDMASTER_LOCAL_LEVEL = 5;
+/** Transposition-table cap (MB) for the grandmaster local fallback. A level-5
+ *  search would otherwise grab the Node-profile default (~40MB); a single
+ *  ~150ms search doesn't need that much, so we cap it at 16MB. Strength is
+ *  unchanged at this depth while peak local allocation stays comfortably under
+ *  the shared 128MB isolate even if a search overlaps another game's tick. */
+const GRANDMASTER_LOCAL_TT_MB = 16;
 // Engine precedence + cache-eligibility helpers live in a pure module
 // (./engine-precedence) so unit tests can import them without
 // `cloudflare:workers`. Imported at the top for this file's own use and
@@ -247,16 +266,24 @@ async function callStockfishOnline(fen: string, depth: number, signal: AbortSign
  * moves as `{ FROM: TO }` (uppercase squares); we lowercase them and append
  * the promotion piece if the move is a pawn-to-back-rank push.
  *
- * Level 3 keeps per-call CPU well under the DO's 30s budget on early-game
- * positions while still playing several hundred ELO above random. We run
+ * Even level 5 runs in ~150ms here, well under the DO's CPU budget. We run
  * with randomness=0 (deterministic best move): the engine's eval is shallow
  * enough that even a small centipawn threshold buckets dozens of opening
  * moves as "near-equal", so any randomness made it pick junk like a3/Nh3/h4
  * at random — exactly the flank-pawn garbage that looked like a random bot.
+ *
+ * `ttSizeMB` overrides the library's per-level transposition-table default
+ * (which reaches 40MB at level 5 on Node). For a ~150ms search a smaller table
+ * captures essentially all the benefit, so the grandmaster fallback caps it to
+ * keep the shared isolate's memory comfortably bounded; difficulty games pass
+ * nothing and use the default.
  */
-function localBestMove(fen: string, level: number): string {
+function localBestMove(fen: string, level: number, ttSizeMB?: number): string {
   const game = new Game(fen);
-  const result = game.ai({ level, play: false, randomness: 0 });
+  const result = game.ai({
+    level, play: false, randomness: 0,
+    ...(ttSizeMB != null ? { ttSizeMB } : {}),
+  });
   const move = result.move;
   const from = Object.keys(move)[0];
   const to = move[from];
@@ -293,34 +320,6 @@ function makeTask(
     }
   })();
   return { promise, abort: () => { try { ac.abort(); } catch {} } };
-}
-
-/**
- * Race all tasks in parallel. Returns whatever has resolved by the ceiling
- * or once every task settles, whichever is sooner. Tasks still in flight
- * at the ceiling are aborted (frees the upstream fetch) and their results
- * are dropped.
- */
-async function raceWithCeiling(
-  tasks: Array<{ promise: Promise<EngineTaskResult>; abort: () => void }>,
-  ceilingMs: number,
-): Promise<EngineTaskResult[]> {
-  const completed: EngineTaskResult[] = [];
-  const allDone = Promise.all(
-    tasks.map(async (t) => {
-      const r = await t.promise;
-      completed.push(r);
-    }),
-  );
-  let timedOut = false;
-  const timeout = new Promise<void>((resolve) => {
-    setTimeout(() => { timedOut = true; resolve(); }, ceilingMs);
-  });
-  await Promise.race([allDone, timeout]);
-  if (timedOut) {
-    for (const t of tasks) t.abort();
-  }
-  return completed.slice();
 }
 
 /** When Lichess returns 429, skip the cloud-eval task for this many ms.
@@ -370,8 +369,9 @@ export class StockfishEngine extends DurableObject<Env> {
 
     const depth = req.depth ?? 12;
 
-    // Build the parallel race. Each engine returns an EngineTaskResult;
-    // the race resolves at min(ceiling, all-settled).
+    // Build the parallel race. Each engine returns an EngineTaskResult; the
+    // race resolves the instant the first good remote move lands (acceptEarly
+    // below), else at min(ceiling, all-settled).
     const tasks: Array<{ promise: Promise<EngineTaskResult>; abort: () => void }> = [];
 
     if (!req.localOnly) {
@@ -466,21 +466,29 @@ export class StockfishEngine extends DurableObject<Env> {
       }));
     }
 
-    if (!req.remoteOnly) {
-      // Difficulty games run ONLY this engine, so honor the requested level
-      // (that's their strength). In the grandmaster race it's a last-resort
-      // fallback behind every remote engine — run it shallow to keep the
-      // shared DO isolate from OOMing (see GRANDMASTER_LOCAL_LEVEL).
-      const level = req.localOnly
-        ? Math.min(Math.max(req.level ?? 3, 1), 5)
-        : GRANDMASTER_LOCAL_LEVEL;
-      tasks.push(makeTask("js-chess-engine (local DO)", start, async () => {
+    if (req.localOnly) {
+      // Difficulty games run ONLY the local engine, in the race, at the
+      // requested level — that IS the configured playing strength.
+      const level = Math.min(Math.max(req.level ?? 3, 1), 5);
+      tasks.push(makeTask(LOCAL_ENGINE, start, async () => {
         const uci = localBestMove(req.fen, level);
         return { move: uci };
       }));
     }
+    // Grandmaster games deliberately do NOT add the local engine to the
+    // parallel race. It runs once AFTER the race as a strong, serialized
+    // fallback (see below) so its big level-5 transposition table can never
+    // stack across concurrent games — that stacking was the OOM.
 
-    const results = await raceWithCeiling(tasks, RACE_CEILING_MS);
+    // End the race on the first usable answer from a real remote engine: it
+    // must be legal in this exact position (chess.js is the ground truth). The
+    // local js-chess-engine is no longer in the grandmaster race (it runs once
+    // after, as the fallback below); for difficulty games it's the only task,
+    // so all-settled resolves it. Excluding it here is a belt-and-braces guard
+    // so a future change can't let a fast local move pre-empt a real engine.
+    const acceptEarly = (r: EngineTaskResult): boolean =>
+      r.ok && !!r.move && r.engine !== LOCAL_ENGINE && isUciLegal(legal, r.move);
+    const results = await raceWithCeiling(tasks, RACE_CEILING_MS, acceptEarly);
 
     // Successful engines, by completion order — but only those whose move is
     // actually LEGAL in this exact position. chess.js (`legal`, above) is the
@@ -501,6 +509,35 @@ export class StockfishEngine extends DurableObject<Env> {
       if (m) { chosen = m; break; }
     }
     if (!chosen && successful.length > 0) chosen = successful[0];
+
+    // Grandmaster last resort: every remote engine failed or timed out (the
+    // race returned no usable move). Run the local js-chess-engine ONCE now —
+    // synchronously, at full strength (GRANDMASTER_LOCAL_LEVEL=5). It is kept
+    // OUT of the parallel race precisely so it can be strong here: a level-5
+    // search allocates a ~20-40MB transposition table, and running that across
+    // many concurrent games every move is what OOM'd the shared 128MB isolate.
+    // As a rare, serialized post-race fallback only one such search is ever
+    // live, so the spike is bounded and the ~150ms is paid only when the
+    // alternative is a random move. Skipped for remoteOnly (no local allowed)
+    // and localOnly (already raced above). Pushed into `results` so it shows
+    // up in the dashboard's per-engine alternatives like any other engine.
+    if (!chosen && !req.localOnly && !req.remoteOnly) {
+      try {
+        const uci = localBestMove(req.fen, GRANDMASTER_LOCAL_LEVEL, GRANDMASTER_LOCAL_TT_MB);
+        const ms = Date.now() - start;
+        if (isUciLegal(legal, uci)) {
+          chosen = { engine: LOCAL_ENGINE, ok: true, move: uci, ms };
+          results.push(chosen);
+        } else {
+          results.push({ engine: LOCAL_ENGINE, ok: false, ms, move: uci, error: "illegal local move" });
+        }
+      } catch (e) {
+        results.push({
+          engine: LOCAL_ENGINE, ok: false, ms: Date.now() - start,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
 
     // Build the alternatives array: every engine's outcome (including
     // failures) so the dashboard can show full transparency.
