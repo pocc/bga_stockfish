@@ -7,6 +7,8 @@ import {
   inviteSlotModeOf,
   GAMEMODES,
   isBenignCreateTableError,
+  shouldFinalizeSeatlessTerminal,
+  needsFinishScoreRefetch,
 } from "../src/bot-status";
 
 /**
@@ -136,5 +138,72 @@ describe("isBenignCreateTableError", () => {
     expect(isBenignCreateTableError("Error: fetch failed")).toBe(false);
     expect(isBenignCreateTableError("createTable failed gamemode=realtime: " +
       '{"status":"0","error":"Game not available"}')).toBe(false);
+  });
+});
+
+describe("shouldFinalizeSeatlessTerminal", () => {
+  // The bug: a realtime abandon BGA archives server-side comes back as a lean
+  // `archive` myTables row with no `players`, so meSeat is undefined and the
+  // game never gets tallied / finished — it ghosts. These two production
+  // ghosts (861196321 at move 0, 861700740 at mate-in-1) are the fixtures.
+  const played = (status: string, finished = false) =>
+    shouldFinalizeSeatlessTerminal({ status, saidHi: true, finished });
+
+  test("finalizes a played game archived out from under us", () => {
+    expect(played("archive")).toBe(true);
+  });
+
+  test("finalizes the explicit realtime/async terminal statuses too", () => {
+    expect(played("finished")).toBe(true);       // realtime end
+    expect(played("asyncfinished")).toBe(true);   // turn-based end
+  });
+
+  test("does nothing for a game we never actually played (saidHi=false)", () => {
+    // Never greeted = never reached play; the staleUnplayed / orphan GC owns it.
+    expect(shouldFinalizeSeatlessTerminal({ status: "archive", saidHi: false, finished: false })).toBe(false);
+  });
+
+  test("never re-finalizes an already-finished memo (no double tally)", () => {
+    expect(played("archive", true)).toBe(false);
+    expect(played("finished", true)).toBe(false);
+  });
+
+  test("ignores live / joinable statuses — those have their own handlers", () => {
+    expect(played("play")).toBe(false);
+    expect(played("asyncplay")).toBe(false);
+    expect(played("open")).toBe(false);
+    expect(played("setup")).toBe(false);
+  });
+});
+
+/**
+ * Regression: the live finish handler used to only re-fetch getTableInfo for
+ * the friendly-draw 0/0 quirk (`score===0 && oppScore==null`). When BGA shipped
+ * a seated-but-scoreless finished row (`meSeat.score` null), the guard never
+ * fired, the tally fell through to "none", and a real win/loss was silently
+ * dropped from W/L/D — ~40 realtime games lost this way (waler ~half of them).
+ * needsFinishScoreRefetch now also fires whenever our own score is missing.
+ */
+describe("needsFinishScoreRefetch", () => {
+  test("null own score always refetches (the dropped-game bug)", () => {
+    expect(needsFinishScoreRefetch(null, null)).toBe(true);
+    expect(needsFinishScoreRefetch(undefined, "1")).toBe(true);
+    expect(needsFinishScoreRefetch(null, "0")).toBe(true);
+  });
+
+  test("loss (0) with missing opponent score refetches (friendly 0/0 quirk)", () => {
+    expect(needsFinishScoreRefetch("0", null)).toBe(true);
+    expect(needsFinishScoreRefetch("0", undefined)).toBe(true);
+  });
+
+  test("loss (0) with a present opponent score does NOT refetch", () => {
+    expect(needsFinishScoreRefetch("0", "1")).toBe(false);
+    expect(needsFinishScoreRefetch("0", "0")).toBe(false); // mutual-zero resolved
+  });
+
+  test("a clear win/draw own score never refetches", () => {
+    expect(needsFinishScoreRefetch("1", null)).toBe(false);
+    expect(needsFinishScoreRefetch("0.5", null)).toBe(false);
+    expect(needsFinishScoreRefetch("1", "0")).toBe(false);
   });
 });

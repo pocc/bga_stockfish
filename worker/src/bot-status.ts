@@ -32,6 +32,57 @@ export function isFinishedStatus(status: string): boolean {
   return status === "finished" || status === "asyncfinished";
 }
 
+/**
+ * Should handleTable finalize a game purely from its terminal status, even
+ * though BGA dropped our seat from the lean snapshot row?
+ *
+ * When a game ends, BGA's myTables row for it can go lean — `{id, status,
+ * creator, game_id}` with no `players` map. That leaves `meSeat` undefined, so
+ * the normal finish/tally path (which reads `meSeat.score`) is skipped and the
+ * memo never reaches `finished`: the result goes uncounted and the memo ghosts
+ * until the 30-day age sweep. This is common for realtime abandons, which BGA
+ * flags/archives server-side (often before our 15-min inactivity timer fires).
+ *
+ * Returns true for a game we actually played (`saidHi`) whose status is
+ * terminal (`finished` / `asyncfinished` / `archive`) and isn't already
+ * finalized — the signal to recover scores via getTableInfo and tally. Pure so
+ * it's unit-testable.
+ */
+export function shouldFinalizeSeatlessTerminal(opts: {
+  status: string;
+  saidHi: boolean;
+  finished: boolean;
+}): boolean {
+  if (opts.finished || !opts.saidHi) return false;
+  return isFinishedStatus(opts.status) || opts.status === "archive";
+}
+
+/**
+ * Should the finish handler re-fetch authoritative per-table info (one
+ * getTableInfo) before tallying, because the polled snapshot is missing a
+ * score we need to classify the result correctly?
+ *
+ *   - our own score is absent (`myRawScore == null`): BGA sometimes ships a
+ *     seated-but-scoreless finished row. Tallying it verbatim banks an
+ *     uncounted "none", silently dropping a real win/loss from W/L/D — this
+ *     dropped ~40 realtime games before the guard generalized past the 0/0
+ *     case below (waler alone accounted for ~half of them).
+ *   - our score is a loss (0) but the opponent's score is missing
+ *     (`oppRawScore == null`): the friendly-draw quirk (BGA reporting 0/0
+ *     instead of 0.5/0.5) would otherwise be misclassified as a loss.
+ *
+ * Returns false once we hold a non-null own score with either a win/draw value
+ * or a present opponent score — no point spending a getTableInfo. Pure so it's
+ * unit-testable.
+ */
+export function needsFinishScoreRefetch(
+  myRawScore: string | null | undefined,
+  oppRawScore: string | null | undefined,
+): boolean {
+  if (myRawScore == null) return true;
+  return Number(myRawScore) === 0 && oppRawScore == null;
+}
+
 export type Gamemode = "realtime" | "async";
 export const GAMEMODES: readonly Gamemode[] = ["realtime", "async"];
 

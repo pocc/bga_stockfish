@@ -32,7 +32,8 @@ import {
 import {
   isJoinableStatus, isLivePlayStatus, isFinishedStatus,
   gamemodeOf, inviteSlotModeOf, GAMEMODES, decideReconcileMiss,
-  isBenignCreateTableError,
+  isBenignCreateTableError, shouldFinalizeSeatlessTerminal,
+  needsFinishScoreRefetch,
   type Gamemode,
 } from "./bot-status";
 import { enginePrecedenceRank, isCacheableEngine } from "./stockfish-do";
@@ -2706,6 +2707,20 @@ export class BotDriver extends DurableObject<Env> {
       return;
     }
     if (!meSeat) {
+      // Terminal status with no seat in the lean snapshot row: BGA already
+      // ended the game and dropped us from its `players` map. If we actually
+      // played it (saidHi), recover scores via getTableInfo and finalize so
+      // the result is counted and the memo stops ghosting — otherwise the
+      // normal finish/tally path below never runs (it reads meSeat.score) and
+      // the game lingers uncounted until the 30-day age sweep. Realtime
+      // abandons land here: BGA flags/archives them server-side, frequently
+      // before our 15-min opponent-inactivity concede can fire.
+      if (shouldFinalizeSeatlessTerminal({ status: t.status, saidHi: m.saidHi, finished: m.finished })) {
+        await this.finalizeArchivedTable(t, m).catch((e) => {
+          this.recordError("archiveFinalize", e, t.id);
+        });
+        return;
+      }
       // Lost-seat on a live game we own — the table is already in `play`
       // (not joinable, so the reclaim branch above didn't fire) but BGA
       // shows no seat for us. This happens after a realtime "Accept" overlay
@@ -2886,14 +2901,7 @@ export class BotDriver extends DurableObject<Env> {
       if (!m.finished) {
         // First sighting in finished/archive state — tally the outcome
         // from our score. BGA chess scores: 1 = win, 0 = loss, 0.5 = draw.
-        //
-        // Friendly-game quirk: BGA sometimes reports a draw as score=0
-        // for *both* players instead of 0.5/0.5 (observed e.g. on table
-        // 854888520, which was actually a draw but came back as 0/0).
-        // We disambiguate by checking the opponent's score — if both
-        // are 0, it's a draw, not a loss.
-        const rawScore = meSeat.score;
-        const score = rawScore == null ? null : Number(rawScore);
+        let rawScore = meSeat.score;
         let oppRawScore: string | null = null;
         if (t.players) {
           for (const [pid, seat] of Object.entries(t.players)) {
@@ -2901,76 +2909,31 @@ export class BotDriver extends DurableObject<Env> {
             if (seat.score != null) { oppRawScore = String(seat.score); break; }
           }
         }
-        // If our score reads as a loss (0) but the opponent's score is missing
-        // from this snapshot, the friendly-draw quirk (BGA reporting 0/0
-        // instead of 0.5/0.5) would be misclassified as a loss. Re-fetch the
-        // authoritative per-table info once to backfill the opponent's score
-        // before tallying — this closes the live-path window that previously
-        // had to be repaired retroactively via /bot/reconcile-results.
-        if (score === 0 && oppRawScore == null && this.client) {
+        // Re-fetch the authoritative per-table info once when this snapshot is
+        // missing a score we need to tally correctly:
+        //   - our own score is absent: BGA sometimes ships a seated-but-
+        //     scoreless finished row, which recordFinishedResult would bank as
+        //     an uncounted "none" — silently dropping a real win/loss from
+        //     W/L/D (cost ~40 realtime games before this guard generalized
+        //     past the 0/0 case below).
+        //   - our score reads as a loss (0) but the opponent's score is
+        //     missing: the friendly-draw quirk (BGA reporting 0/0 instead of
+        //     0.5/0.5) would otherwise be misclassified as a loss.
+        // Closes the live-path window that previously had to be repaired
+        // retroactively via /bot/reconcile-results.
+        if (needsFinishScoreRefetch(rawScore, oppRawScore) && this.client) {
           const ti = await this.client.getTableInfo(t.id).catch(() => null);
           if (ti?.players) {
+            const mine = ti.players[this.uid];
+            if (mine?.score != null) rawScore = mine.score;
             for (const [pid, seat] of Object.entries(ti.players)) {
               if (pid === this.uid) continue;
               if (seat.score != null) { oppRawScore = String(seat.score); break; }
             }
           }
         }
-        const oppScore = oppRawScore == null ? null : Number(oppRawScore);
-        const mutualZero = score === 0 && oppScore === 0;
-        let tally: ResultEntry["tally"] = "none";
-        if (score === 1) { this.status.stats.wins++; tally = "win"; }
-        else if (score === 0.5 || mutualZero) { this.status.stats.draws++; tally = "draw"; }
-        else if (score === 0) { this.status.stats.losses++; tally = "loss"; }
-        const tallyDifficulty = m.effectiveDifficulty ?? m.difficulty ?? "grandmaster";
-        if (tally !== "none") {
-          if (!this.status.stats.byDifficulty) this.status.stats.byDifficulty = emptyDifficultyTally();
-          const bucket = this.status.stats.byDifficulty[tallyDifficulty]
-            ?? (this.status.stats.byDifficulty[tallyDifficulty] = { wins: 0, losses: 0, draws: 0 });
-          if (tally === "win") bucket.wins++;
-          else if (tally === "draw") bucket.draws++;
-          else if (tally === "loss") bucket.losses++;
-        }
-        const parsed = Number.isFinite(score as number) ? (score as number) : null;
-        m.finishedScore = {
-          raw: rawScore == null ? null : String(rawScore),
-          parsed,
-        };
-        const entry: ResultEntry = {
-          ts: Date.now(),
-          tableId: t.id,
-          status: t.status,
-          rawScore: rawScore == null ? null : String(rawScore),
-          parsedScore: parsed,
-          tally,
-          oppRawScore,
-          durationMs: m.startedAt != null ? Date.now() - m.startedAt : undefined,
-          moveCount: m.moveCount,
-          engineCounts: m.engineCounts,
-          botColor: m.botColor,
-          oppName: m.oppName,
-          oppId: m.oppId,
-          difficulty: tallyDifficulty,
-          oppLanguage: m.oppLanguage,
-          oppPremium: m.oppPremium,
-          // Prefer the gamemode captured during live play (authoritative);
-          // fall back to the terminal status only for legacy memos that
-          // finished before m.realtime was recorded. `archive` is ambiguous,
-          // so it resolves to undefined rather than guessing realtime.
-          realtime: m.realtime ?? (t.status === "finished" ? true
-            : t.status === "asyncfinished" ? false : undefined),
-        };
-        if (!this.status.recentResults) this.status.recentResults = [];
-        this.status.recentResults.push(entry);
-        if (this.status.recentResults.length > RECENT_RESULTS_CAP) {
-          this.status.recentResults.splice(
-            0, this.status.recentResults.length - RECENT_RESULTS_CAP,
-          );
-        }
-        console.log(
-          `t=${t.id} finished status=${t.status} rawScore=${rawScore ?? "null"} `
-          + `oppRawScore=${oppRawScore ?? "null"} `
-          + `parsed=${parsed ?? "null"} tally=${tally}`,
+        this.recordFinishedResult(
+          t, m, rawScore == null ? null : String(rawScore), oppRawScore,
         );
       }
       // Best-effort: capture the full move log so historical games can be
@@ -3011,6 +2974,117 @@ export class BotDriver extends DurableObject<Env> {
       m.finishedAt = Date.now();
       return;
     }
+  }
+
+  /**
+   * Tally a finished game's outcome from the two seat scores and record a
+   * ResultEntry. Shared by the live finish path (status flips to
+   * finished/asyncfinished/archive while we're still seated) and the
+   * archive-recovery path (BGA dropped us from the lean snapshot row; scores
+   * recovered via getTableInfo). Increments stats + byDifficulty and appends
+   * the result row. Does NOT set m.finished — callers own that.
+   *
+   * BGA chess scores: 1 = win, 0 = loss, 0.5 = draw. Friendly-game quirk: a
+   * draw sometimes comes back as 0 for *both* players instead of 0.5/0.5
+   * (observed on table 854888520), so a mutual 0 is scored a draw, not a loss.
+   */
+  private recordFinishedResult(
+    t: RawTableInfo,
+    m: TableMemo,
+    rawScore: string | null,
+    oppRawScore: string | null,
+  ): void {
+    const score = rawScore == null ? null : Number(rawScore);
+    const oppScore = oppRawScore == null ? null : Number(oppRawScore);
+    const mutualZero = score === 0 && oppScore === 0;
+    let tally: ResultEntry["tally"] = "none";
+    if (score === 1) { this.status.stats.wins++; tally = "win"; }
+    else if (score === 0.5 || mutualZero) { this.status.stats.draws++; tally = "draw"; }
+    else if (score === 0) { this.status.stats.losses++; tally = "loss"; }
+    const tallyDifficulty = m.effectiveDifficulty ?? m.difficulty ?? "grandmaster";
+    if (tally !== "none") {
+      if (!this.status.stats.byDifficulty) this.status.stats.byDifficulty = emptyDifficultyTally();
+      const bucket = this.status.stats.byDifficulty[tallyDifficulty]
+        ?? (this.status.stats.byDifficulty[tallyDifficulty] = { wins: 0, losses: 0, draws: 0 });
+      if (tally === "win") bucket.wins++;
+      else if (tally === "draw") bucket.draws++;
+      else if (tally === "loss") bucket.losses++;
+    }
+    const parsed = Number.isFinite(score as number) ? (score as number) : null;
+    m.finishedScore = { raw: rawScore == null ? null : String(rawScore), parsed };
+    const entry: ResultEntry = {
+      ts: Date.now(),
+      tableId: t.id,
+      status: t.status,
+      rawScore: rawScore == null ? null : String(rawScore),
+      parsedScore: parsed,
+      tally,
+      oppRawScore,
+      durationMs: m.startedAt != null ? Date.now() - m.startedAt : undefined,
+      moveCount: m.moveCount,
+      engineCounts: m.engineCounts,
+      botColor: m.botColor,
+      oppName: m.oppName,
+      oppId: m.oppId,
+      difficulty: tallyDifficulty,
+      oppLanguage: m.oppLanguage,
+      oppPremium: m.oppPremium,
+      // Prefer the gamemode captured during live play (authoritative); fall
+      // back to the terminal status only for legacy memos that finished before
+      // m.realtime was recorded. `archive` is ambiguous, so it resolves to
+      // undefined rather than guessing realtime.
+      realtime: m.realtime ?? (t.status === "finished" ? true
+        : t.status === "asyncfinished" ? false : undefined),
+    };
+    if (!this.status.recentResults) this.status.recentResults = [];
+    this.status.recentResults.push(entry);
+    if (this.status.recentResults.length > RECENT_RESULTS_CAP) {
+      this.status.recentResults.splice(
+        0, this.status.recentResults.length - RECENT_RESULTS_CAP,
+      );
+    }
+    console.log(
+      `t=${t.id} finished status=${t.status} rawScore=${rawScore ?? "null"} `
+      + `oppRawScore=${oppRawScore ?? "null"} parsed=${parsed ?? "null"} tally=${tally}`,
+    );
+  }
+
+  /**
+   * Finalize a game BGA already ended but dropped us from. A lean myTables row
+   * for a finished/archive table carries no `players`, so handleTable's
+   * `meSeat` is undefined and the normal finish/tally path is skipped, leaving
+   * the result uncounted and the memo ghosting (until the 30-day age sweep).
+   * Common for realtime abandons, which BGA flags/archives server-side, often
+   * before our 15-min inactivity timer fires.
+   *
+   * Recover the seat/scores via getTableInfo, tally, and mark finished. If the
+   * fetch fails or carries no scores we still mark finished (tally `none`) so
+   * the ghost can't persist — a never-counted game is better than a stuck slot.
+   */
+  private async finalizeArchivedTable(t: RawTableInfo, m: TableMemo): Promise<void> {
+    let myRawScore: string | null = null;
+    let oppRawScore: string | null = null;
+    if (this.client) {
+      const ti = await this.client.getTableInfo(t.id).catch(() => null);
+      if (ti?.players) {
+        for (const [pid, seat] of Object.entries(ti.players)) {
+          if (seat.score == null) continue;
+          if (pid === this.uid) myRawScore = String(seat.score);
+          else oppRawScore = String(seat.score);
+        }
+      }
+    }
+    this.recordFinishedResult(t, m, myRawScore, oppRawScore);
+    m.finished = true;
+    m.finishedAt = Date.now();
+    // Surface in recentErrors (the troubleshooting feed) so these recoveries
+    // are visible — they mark games BGA ended out from under us.
+    this.recordError(
+      "archiveFinalize",
+      `finalized seatless ${t.status} table myScore=${myRawScore ?? "null"} `
+      + `oppScore=${oppRawScore ?? "null"}`,
+      t.id,
+    );
   }
 
   private async pollPendingDecision(
