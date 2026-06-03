@@ -283,6 +283,10 @@ function landingHtml(): string {
   .gmode { font-weight: 600; padding: 1px 6px; border-radius: 8px; font-size: 10px; white-space: nowrap; flex-shrink: 0; }
   /* Past-games Live column: orange dot marks a realtime game. */
   .livedot { color: #f59e0b; font-size: 13px; line-height: 1; }
+  /* Premium marker before an opponent name: filled green dot = BGA Premium,
+     hollow muted dot = free member, nothing = unknown (legacy entries). */
+  .premdot { color: var(--ok); font-size: 12px; line-height: 1; margin-right: 4px; }
+  .freedot { color: var(--muted); font-size: 12px; line-height: 1; margin-right: 4px; }
   .gmode.rt { background: rgba(245, 158, 11, 0.18); color: #b45309; }
   .gmode.tb { background: rgba(107, 127, 215, 0.18); color: #4356a8; }
   @media (prefers-color-scheme: dark) {
@@ -440,6 +444,7 @@ function landingHtml(): string {
   <div id="moves" class="muted">…</div>
 
   <h2>Past Games</h2>
+  <p class="sub" style="margin: -2px 0 10px;">Before each opponent: <span class="premdot">●</span> BGA Premium member · <span class="freedot">○</span> free member.</p>
   <div id="results" class="muted">…</div>
 
   <h2>Technical details</h2>
@@ -1411,6 +1416,21 @@ function isScored(r) {
   return r.tally === "win" || r.tally === "loss" || r.tally === "draw";
 }
 
+// Premium marker shown before an opponent's name in the games tables.
+// oppPremium is boolean | undefined (read from the opponent's game-page
+// profile): filled green dot = BGA Premium, hollow muted dot = free member,
+// nothing = unknown (entries predating the field). Trailing space separates
+// the dot from the name that follows.
+function premiumDot(oppPremium) {
+  if (oppPremium === true) {
+    return '<span class="premdot" title="BGA Premium member">●</span>';
+  }
+  if (oppPremium === false) {
+    return '<span class="freedot" title="Free member">○</span>';
+  }
+  return "";
+}
+
 function renderResults(results) {
   // Only clean win/loss/draw games belong in Past Games; non-scored games
   // live in the "Non-scored games" troubleshooting table under Technical
@@ -1436,7 +1456,7 @@ function renderResults(results) {
       : '<span class="pill ' + tallyClass + '" title="' + esc(tip) + '">' + esc(r.tally) + '</span>';
     const oppNameDec = decodeName(r.oppName);
     const opp = r.oppName
-      ? (r.oppId
+      ? premiumDot(r.oppPremium) + (r.oppId
         ? '<a href="https://boardgamearena.com/player?id=' + esc(r.oppId) + '" target="_blank" rel="noopener">' + esc(oppNameDec) + '</a>'
         : esc(oppNameDec))
       : dash;
@@ -1508,7 +1528,7 @@ function renderNonResults(results) {
   const rows = page.map(r => {
     const oppNameDec = decodeName(r.oppName);
     const opp = r.oppName
-      ? (r.oppId
+      ? premiumDot(r.oppPremium) + (r.oppId
         ? '<a href="https://boardgamearena.com/player?id=' + esc(r.oppId) + '" target="_blank" rel="noopener">' + esc(oppNameDec) + '</a>'
         : esc(oppNameDec))
       : dash;

@@ -101,4 +101,39 @@ describe("dashboard inline scripts", () => {
     expect(html).toContain('href="https://www.npmjs.com/package/js-chess-engine"');
     expect(html).toContain('href="https://lichess.org/api#tag/Analysis/operation/apiCloudEval"');
   });
+
+  test("Past Games shows a premium dot before the opponent name", () => {
+    // Same sandbox trick as above: run the client script, then call
+    // renderResults directly. Guards the "easy to read premium marker"
+    // feature against a future revert.
+    const dummyEl = new Proxy({}, { get: () => () => {}, set: () => true });
+    const sandbox: any = {
+      document: { getElementById: () => dummyEl },
+      setInterval: () => 0,
+      fetch: () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) }),
+      window: {},
+      console,
+    };
+    sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(scripts[scripts.length - 1], sandbox);
+
+    const now = Date.now();
+    const html: string = sandbox.renderResults([
+      { ts: now, tableId: "1", tally: "win", oppName: "PremPlayer", oppId: "100", oppPremium: true },
+      { ts: now, tableId: "2", tally: "loss", oppName: "FreePlayer", oppId: "200", oppPremium: false },
+      { ts: now, tableId: "3", tally: "draw", oppName: "OldEntry", oppId: "300" }, // oppPremium undefined
+    ]);
+
+    // Premium → filled green dot immediately before the name link.
+    expect(html).toMatch(/premdot" title="BGA Premium member">●<\/span><a href="[^"]*id=100"/);
+    // Free → hollow muted dot before the name link.
+    expect(html).toMatch(/freedot" title="Free member">○<\/span><a href="[^"]*id=200"/);
+    // Exactly one of each across the three rows — the unknown (legacy) entry
+    // gets no dot at all.
+    expect((html.match(/class="premdot"/g) || []).length).toBe(1);
+    expect((html.match(/class="freedot"/g) || []).length).toBe(1);
+    // The legacy entry's name link is not preceded by any dot span.
+    expect(html).toMatch(/<td><a href="[^"]*id=300"[^>]*>OldEntry<\/a><\/td>/);
+  });
 });
