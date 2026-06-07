@@ -4,7 +4,7 @@ import { Game } from "js-chess-engine";
 import type { Env } from "./index";
 import {
   ENGINE_PRECEDENCE, enginePrecedenceRank, LOCAL_ENGINE, isCacheableEngine,
-  isUciLegal,
+  isUciLegal, pawnAtSquare,
 } from "./engine-precedence";
 import { raceWithCeiling } from "./engine-race";
 
@@ -289,12 +289,19 @@ function localBestMove(fen: string, level: number, ttSizeMB?: number): string {
   const to = move[from];
   if (!from || !to) throw new Error(`js-chess-engine returned empty move`);
   const uci = from.toLowerCase() + to.toLowerCase();
-  // Add a queen promotion suffix when a pawn lands on its back rank.
+  // Add a queen promotion suffix when a PAWN lands on its back rank. The
+  // ranks alone aren't enough: a rook/queen/king sitting on rank 7 moving to
+  // rank 8 (e.g. a rook lift to a8) also matches "rank 7 → rank 8", and the
+  // bogus "q" suffix makes chess.js's isUciLegal reject the move as an
+  // illegal promotion. The race then falls through to a random legal move
+  // and the dashboard shows a 🎲 Random pill for what was actually a sound
+  // engine pick. Check the FEN's board to confirm the from-square holds a
+  // pawn of the side to move.
   const toRank = to[1];
-  const isPawnPush = /^[a-hA-H]2$|^[a-hA-H]7$/.test(from);
-  if (isPawnPush && (toRank === "8" || toRank === "1")) return uci + "q";
+  if ((toRank === "8" || toRank === "1") && pawnAtSquare(fen, from)) return uci + "q";
   return uci;
 }
+
 
 /**
  * Wrap a per-engine async task into a never-rejecting promise that always

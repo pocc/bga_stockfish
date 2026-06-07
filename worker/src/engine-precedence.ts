@@ -41,6 +41,39 @@ export function isUciLegal(legal: readonly VerboseMove[], uci: string): boolean 
   );
 }
 
+/**
+ * True if the FEN's piece placement field has a pawn (of either color) on the
+ * given square. Used by the local engine wrapper to decide whether to append a
+ * queen-promotion suffix to a UCI move: js-chess-engine returns moves as
+ * `{FROM: TO}` with no piece-type info, so we'd otherwise have to guess from
+ * the from/to ranks alone — and rank-7→8 (or rank-2→1) matches plenty of
+ * legitimate non-pawn moves (a rook lift to a8, a queen sweep up the file).
+ * Tagging those as "q" promotions makes chess.js reject the move as illegal
+ * and the race falls through to a random legal pick. `sq` may be upper- or
+ * lower-case ("A7" or "a7"). Lives here so unit tests can import it without
+ * dragging in `cloudflare:workers` from stockfish-do.ts.
+ */
+export function pawnAtSquare(fen: string, sq: string): boolean {
+  if (sq.length < 2) return false;
+  const c = sq.charCodeAt(0);
+  const file = c >= 97 ? c - 97 : c - 65;
+  const rank = Number(sq[1]);
+  if (file < 0 || file > 7 || !(rank >= 1 && rank <= 8)) return false;
+  const placement = fen.split(" ")[0] ?? "";
+  const rows = placement.split("/");
+  if (rows.length !== 8) return false;
+  const row = rows[8 - rank]; // FEN rank 8 first, rank 1 last
+  let col = 0;
+  for (const ch of row) {
+    if (ch >= "1" && ch <= "8") col += Number(ch);
+    else {
+      if (col === file) return ch === "p" || ch === "P";
+      col++;
+    }
+  }
+  return false;
+}
+
 /** Engine race order, strongest first. The winner of a parallel race is the
  *  lowest-ranked engine here that returned a usable move. lichess-cloud-eval
  *  serves community-cached evals at very deep nominal depths but misses for
