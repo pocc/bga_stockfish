@@ -1487,6 +1487,19 @@ const LANG_DISPLAY = {
   zh: "🇨🇳 Chinese",
 };
 
+// Intended game level → 1-6 numeric (6 = grandmaster, the full remote race).
+// Mirrors DIFFICULTY_LEVELS in bot-do.ts (beginner..expert = 1..5) and slots
+// grandmaster at the top of the same scale so the LVL column reads as a
+// single ordered strength axis. Returns "?" for entries written before the
+// per-move difficulty field existed, or for any unrecognized value.
+const DIFFICULTY_LVL = {
+  beginner: 1, easy: 2, intermediate: 3, advanced: 4, expert: 5, grandmaster: 6,
+};
+function difficultyLvl(diff) {
+  if (diff == null) return "?";
+  return DIFFICULTY_LVL[diff] != null ? String(DIFFICULTY_LVL[diff]) : "?";
+}
+
 function renderMoves(moves) {
   if (!moves || moves.length === 0) return "<span class='muted'>no moves yet</span>";
   // Drop moves older than 24h; keep newest first.
@@ -1557,16 +1570,23 @@ function renderMoves(moves) {
       if (m.fen) parts.push("FEN: " + m.fen);
       movePill = ' <span class="pill warn" title="' + esc(parts.join("\\n")) + '">🎲 Random</span>';
     }
+    // LVL: intended game level as 1-6 (6=grandmaster). Rightmost column so
+    // engine columns stay grouped. Tooltip carries the raw label so an
+    // operator can see "expert" vs "advanced" without memorizing the scale.
+    const lvl = difficultyLvl(m.difficulty);
+    const lvlTitle = m.difficulty ? esc(m.difficulty) : "unknown (entry predates difficulty capture)";
     return '<tr>'
       + '<td class="muted">' + fmtTime(m.ts) + '</td>'
       + '<td>' + tableLink(m.tableId) + '</td>'
       + '<td class="mono">' + esc(m.from) + ' → ' + esc(m.to) + movePill + '</td>'
       + cells.join("")
+      + '<td class="mono" title="' + lvlTitle + '">' + esc(lvl) + '</td>'
       + '</tr>';
   }).join("");
   return legend
     + '<table><thead><tr>'
     + '<th>When</th><th>Table</th><th>Move</th>' + headers
+    + '<th title="Intended game level: 1=beginner, 2=easy, 3=intermediate, 4=advanced, 5=expert, 6=grandmaster">LVL</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, MOVES_PAGE_SIZE, movesPage, "setMovesPage", "moves (24h)");
 }
