@@ -547,7 +547,14 @@ export class BGAClient {
       "https://en.boardgamearena.com/table/table/quitgame.html",
       body,
     );
-    return (await resp.json()) as BGAEnvelope<unknown>;
+    // BGA sometimes returns an empty body for already-finalized tables.
+    // JSON.parse("") throws SyntaxError, which the caller would log as a
+    // failure even though the row may already be cleared. Treat empty /
+    // unparseable as no-op success so the retry loop keeps pacing.
+    const text = await resp.text();
+    if (!text) return { status: 1 };
+    try { return JSON.parse(text) as BGAEnvelope<unknown>; }
+    catch { return { status: 1 }; }
   }
 
   /**
@@ -579,7 +586,13 @@ export class BGAClient {
       `?src=menu&table=${tableId}` +
       `&noerrortracking=true&dojo.preventCache=${Date.now()}`;
     const resp = await this.request("GET", url);
-    return (await resp.json()) as BGAEnvelope<unknown>;
+    // Same empty-body trap as leaveTable: BGA returns "" for already-cleared
+    // tables. Observed on tables 863708872 / 864070360 as a SyntaxError flood
+    // in recentErrors. Treat empty / unparseable as no-op success.
+    const text = await resp.text();
+    if (!text) return { status: 1 };
+    try { return JSON.parse(text) as BGAEnvelope<unknown>; }
+    catch { return { status: 1 }; }
   }
 
   async chat(tableId: number | string, msg: string): Promise<BGAEnvelope<unknown>> {
