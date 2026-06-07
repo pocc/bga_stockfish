@@ -529,6 +529,10 @@ interface MoveEntry {
    *  js-chess-engine level (1-5). Undefined for grandmaster (the race uses
    *  a hardcoded level 1; the post-race fallback uses level 5). */
   level?: number;
+  /** Effective difficulty tier used for this move (DIFFICULTY_LEVELS key or
+   *  "grandmaster"). Drives the LVL column in the dashboard's move log.
+   *  Undefined on entries written before this field was captured. */
+  difficulty?: string;
 }
 
 interface BotStats {
@@ -4012,6 +4016,7 @@ export class BotDriver extends DurableObject<Env> {
       cp: moveCp, mate: moveMate, thinkMs: moveThinkMs,
       captured: isCapture,
       pieceType: movedPiece?.piece_type,
+      difficulty: effectiveDifficulty,
       // Stash the FEN (and js-chess-engine level for difficulty games) only
       // when we fell through to a random legal pick. The engineResults entry
       // already records each engine's UCI + error; pairing it with the FEN

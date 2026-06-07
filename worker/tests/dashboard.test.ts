@@ -139,6 +139,35 @@ describe("dashboard inline scripts", () => {
     expect(html).toMatch(/<td><a href="[^"]*id=300"[^>]*>OldEntry<\/a><\/td>/);
   });
 
+  test("LVL column renders 1-6 from difficulty, and '?' only when missing", () => {
+    // Regression: MoveEntry.difficulty was never written by recordMove, so
+    // every fresh move rendered "?" in the LVL column instead of 1-6.
+    const dummyEl = new Proxy({}, { get: () => () => {}, set: () => true });
+    const sandbox: any = {
+      document: { getElementById: () => dummyEl },
+      setInterval: () => 0,
+      fetch: () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) }),
+      window: {},
+      console,
+    };
+    sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(scripts[scripts.length - 1], sandbox);
+
+    const now = Date.now();
+    const html: string = sandbox.renderMoves([
+      { ts: now, tableId: "1", from: "e2", to: "e4", engine: "chess-api.com", difficulty: "grandmaster" },
+      { ts: now, tableId: "2", from: "d2", to: "d4", engine: "chess-api.com", difficulty: "expert" },
+      { ts: now, tableId: "3", from: "g1", to: "f3", engine: "chess-api.com", difficulty: "beginner" },
+      { ts: now, tableId: "4", from: "c2", to: "c4", engine: "chess-api.com" }, // legacy: no difficulty
+    ]);
+
+    expect(html).toMatch(/title="grandmaster">6</);
+    expect(html).toMatch(/title="expert">5</);
+    expect(html).toMatch(/title="beginner">1</);
+    expect(html).toMatch(/title="unknown \(entry predates difficulty capture\)">\?</);
+  });
+
   test("short scored games drop out of Past Games and surface in non-scored", () => {
     // BGA reported a clean win/loss/draw, but the game never crossed the
     // MIN_BOT_MOVES_FOR_SCORED bar — typically an opp abandon in the opening
