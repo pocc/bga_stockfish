@@ -1033,9 +1033,10 @@ export class BotDriver extends DurableObject<Env> {
     } catch (e) {
       this.recordError("feedbackKv", e, tableId);
     }
-    // Fire-and-forget Discord push so a broken webhook never blocks the
-    // bot's chat reply. notifyFeedbackWebhook swallows its own errors too.
-    notifyFeedbackWebhook(this.env, entry).catch(() => {});
+    // ctx.waitUntil so the runtime keeps the webhook fetch alive past the
+    // chat-reply request that triggered us — bare fire-and-forget gets
+    // cancelled. notifyFeedbackWebhook swallows its own errors too.
+    this.ctx.waitUntil(notifyFeedbackWebhook(this.env, entry).catch(() => {}));
   }
 
   /** Recompute `stats.engineUses` by tallying entries from `recentMoves`

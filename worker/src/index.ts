@@ -137,7 +137,7 @@ export async function notifyFeedbackWebhook(
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
 
     if (url.pathname === "/") {
@@ -251,10 +251,10 @@ export default {
         ...(ip ? { ip } : {}),
       };
       await env.FEEDBACK.put(feedbackKey(entry.ts), JSON.stringify(entry));
-      // Discord notification is fire-and-forget so a slow / broken webhook
-      // can't delay the response. Already swallowed internally; .catch here
-      // is belt-and-braces in case the helper itself ever throws.
-      notifyFeedbackWebhook(env, entry).catch(() => {});
+      // ctx.waitUntil keeps the runtime alive past the response so the
+      // Discord POST actually completes — a bare fire-and-forget gets
+      // cancelled the moment we return.
+      ctx.waitUntil(notifyFeedbackWebhook(env, entry).catch(() => {}));
       return Response.json({ ok: true });
     }
 
