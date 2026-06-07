@@ -197,6 +197,25 @@ export function shouldSkipMoveForNeutralized(
 }
 
 /**
+ * Cooldown gate for re-attempting the zombie-win seat-clear calls
+ * (concedeMenu + leaveTable). BGA sometimes accepts concedeMenu on a
+ * neutralized table but no-ops server-side, leaving the row at status=play
+ * and blocking the single realtime invite slot indefinitely (observed:
+ * table 864070360 stuck 9h after concedeMenu returned ok). We must keep
+ * trying until BGA actually flips the row, but not on every 5s tick —
+ * pace the retries to avoid log spam and noisy POSTs. Returns true when
+ * the cooldown has elapsed (or no prior attempt is recorded).
+ */
+export function shouldRetryClaimSeat(
+  lastAttemptAt: number | null | undefined,
+  now: number,
+  retryMs: number,
+): boolean {
+  if (lastAttemptAt == null) return true;
+  return now - lastAttemptAt >= retryMs;
+}
+
+/**
  * Decode the \\u-escaped JSON string escapes BGA leaves in player names that
  * we pull straight out of the page HTML by regex (e.g. "laglo\\u00efre" →
  * "lagloïre"). The captured text came from a JSON string literal, so we

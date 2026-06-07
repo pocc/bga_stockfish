@@ -2,10 +2,12 @@ import { describe, expect, test } from "vitest";
 import {
   parseOpponent, parseGameNeutralized, buildFen, parseGameHtml,
   placementAfterMove, chooseRepetitionAwareMove, shouldSkipMoveForNeutralized,
+  shouldRetryClaimSeat,
   type Piece, type Destination, type MoveCandidate,
 } from "../src/bot-move";
 import {
-  isCacheableEngine, CACHEABLE_ENGINES, isUciLegal, type VerboseMove,
+  isCacheableEngine, CACHEABLE_ENGINES, isUciLegal, pawnAtSquare,
+  type VerboseMove,
 } from "../src/engine-precedence";
 
 // Player blocks in BGA's game-page HTML look like:
@@ -115,6 +117,30 @@ describe("shouldSkipMoveForNeutralized", () => {
     expect(
       shouldSkipMoveForNeutralized(null, '"neutralized_player_id":"22430351"'),
     ).toBe(true);
+  });
+});
+
+describe("shouldRetryClaimSeat", () => {
+  const RETRY_MS = 5 * 60 * 1000;
+
+  test("first attempt: no prior timestamp → retry", () => {
+    // Both null/undefined mean "we've never tried" → must attempt.
+    expect(shouldRetryClaimSeat(null, 1_000_000, RETRY_MS)).toBe(true);
+    expect(shouldRetryClaimSeat(undefined, 1_000_000, RETRY_MS)).toBe(true);
+  });
+
+  test("inside cooldown: skip the retry", () => {
+    // A 5s tick right after an attempt must not re-POST.
+    expect(shouldRetryClaimSeat(1_000_000, 1_005_000, RETRY_MS)).toBe(false);
+    // One tick shy of the cooldown is still inside it.
+    expect(shouldRetryClaimSeat(1_000_000, 1_000_000 + RETRY_MS - 1, RETRY_MS)).toBe(false);
+  });
+
+  test("cooldown elapsed: retry", () => {
+    // Exactly at the boundary → retry (>=, not >).
+    expect(shouldRetryClaimSeat(1_000_000, 1_000_000 + RETRY_MS, RETRY_MS)).toBe(true);
+    // Well past → still retry.
+    expect(shouldRetryClaimSeat(1_000_000, 9_000_000, RETRY_MS)).toBe(true);
   });
 });
 
@@ -397,5 +423,56 @@ describe("isUciLegal", () => {
 
   test("an empty legal list rejects everything (game over)", () => {
     expect(isUciLegal([], "e2e4")).toBe(false);
+  });
+});
+
+/**
+ * Regression: the local engine wrapper used to append "q" to every move whose
+ * from-rank was 7 (or 2) and to-rank was 8 (or 1) — solely from the rank, with
+ * no piece-type check. A rook lift to a8 came back as "a7a8q", chess.js
+ * rejected it as an illegal promotion, and the race fell through to a random
+ * legal move. pawnAtSquare gates the suffix on the from-square actually
+ * holding a pawn.
+ */
+describe("pawnAtSquare", () => {
+  // Pawn on a7, rook on a1 — classic "is a7 a pawn?" check.
+  const fenWhitePawn = "4k3/P7/8/8/8/8/8/R3K3 w - - 0 1";
+  const fenWhiteRook = "4k3/R7/8/8/8/8/8/4K3 w - - 0 1";
+  const fenWhiteQueen = "4k3/Q7/8/8/8/8/8/4K3 w - - 0 1";
+
+  test("identifies a white pawn on the back-rank-adjacent square", () => {
+    expect(pawnAtSquare(fenWhitePawn, "a7")).toBe(true);
+    expect(pawnAtSquare(fenWhitePawn, "A7")).toBe(true);
+  });
+
+  test("returns false for non-pawn pieces (the actual bug)", () => {
+    expect(pawnAtSquare(fenWhiteRook, "a7")).toBe(false);
+    expect(pawnAtSquare(fenWhiteQueen, "a7")).toBe(false);
+  });
+
+  test("returns false for empty squares", () => {
+    expect(pawnAtSquare(fenWhitePawn, "b7")).toBe(false);
+    expect(pawnAtSquare(fenWhitePawn, "h4")).toBe(false);
+  });
+
+  test("handles black pawns symmetrically (rank 2 → rank 1 promotion)", () => {
+    const fenBlackPawn = "4k3/8/8/8/8/8/p7/4K3 b - - 0 1";
+    expect(pawnAtSquare(fenBlackPawn, "a2")).toBe(true);
+    expect(pawnAtSquare(fenBlackPawn, "a1")).toBe(false);
+  });
+
+  test("starting position has pawns across rank 2 and rank 7 only", () => {
+    const start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    expect(pawnAtSquare(start, "a2")).toBe(true);
+    expect(pawnAtSquare(start, "h7")).toBe(true);
+    expect(pawnAtSquare(start, "a1")).toBe(false); // rook
+    expect(pawnAtSquare(start, "e1")).toBe(false); // king
+    expect(pawnAtSquare(start, "e4")).toBe(false); // empty
+  });
+
+  test("rejects malformed input", () => {
+    expect(pawnAtSquare(fenWhitePawn, "")).toBe(false);
+    expect(pawnAtSquare(fenWhitePawn, "z9")).toBe(false);
+    expect(pawnAtSquare("not a fen", "a7")).toBe(false);
   });
 });

@@ -23,7 +23,7 @@ import { BGAClient, type Cookie, type RawTableInfo } from "./bga-client";
 import {
   parseGameHtml, parseGameNeutralized, parseOpponent, buildFen, lookupUciMove,
   anyLegalMove, xyToSq, placementAfterMove, chooseRepetitionAwareMove,
-  shouldSkipMoveForNeutralized,
+  shouldSkipMoveForNeutralized, shouldRetryClaimSeat,
   type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
@@ -106,6 +106,16 @@ const OPPONENT_INACTIVITY_LIMIT_MS = 15 * 60 * 1000;
  *  table instead of waiting out OPPONENT_INACTIVITY_LIMIT_MS / MAX_TABLE_AGE_MS
  *  / BGA's own end-of-game sweep. Applies to both realtime and async. */
 const OPP_QUIT_CONFIRM_MS = 60 * 1000;
+/** After we detect a zombie-win (opponent neutralized, BGA finalized as our
+ *  win), we must call concedeMenu/leaveTable to flip BGA's row out of
+ *  status=play — otherwise the realtime slot stays blocked (BGA caps one
+ *  realtime game per account). concedeMenu sometimes returns ok-and-no-ops
+ *  server-side (observed: table 864070360 stuck 9h after a single concedeMenu
+ *  returned ok), so we keep retrying both endpoints on this cooldown until
+ *  BGA actually flips the row and the memo GC drops us. Cooldown picked so
+ *  retries are paced (no per-tick log spam) but the realtime slot reopens
+ *  within minutes, not hours. */
+const ZOMBIE_CLEAR_RETRY_MS = 5 * 60 * 1000;
 /** Force-clear awaitingOppMove after this long. Guards against the case
  *  where the opponent replies in between two of our 5s ticks: we never
  *  observe activePlayer=opp, so the original "clear when ourTurn flips"
@@ -289,6 +299,15 @@ interface TableMemo {
    *  conceding, so a transient realtime blip doesn't throw a live game.
    *  Cleared when the flag clears. */
   oppQuitSince?: number | null;
+  /** Wall-clock ms of the last claim-seat attempt (concedeMenu + leaveTable)
+   *  after a zombie win. Used as a cooldown so claimZombieWin paces its
+   *  retries when BGA accepts the call but no-ops server-side (see
+   *  ZOMBIE_CLEAR_RETRY_MS). null/unset = retry immediately. */
+  zombieClearAt?: number | null;
+  /** Telemetry: number of claim-seat attempts so far on this memo. Used to
+   *  surface "the slot is stuck" without re-parsing recentErrors, and to
+   *  bound retry logging. */
+  zombieClearAttempts?: number;
   /** Wall-clock ms we first created the memo for this table (i.e. first
    *  tick where we saw it). Used for "started" column in the dashboard. */
   startedAt?: number;
@@ -2274,48 +2293,75 @@ export class BotDriver extends DurableObject<Env> {
   /**
    * BGA already finalized the game with the opponent as the loser (zombie
    * flag + game_result_neutralized=1). We don't need to concede — we WON.
-   * Record the win, then call leaveTable to free our seat so the table flips
-   * out of `status=play` immediately instead of waiting for the zombified
-   * opponent to come back and click "leave". Without the leaveTable call BGA
-   * leaves the row at `play` indefinitely (observed on table 863414707
-   * stuck for 12h+ blocking the realtime invite slot).
+   * Record the win once, then keep retrying concedeMenu + leaveTable on a
+   * cooldown until BGA actually flips the row out of `status=play`. Why
+   * both, and why retry?
+   *   - concedeMenu (concede.html?src=menu) is the UI Concede call and was
+   *     supposed to be sufficient (worked for 863414707), but on table
+   *     864070360 BGA returned status:1/data:ok and then no-op'd: the row
+   *     sat at status=play for 9h+, the bot's realtime slot stayed blocked
+   *     (BGA caps one realtime game per account), and no new invite could
+   *     open.
+   *   - leaveTable (quitgame.html, neutralized=true) is the player-leaves
+   *     call. Pairing it with concedeMenu covers the "concedeMenu no-op"
+   *     mode without trusting either endpoint alone.
+   *   - Retry: a single attempt is gone forever if BGA dropped it on the
+   *     floor. The memo GC at handleTableSnapshot() drops this memo once
+   *     it falls out of the live snapshot, so the retry loop naturally
+   *     terminates as soon as BGA flips the row.
+   * Result row is recorded on the first call only (m.finished gate). Retry
+   * cadence is ZOMBIE_CLEAR_RETRY_MS so we don't spam BGA every 5s tick.
    */
   private async claimZombieWin(tableId: string, m: TableMemo): Promise<void> {
-    if (!this.client || m.finished) return;
-    // Best-effort score lookup. BGA returns 1/0 once the game is finalized;
-    // fall back to "1" / "0" when getTableInfo fails so the win is still
-    // recorded rather than logged as an unscored row.
-    let myRawScore: string | null = null;
-    let oppRawScore: string | null = null;
-    const ti = await this.client.getTableInfo(tableId).catch(() => null);
-    if (ti?.players) {
-      for (const [pid, seat] of Object.entries(ti.players)) {
-        if (seat.score == null) continue;
-        if (pid === this.uid) myRawScore = String(seat.score);
-        else oppRawScore = String(seat.score);
+    if (!this.client) return;
+
+    // FIRST-TIME: record the result row. Guarded by m.finished so a retry
+    // doesn't double-count or rewrite the row.
+    if (!m.finished) {
+      // Best-effort score lookup. BGA returns 1/0 once the game is finalized;
+      // fall back to "1" / "0" when getTableInfo fails so the win is still
+      // recorded rather than logged as an unscored row.
+      let myRawScore: string | null = null;
+      let oppRawScore: string | null = null;
+      const ti = await this.client.getTableInfo(tableId).catch(() => null);
+      if (ti?.players) {
+        for (const [pid, seat] of Object.entries(ti.players)) {
+          if (seat.score == null) continue;
+          if (pid === this.uid) myRawScore = String(seat.score);
+          else oppRawScore = String(seat.score);
+        }
       }
+      const stub = {
+        id: tableId,
+        game_id: "81",
+        status: "finished",
+        table_creator: "",
+        max_player: "2",
+        min_player: "2",
+      } as RawTableInfo;
+      this.recordFinishedResult(stub, m, myRawScore ?? "1", oppRawScore ?? "0");
+      m.finished = true;
+      m.finishedAt = Date.now();
+      console.log(
+        `bot:claimZombieWin recorded t=${tableId} myScore=${myRawScore ?? "1"} oppScore=${oppRawScore ?? "0"}`,
+      );
     }
-    const stub = {
-      id: tableId,
-      game_id: "81",
-      status: "finished",
-      table_creator: "",
-      max_player: "2",
-      min_player: "2",
-    } as RawTableInfo;
-    this.recordFinishedResult(stub, m, myRawScore ?? "1", oppRawScore ?? "0");
-    m.finished = true;
-    m.finishedAt = Date.now();
-    // concedeMenu posts concede.html?src=menu — the UI Concede call. This is
-    // the endpoint that actually clears a terminal-but-seated zombie row out
-    // of status=play; quitgame.html in either flavor returns ok but no-ops
-    // (see bga-client.ts:concedeMenu doc). Swallow errors — the recorded
-    // result + finished memo still matter even if BGA rejects the call.
+
+    // Retry-clear-seat with cooldown. Pure cooldown check lives in
+    // shouldRetryClaimSeat() (bot-move.ts) so the policy is unit-testable.
+    const now = Date.now();
+    if (!shouldRetryClaimSeat(m.zombieClearAt, now, ZOMBIE_CLEAR_RETRY_MS)) return;
+    m.zombieClearAt = now;
+    m.zombieClearAttempts = (m.zombieClearAttempts ?? 0) + 1;
+
     await this.client.concedeMenu(tableId).catch((e) => {
       this.recordError("claimZombieConcede", e, tableId);
     });
+    await this.client.leaveTable(tableId).catch((e) => {
+      this.recordError("claimZombieLeave", e, tableId);
+    });
     console.log(
-      `bot:claimZombieWin t=${tableId} myScore=${myRawScore ?? "1"} oppScore=${oppRawScore ?? "0"}`,
+      `bot:claimZombieWin clearSeat attempt=${m.zombieClearAttempts} t=${tableId}`,
     );
   }
 
@@ -3465,11 +3511,20 @@ export class BotDriver extends DurableObject<Env> {
           // realtime invite slot. Claim the win instead: record a `win` row
           // and call leaveTable to clear the seat.
           if (parseGameNeutralized(html)) {
-            this.recordError(
-              "oppQuitWin",
-              `${reason} persisted ${secs}s (${isRealtime ? "realtime" : "async"}); BGA finalized server-side, claiming win`,
-              tableId,
-            );
+            // Log to recentErrors ONCE per game — claimZombieWin owns the
+            // retry loop, which can fire every tick for hours while BGA
+            // refuses to flip the row. Logging here every tick swamps
+            // recentErrors with one stuck table's noise (RECENT_ERRORS_CAP is
+            // only 100, so a single stuck table evicted every other useful
+            // error). The retry itself stays observable via the per-attempt
+            // console.log inside claimZombieWin.
+            if (!m.finished) {
+              this.recordError(
+                "oppQuitWin",
+                `${reason} persisted ${secs}s (${isRealtime ? "realtime" : "async"}); BGA finalized server-side, claiming win`,
+                tableId,
+              );
+            }
             await this.claimZombieWin(tableId, m).catch((e) => {
               this.recordError("oppQuitClaim", e, tableId);
             });
