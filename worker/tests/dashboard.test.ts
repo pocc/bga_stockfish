@@ -119,10 +119,12 @@ describe("dashboard inline scripts", () => {
     vm.runInContext(scripts[scripts.length - 1], sandbox);
 
     const now = Date.now();
+    // moveCount ≥ 4 keeps each entry in Past Games (under MIN_BOT_MOVES_FOR_SCORED
+    // they'd be routed to the non-scored troubleshooting table instead).
     const html: string = sandbox.renderResults([
-      { ts: now, tableId: "1", tally: "win", oppName: "PremPlayer", oppId: "100", oppPremium: true },
-      { ts: now, tableId: "2", tally: "loss", oppName: "FreePlayer", oppId: "200", oppPremium: false },
-      { ts: now, tableId: "3", tally: "draw", oppName: "OldEntry", oppId: "300" }, // oppPremium undefined
+      { ts: now, tableId: "1", tally: "win", oppName: "PremPlayer", oppId: "100", oppPremium: true, moveCount: 22 },
+      { ts: now, tableId: "2", tally: "loss", oppName: "FreePlayer", oppId: "200", oppPremium: false, moveCount: 18 },
+      { ts: now, tableId: "3", tally: "draw", oppName: "OldEntry", oppId: "300", moveCount: 24 }, // oppPremium undefined
     ]);
 
     // Premium → filled green dot immediately before the name link.
@@ -135,5 +137,54 @@ describe("dashboard inline scripts", () => {
     expect((html.match(/class="freedot"/g) || []).length).toBe(1);
     // The legacy entry's name link is not preceded by any dot span.
     expect(html).toMatch(/<td><a href="[^"]*id=300"[^>]*>OldEntry<\/a><\/td>/);
+  });
+
+  test("short scored games drop out of Past Games and surface in non-scored", () => {
+    // BGA reported a clean win/loss/draw, but the game never crossed the
+    // MIN_BOT_MOVES_FOR_SCORED bar — typically an opp abandon in the opening
+    // or a seatless-archive recovery with no played moves. These belong in
+    // the troubleshooting table, not in Past Games, so they don't pad W/L/D.
+    const dummyEl = new Proxy({}, { get: () => () => {}, set: () => true });
+    const sandbox: any = {
+      document: { getElementById: () => dummyEl },
+      setInterval: () => 0,
+      fetch: () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) }),
+      window: {},
+      console,
+    };
+    sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(scripts[scripts.length - 1], sandbox);
+
+    const now = Date.now();
+    const entries = [
+      { ts: now, tableId: "10", tally: "win", oppName: "Real", oppId: "10", moveCount: 22 },
+      { ts: now, tableId: "11", tally: "win", oppName: null, moveCount: null }, // seatless recovery
+      { ts: now, tableId: "12", tally: "loss", oppName: "Quick", oppId: "12", moveCount: 2 }, // opp abandoned early
+      { ts: now, tableId: "13", tally: "none", reason: "oppQuit", oppName: "Quitter", oppId: "13" },
+    ];
+
+    const past: string = sandbox.renderResults(entries);
+    // Only the proper 22-move win shows up in Past Games. Every row gets a
+    // tableLink with ?table=N — checking that href is the simplest per-row
+    // sentinel (works even for rows with no oppId, e.g. the seatless one).
+    expect(past).toContain("?table=10");
+    expect(past).not.toContain("?table=11");
+    expect(past).not.toContain("?table=12");
+    expect(past).not.toContain("?table=13");
+
+    const nonScored: string = sandbox.renderNonResults(entries);
+    // The two short scored games are now routed here, labeled with the
+    // actual tally so the row stays auditable.
+    expect(nonScored).toContain("?table=11");
+    expect(nonScored).toContain("?table=12");
+    expect(nonScored).toMatch(/Too short — loss \(bot moves: 2\)/);
+    expect(nonScored).toMatch(/Too short — win \(bot moves: \?\)/);
+    // And the genuinely-unscored opp-quit row is still in there with its
+    // existing reason, unchanged.
+    expect(nonScored).toContain("?table=13");
+    expect(nonScored).toContain("Opponent quit");
+    // The real win stays out of the non-scored table.
+    expect(nonScored).not.toContain("?table=10");
   });
 });

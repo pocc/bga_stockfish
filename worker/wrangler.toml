@@ -28,6 +28,13 @@ class_name = "StockfishEngine"
 name = "BOT"
 class_name = "BotDriver"
 
+# KV namespace for user feedback collected from the landing page and from
+# in-game chat messages prefixed with "feedback". One entry per key
+# (`feedback:<isoTs>:<rand>`) so writes never RMW a shared blob.
+[[kv_namespaces]]
+binding = "FEEDBACK"
+id = "601634d7e6ec4e0cb364c891e7701af9"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["StockfishEngine"]

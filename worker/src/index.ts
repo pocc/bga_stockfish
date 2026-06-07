@@ -21,6 +21,15 @@ export interface Env {
    *  `wrangler secret put RAPIDAPI_STOCKFISH_KEY`. When unset, the engine
    *  is silently skipped in the race. */
   RAPIDAPI_STOCKFISH_KEY?: string;
+  /** KV namespace for user feedback: both website submissions
+   *  (POST /feedback) and in-game chat messages prefixed with "feedback".
+   *  One entry per key (`feedback:<isoTs>:<rand>` -> JSON entry). */
+  FEEDBACK: KVNamespace;
+  /** Optional Discord webhook URL — when set, a summary embed is posted on
+   *  every new feedback entry (web + chat). Set with
+   *  `wrangler secret put DISCORD_FEEDBACK_WEBHOOK`. When unset, the
+   *  notification call is a no-op so feedback still gets persisted to KV. */
+  DISCORD_FEEDBACK_WEBHOOK?: string;
 }
 
 function botStub(env: Env) {
@@ -56,6 +65,75 @@ function isAdmin(req: Request, env: Env): boolean {
 
 function unauthorized(): Response {
   return Response.json({ error: "unauthorized" }, { status: 401 });
+}
+
+/** Per-entry KV key. ISO timestamp sorts lexically + a short random suffix
+ *  guards against same-ms collisions. Shared by web + chat feedback paths. */
+export function feedbackKey(ts: number): string {
+  const iso = new Date(ts).toISOString();
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `feedback:${iso}:${rand}`;
+}
+
+/** Shared shape used for the Discord notification. Both feedback paths
+ *  (web POST and in-game chat) build one of these. */
+export interface FeedbackEntry {
+  ts: number;
+  source: "web" | "chat";
+  message: string;
+  contact?: string;
+  ip?: string;
+  tableId?: string;
+  oppId?: string;
+  oppName?: string;
+  oppLanguage?: string;
+}
+
+/** Best-effort Discord webhook notification on a new feedback entry. Silent
+ *  no-op when the webhook isn't configured or the POST fails — feedback is
+ *  already persisted in KV, so a notification miss must never affect the
+ *  caller. Returns void (callers should fire-and-forget or `.catch(() => {})`). */
+export async function notifyFeedbackWebhook(
+  env: Env,
+  entry: FeedbackEntry,
+): Promise<void> {
+  const url = env.DISCORD_FEEDBACK_WEBHOOK;
+  if (!url) return;
+  // Discord limits: title<=256, description<=4096, field value<=1024. The
+  // message body lives in description (KV cap is 2000 anyway). Truncate with
+  // a clear marker so the operator knows there's more in KV.
+  const trunc = (s: string, n: number) => s.length > n ? s.slice(0, n - 1) + "…" : s;
+  const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+  if (entry.contact) fields.push({ name: "Contact", value: trunc(entry.contact, 1024), inline: true });
+  if (entry.oppName) fields.push({ name: "Opponent", value: trunc(entry.oppName, 1024), inline: true });
+  if (entry.tableId) {
+    fields.push({
+      name: "Table",
+      value: `[${entry.tableId}](https://boardgamearena.com/table?table=${entry.tableId})`,
+      inline: true,
+    });
+  }
+  if (entry.oppLanguage) fields.push({ name: "Lang", value: entry.oppLanguage, inline: true });
+  if (entry.ip) fields.push({ name: "IP", value: trunc(entry.ip, 1024), inline: true });
+  const payload = {
+    embeds: [{
+      title: `Feedback via ${entry.source}`,
+      description: trunc(entry.message, 4000),
+      color: 0xb85c38, // matches dashboard accent
+      fields,
+      timestamp: new Date(entry.ts).toISOString(),
+      footer: { text: "stockfish.ross.gg" },
+    }],
+  };
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    /* swallow — see jsdoc */
+  }
 }
 
 export default {
@@ -148,6 +226,69 @@ export default {
       }
       return Response.redirect(BGA_PREMIUM_URL, 302);
     }
+    // Public feedback submission from the landing page. Writes straight to
+    // KV (one key per entry, `feedback:<isoTs>:<rand>`) so we share the same
+    // store as in-game chat feedback persisted from the bot DO.
+    if (url.pathname === "/feedback" && req.method === "POST") {
+      let body: { message?: unknown; contact?: unknown };
+      try {
+        body = await req.json();
+      } catch {
+        return Response.json({ error: "invalid json body" }, { status: 400 });
+      }
+      const message = typeof body.message === "string" ? body.message.trim() : "";
+      const contact = typeof body.contact === "string" ? body.contact.trim() : "";
+      if (!message) return Response.json({ error: "message required" }, { status: 400 });
+      if (message.length > 2000) {
+        return Response.json({ error: "message too long (max 2000 chars)" }, { status: 400 });
+      }
+      const ip = req.headers.get("cf-connecting-ip") ?? "";
+      const entry: FeedbackEntry = {
+        ts: Date.now(),
+        source: "web",
+        message,
+        ...(contact ? { contact: contact.slice(0, 200) } : {}),
+        ...(ip ? { ip } : {}),
+      };
+      await env.FEEDBACK.put(feedbackKey(entry.ts), JSON.stringify(entry));
+      // Discord notification is fire-and-forget so a slow / broken webhook
+      // can't delay the response. Already swallowed internally; .catch here
+      // is belt-and-braces in case the helper itself ever throws.
+      notifyFeedbackWebhook(env, entry).catch(() => {});
+      return Response.json({ ok: true });
+    }
+
+    // Public count of feedback entries — used by the landing page to show
+    // "Feedback (N)" next to the submission form so a new arrival is visible
+    // at a glance. Just the integer count, no entries.
+    if (url.pathname === "/feedback/count" && req.method === "GET") {
+      let total = 0;
+      let cursor: string | undefined;
+      do {
+        const page: KVNamespaceListResult<unknown> = await env.FEEDBACK.list({
+          prefix: "feedback:", cursor,
+        });
+        total += page.keys.length;
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+      return Response.json({ count: total });
+    }
+
+    // Admin: list feedback entries from KV. Newest first.
+    if (url.pathname === "/bot/feedback" && req.method === "GET") {
+      if (!isAdmin(req, env)) return unauthorized();
+      const list = await env.FEEDBACK.list({ prefix: "feedback:", limit: 200 });
+      const entries = await Promise.all(
+        list.keys.map(async (k) => {
+          const raw = await env.FEEDBACK.get(k.name);
+          try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+        }),
+      );
+      return Response.json({
+        entries: entries.filter((e) => e != null).sort((a, b) => b.ts - a.ts),
+      });
+    }
+
     // Debug: dump parsed game state for a tracked table id. Gated behind the
     // admin secret — it triggers a BGA login + game-page fetch, so leaving it
     // open lets anonymous callers drive bot-side work (and leaks game state).
@@ -166,7 +307,7 @@ export default {
       "/bot/probe", "/bot/wipe", "/bot/fix-result", "/bot/reconcile-results",
       "/bot/retally-unscored",
       "/bot/resync-stats", "/bot/resync-engine-uses", "/bot/ws-probe",
-      "/bot/purge-cache",
+      "/bot/purge-cache", "/bot/unstick",
     ]);
     if (mutatingBot.has(url.pathname)) {
       if (!isAdmin(req, env)) return unauthorized();
@@ -408,10 +549,21 @@ function landingHtml(): string {
     <li>Maintains one open invite per gamemode (realtime + turn-based).</li>
     <li>Always accepts draw offers and collective-abandon proposals.</li>
     <li>Default strength is full <span class="mono">grandmaster</span> Stockfish for both realtime and turn-based games. Send one word at any time — <span class="mono">beginner</span> / <span class="mono">easy</span> / <span class="mono">intermediate</span> / <span class="mono">advanced</span> / <span class="mono">expert</span> / <span class="mono">grandmaster</span> — to set my level.</li>
-    <li>Replies <span class="mono">"I'm not sure."</span> to every opponent chat message except those exact difficulty keywords (chat otherwise treated as untrusted).</li>
+    <li>Replies <span class="mono">"I'm not sure."</span> to every opponent chat message except those exact difficulty keywords (chat otherwise treated as untrusted). One exception: messages starting with the word <span class="mono">feedback</span> are captured and reach the bot operator.</li>
     <li>Speaks to each opponent in their BGA interface language (41 supported, English fallback).</li>
     <li>After 3 consecutive errors on a table, sends a polite concession message and resigns.</li>
   </ul>
+
+  <div id="feedback-box" style="margin-top: 14px; padding: 12px 14px; background: var(--code-bg); border-radius: 6px;">
+    <label for="feedback-msg" style="display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px;">Feedback<span id="feedback-count" style="margin-left: 6px;"></span></label>
+    <p class="sub" style="margin: 0 0 8px; font-size: 12px;">Bug? Suggestion? Drop a note. Optional contact field if you'd like a reply.</p>
+    <textarea id="feedback-msg" rows="3" maxlength="2000" placeholder="Your feedback…" style="width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 4px; resize: vertical;"></textarea>
+    <div class="row" style="margin-top: 8px; gap: 8px;">
+      <input id="feedback-contact" type="text" maxlength="200" placeholder="Contact (optional: email, BGA handle, etc.)" style="flex: 1; min-width: 0; padding: 6px 10px; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 4px;">
+      <a href="javascript:submitFeedback()" id="feedback-submit" class="pill btn on">Send</a>
+      <span id="feedback-status" class="muted" style="font-size: 11px;"></span>
+    </div>
+  </div>
 
   <h2 style="margin-bottom: 6px;">Active games</h2>
   <div class="row" style="margin: 0 0 12px;">
@@ -1392,9 +1544,19 @@ function renderMoves(moves) {
       const isRejectedWinner = fellThrough && e === raceWinner;
       return renderEngineCell(r, isChosen, isRejectedWinner);
     });
-    const movePill = m.engine === "random-fallback"
-      ? ' <span class="pill warn" title="no engine produced a usable move">🎲 Random</span>'
-      : "";
+    // Random-fallback rows carry the FEN (and level for difficulty games) so
+    // a reproducer for the offending engine is one hover away. The newline
+    // separator renders as multi-line in modern browser tooltips; if the
+    // fields are missing (old entries written before this was recorded) the
+    // tooltip degrades to just the headline.
+    let movePill = "";
+    if (m.engine === "random-fallback") {
+      const parts = ["no engine produced a usable move"];
+      if (typeof m.level === "number") parts.push("js-chess-engine level: " + m.level);
+      else if (m.fen) parts.push("mode: grandmaster (race level 1 / post-race level 5)");
+      if (m.fen) parts.push("FEN: " + m.fen);
+      movePill = ' <span class="pill warn" title="' + esc(parts.join("\\n")) + '">🎲 Random</span>';
+    }
     return '<tr>'
       + '<td class="muted">' + fmtTime(m.ts) + '</td>'
       + '<td>' + tableLink(m.tableId) + '</td>'
@@ -1409,11 +1571,17 @@ function renderMoves(moves) {
     + pager(all.length, MOVES_PAGE_SIZE, movesPage, "setMovesPage", "moves (24h)");
 }
 
-// A clean, BGA-scored game (win/loss/draw). Everything else (tally "none":
-// concedes, opponent-quits, aborts, premium-gate voids, unparseable finishes)
-// is split out into the troubleshooting table — see renderNonResults.
+// A clean, BGA-scored game that ran long enough to call a real game. Tally
+// must be win/loss/draw AND the bot played at least MIN_BOT_MOVES_FOR_SCORED
+// of its own moves (~MIN_BOT_MOVES_FOR_SCORED*2 combined plies). Sub-threshold
+// games — opp abandons in the opening, seatless-archive recoveries with no
+// played moves — are split out into the troubleshooting table so they don't
+// pad the W/L/D stats with games that were never actually contested. See
+// renderNonResults / nonResultReason for how they're surfaced.
+const MIN_BOT_MOVES_FOR_SCORED = 4;
 function isScored(r) {
-  return r.tally === "win" || r.tally === "loss" || r.tally === "draw";
+  if (r.tally !== "win" && r.tally !== "loss" && r.tally !== "draw") return false;
+  return r.moveCount != null && r.moveCount >= MIN_BOT_MOVES_FOR_SCORED;
 }
 
 // Premium marker shown before an opponent's name in the games tables.
@@ -1510,6 +1678,14 @@ function nonResultReason(r) {
   // "none" and recorded why in uncountedReason. /bot/retally-unscored
   // re-tallies the ones with a clean score; the rest surface their reason.
   if (r.uncountedReason) return NONRESULT_REASONS[r.uncountedReason] || r.uncountedReason;
+  // BGA reported a clean win/loss/draw but the game never reached the
+  // MIN_BOT_MOVES_FOR_SCORED bar — opp abandon in opening, seatless-archive
+  // recovery with no played moves, etc. Keep the actual tally visible so the
+  // row isn't mistaken for an error.
+  if (r.tally === "win" || r.tally === "loss" || r.tally === "draw") {
+    const mv = r.moveCount == null ? "?" : r.moveCount;
+    return "Too short — " + r.tally + " (bot moves: " + mv + ")";
+  }
   // Truly unscored: a BGA finish whose score didn't parse to 0/0.5/1.
   return "Unscored finish (raw: " + (r.rawScore == null ? "null" : r.rawScore) + ")";
 }
@@ -1704,7 +1880,55 @@ function tickCountups() {
   });
 }
 
+async function loadFeedbackCount() {
+  try {
+    const r = await fetch("/feedback/count", { cache: "no-store" });
+    if (!r.ok) return;
+    const { count } = await r.json();
+    const el = document.getElementById("feedback-count");
+    if (el && typeof count === "number") el.textContent = "(" + count + ")";
+  } catch (e) { /* non-fatal */ }
+}
+
+async function submitFeedback() {
+  const msgEl = document.getElementById("feedback-msg");
+  const contactEl = document.getElementById("feedback-contact");
+  const btn = document.getElementById("feedback-submit");
+  const statusEl = document.getElementById("feedback-status");
+  const message = (msgEl.value || "").trim();
+  const contact = (contactEl.value || "").trim();
+  if (!message) {
+    statusEl.textContent = "Please write something first.";
+    statusEl.className = "warn";
+    return;
+  }
+  btn.classList.add("muted");
+  btn.style.pointerEvents = "none";
+  statusEl.className = "muted";
+  statusEl.textContent = "sending…";
+  try {
+    const r = await fetch("/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message, contact: contact || undefined }),
+    });
+    if (!r.ok) throw new Error("http " + r.status);
+    msgEl.value = "";
+    contactEl.value = "";
+    statusEl.textContent = "Thanks, received.";
+    statusEl.className = "ok";
+    loadFeedbackCount();
+  } catch (e) {
+    statusEl.textContent = "Send failed: " + String(e);
+    statusEl.className = "err";
+  } finally {
+    btn.classList.remove("muted");
+    btn.style.pointerEvents = "";
+  }
+}
+
 load();
+loadFeedbackCount();
 setInterval(load, 10000);
 setInterval(tickCountups, 1000);
 </script>

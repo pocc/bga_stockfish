@@ -565,6 +565,23 @@ export class BGAClient {
     return (await resp.json()) as BGAEnvelope<unknown>;
   }
 
+  /**
+   * GET /table/table/concede.html?src=menu — the UI "Concede" menu call.
+   * Distinct from quitgame.html: this is the one that successfully clears a
+   * terminal-but-seated zombie table (BGA returned status:1/data:ok for
+   * quitgame.html in both flavors on table 863414707 but left the row at
+   * status=play; the menu concede endpoint is what the in-game UI fires
+   * from the Concede button).
+   */
+  async concedeMenu(tableId: number | string): Promise<BGAEnvelope<unknown>> {
+    const url =
+      `https://en.boardgamearena.com/table/table/concede.html` +
+      `?src=menu&table=${tableId}` +
+      `&noerrortracking=true&dojo.preventCache=${Date.now()}`;
+    const resp = await this.request("GET", url);
+    return (await resp.json()) as BGAEnvelope<unknown>;
+  }
+
   async chat(tableId: number | string, msg: string): Promise<BGAEnvelope<unknown>> {
     const body = new URLSearchParams({ table: String(tableId), msg });
     const resp = await this.request(

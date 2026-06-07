@@ -16,11 +16,14 @@
  *   - on our turn: parse legal moves, ask /bestmove, send selectCell+wakeup
  */
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "./index";
+import {
+  feedbackKey, notifyFeedbackWebhook, type FeedbackEntry, type Env,
+} from "./index";
 import { BGAClient, type Cookie, type RawTableInfo } from "./bga-client";
 import {
-  parseGameHtml, parseOpponent, buildFen, lookupUciMove, anyLegalMove, xyToSq,
-  placementAfterMove, chooseRepetitionAwareMove, shouldSkipMoveForNeutralized,
+  parseGameHtml, parseGameNeutralized, parseOpponent, buildFen, lookupUciMove,
+  anyLegalMove, xyToSq, placementAfterMove, chooseRepetitionAwareMove,
+  shouldSkipMoveForNeutralized,
   type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
@@ -167,6 +170,14 @@ const RECENT_MOVES_CAP = 500;
  *  tally so we can audit which raw score BGA reported per game without
  *  spelunking the GC'd memo. Used to diagnose "draws stayed 0" bugs. */
 const RECENT_RESULTS_CAP = 500;
+/** Minimum bot move count for a BGA-scored game to count toward W/L/D and
+ *  appear in Past Games. The bot only tracks its own moves, so combined
+ *  plies ≈ 2 × moveCount; this threshold approximates "≥ 8 combined plies".
+ *  Below the bar (opp abandons in the opening, seatless-archive recoveries
+ *  with no played moves) the game is logged but routed to the non-scored
+ *  table and excluded from the counters. Keep in sync with
+ *  MIN_BOT_MOVES_FOR_SCORED in src/index.ts (the dashboard client). */
+const MIN_BOT_MOVES_FOR_SCORED = 4;
 /** Cap on each of the rolling premium-engagement logs (nudges + clicks).
  *  Kept generous so the "we drive BGA memberships" evidence is durable. */
 const PREMIUM_LOG_CAP = 1000;
@@ -491,6 +502,14 @@ interface MoveEntry {
   /** Piece type that moved ("pawn" / "knight" / "bishop" / "rook" /
    *  "queen" / "king"). Useful for analytics + UI. */
   pieceType?: string;
+  /** Set only when engine === "random-fallback": the FEN handed to the
+   *  engine race, so an illegal upstream move (js-chess-engine or any cloud
+   *  engine) can be reproduced verbatim against the offending package. */
+  fen?: string;
+  /** Set only when engine === "random-fallback" on a difficulty game: the
+   *  js-chess-engine level (1-5). Undefined for grandmaster (the race uses
+   *  a hardcoded level 1; the post-race fallback uses level 5). */
+  level?: number;
 }
 
 interface BotStats {
@@ -900,7 +919,104 @@ export class BotDriver extends DurableObject<Env> {
       const result = await this.resyncEngineUses(since, apply);
       return Response.json(result);
     }
+    if (url.pathname === "/unstick") {
+      await this.boot();
+      const id = url.searchParams.get("id");
+      if (!id) return Response.json({ error: "missing id" }, { status: 400 });
+      const result = await this.unstickTable(id);
+      return Response.json(result);
+    }
     return new Response("not found", { status: 404 });
+  }
+
+  /**
+   * Manual recovery for a table BGA has finalized server-side but left at
+   * `status=play` because both players are still seated. Posts leaveTable
+   * (quitgame.html with neutralized=true) so BGA flips the table out of
+   * play, then marks the memo finished and clears any openInvites slot
+   * still parked on this id. Does NOT touch recentResults — pair with
+   * /fix-result if the row's tally is wrong.
+   */
+  private async unstickTable(tableId: string): Promise<{
+    ok: boolean;
+    concedeResp?: unknown;
+    leaveResp?: unknown;
+    memoBefore?: { finished?: boolean; conceded?: boolean } | null;
+    invitesCleared?: string[];
+    error?: string;
+  }> {
+    if (!this.client) return { ok: false, error: "no client" };
+    try { await this.client.login(); } catch (e) {
+      return { ok: false, error: "login: " + String(e).slice(0, 200) };
+    }
+    const m = this.status.tables[tableId];
+    const memoBefore = m ? { finished: m.finished, conceded: m.conceded } : null;
+    // concede.html?src=menu is the UI Concede call. Empirically the only
+    // endpoint that actually clears a terminal-but-seated zombie row out of
+    // status=play (quitgame.html in either flavor returns status:1/ok but
+    // leaves the table untouched). Try it first; fall back to leaveTable so
+    // tables in earlier states still get cleared.
+    let concedeResp: unknown = null;
+    try {
+      concedeResp = await this.client.concedeMenu(tableId);
+    } catch (e) {
+      this.recordError("unstickConcede", e, tableId);
+    }
+    let leaveResp: unknown = null;
+    try {
+      leaveResp = await this.client.leaveTable(tableId);
+    } catch (e) {
+      this.recordError("unstickLeave", e, tableId);
+    }
+    if (!concedeResp && !leaveResp) {
+      return { ok: false, memoBefore, error: "both concedeMenu and leaveTable failed" };
+    }
+    if (m) {
+      m.finished = true;
+      if (m.finishedAt == null) m.finishedAt = Date.now();
+    }
+    const invitesCleared: string[] = [];
+    for (const mode of GAMEMODES) {
+      const slot = this.status.openInvites[mode];
+      if (slot.id === tableId) {
+        invitesCleared.push(mode);
+        slot.id = null;
+        slot.createdAt = null;
+        slot.lastAttempt = null;
+      }
+    }
+    await this.ctx.storage.put("openInvites", this.status.openInvites);
+    console.log(`bot:unstick t=${tableId} invitesCleared=${invitesCleared.join(",") || "none"}`);
+    return { ok: true, concedeResp, leaveResp, memoBefore, invitesCleared };
+  }
+
+  /** Persist a chat-channel feedback message to the shared KV store. The
+   *  worker's POST /feedback path uses the same key format; an admin GET
+   *  /bot/feedback reads them all back. Errors are swallowed: a KV write
+   *  blip must not block the bot's chat reply. */
+  private async persistChatFeedback(
+    tableId: string,
+    m: TableMemo,
+    message: string,
+  ): Promise<void> {
+    const ts = Date.now();
+    const entry: FeedbackEntry = {
+      ts,
+      source: "chat",
+      message: message.slice(0, 2000),
+      tableId,
+      ...(m.oppId ? { oppId: m.oppId } : {}),
+      ...(m.oppName ? { oppName: m.oppName } : {}),
+      ...(m.oppLanguage ? { oppLanguage: m.oppLanguage } : {}),
+    };
+    try {
+      await this.env.FEEDBACK.put(feedbackKey(ts), JSON.stringify(entry));
+    } catch (e) {
+      this.recordError("feedbackKv", e, tableId);
+    }
+    // Fire-and-forget Discord push so a broken webhook never blocks the
+    // bot's chat reply. notifyFeedbackWebhook swallows its own errors too.
+    notifyFeedbackWebhook(this.env, entry).catch(() => {});
   }
 
   /** Recompute `stats.engineUses` by tallying entries from `recentMoves`
@@ -967,6 +1083,10 @@ export class BotDriver extends DurableObject<Env> {
     const byDifficulty = emptyDifficultyTally();
     for (const r of results) {
       if (r.tally !== "win" && r.tally !== "loss" && r.tally !== "draw") continue;
+      // Mirror the recordFinishedResult guard: short games (opp abandons,
+      // seatless-archive recoveries) keep their tally on the row but stay
+      // out of the counters so Past Games and W/L/D agree.
+      if (r.moveCount == null || r.moveCount < MIN_BOT_MOVES_FOR_SCORED) continue;
       const diff = r.difficulty || "grandmaster";
       const bucket = byDifficulty[diff] ?? (byDifficulty[diff] = { wins: 0, losses: 0, draws: 0 });
       if (r.tally === "win") { tallies.wins++; bucket.wins++; }
@@ -2151,6 +2271,54 @@ export class BotDriver extends DurableObject<Env> {
    *  or surfaced on the dashboard — they're mostly error/cancellation
    *  states, not real outcomes). Pass a custom chat to explain a non-error
    *  concession (e.g. opponent clock overdraft). */
+  /**
+   * BGA already finalized the game with the opponent as the loser (zombie
+   * flag + game_result_neutralized=1). We don't need to concede — we WON.
+   * Record the win, then call leaveTable to free our seat so the table flips
+   * out of `status=play` immediately instead of waiting for the zombified
+   * opponent to come back and click "leave". Without the leaveTable call BGA
+   * leaves the row at `play` indefinitely (observed on table 863414707
+   * stuck for 12h+ blocking the realtime invite slot).
+   */
+  private async claimZombieWin(tableId: string, m: TableMemo): Promise<void> {
+    if (!this.client || m.finished) return;
+    // Best-effort score lookup. BGA returns 1/0 once the game is finalized;
+    // fall back to "1" / "0" when getTableInfo fails so the win is still
+    // recorded rather than logged as an unscored row.
+    let myRawScore: string | null = null;
+    let oppRawScore: string | null = null;
+    const ti = await this.client.getTableInfo(tableId).catch(() => null);
+    if (ti?.players) {
+      for (const [pid, seat] of Object.entries(ti.players)) {
+        if (seat.score == null) continue;
+        if (pid === this.uid) myRawScore = String(seat.score);
+        else oppRawScore = String(seat.score);
+      }
+    }
+    const stub = {
+      id: tableId,
+      game_id: "81",
+      status: "finished",
+      table_creator: "",
+      max_player: "2",
+      min_player: "2",
+    } as RawTableInfo;
+    this.recordFinishedResult(stub, m, myRawScore ?? "1", oppRawScore ?? "0");
+    m.finished = true;
+    m.finishedAt = Date.now();
+    // concedeMenu posts concede.html?src=menu — the UI Concede call. This is
+    // the endpoint that actually clears a terminal-but-seated zombie row out
+    // of status=play; quitgame.html in either flavor returns ok but no-ops
+    // (see bga-client.ts:concedeMenu doc). Swallow errors — the recorded
+    // result + finished memo still matter even if BGA rejects the call.
+    await this.client.concedeMenu(tableId).catch((e) => {
+      this.recordError("claimZombieConcede", e, tableId);
+    });
+    console.log(
+      `bot:claimZombieWin t=${tableId} myScore=${myRawScore ?? "1"} oppScore=${oppRawScore ?? "0"}`,
+    );
+  }
+
   private async concedeTable(
     tableId: string,
     m: TableMemo,
@@ -2992,7 +3160,14 @@ export class BotDriver extends DurableObject<Env> {
         }
       }
       if (!m.saidGg) {
-        await this.sendChat(t.id, tr("closing", m.oppLanguage));
+        // English-only by design: the appended feedback prompt asks the
+        // opponent to type "feedback ..." and we only want to read English
+        // submissions, so the surrounding line stays English regardless of
+        // m.oppLanguage.
+        await this.sendChat(
+          t.id,
+          "Good game! For bot feedback, start your message with the word \"feedback\".",
+        );
         m.saidGg = true;
       }
       m.finished = true;
@@ -3023,11 +3198,22 @@ export class BotDriver extends DurableObject<Env> {
     const oppScore = oppRawScore == null ? null : Number(oppRawScore);
     const mutualZero = score === 0 && oppScore === 0;
     let tally: ResultEntry["tally"] = "none";
-    if (score === 1) { this.status.stats.wins++; tally = "win"; }
-    else if (score === 0.5 || mutualZero) { this.status.stats.draws++; tally = "draw"; }
-    else if (score === 0) { this.status.stats.losses++; tally = "loss"; }
+    if (score === 1) tally = "win";
+    else if (score === 0.5 || mutualZero) tally = "draw";
+    else if (score === 0) tally = "loss";
+    // Only count toward W/L/D + by-difficulty stats if the game ran long
+    // enough to be a real contest — see MIN_BOT_MOVES_FOR_SCORED. The tally
+    // itself stays accurate so the row's terminal score is auditable in the
+    // non-scored table.
+    const moves = m.moveCount ?? 0;
+    const countable = tally !== "none" && moves >= MIN_BOT_MOVES_FOR_SCORED;
+    if (countable) {
+      if (tally === "win") this.status.stats.wins++;
+      else if (tally === "draw") this.status.stats.draws++;
+      else if (tally === "loss") this.status.stats.losses++;
+    }
     const tallyDifficulty = m.effectiveDifficulty ?? m.difficulty ?? "grandmaster";
-    if (tally !== "none") {
+    if (countable) {
       if (!this.status.stats.byDifficulty) this.status.stats.byDifficulty = emptyDifficultyTally();
       const bucket = this.status.stats.byDifficulty[tallyDifficulty]
         ?? (this.status.stats.byDifficulty[tallyDifficulty] = { wins: 0, losses: 0, draws: 0 });
@@ -3169,8 +3355,14 @@ export class BotDriver extends DurableObject<Env> {
       // keywords embedded in a sentence) is treated as untrusted chatter
       // and gets the canned reply — this keeps the injection surface a
       // closed enum rather than free text.
-      const word = String(h.msg ?? "").trim().toLowerCase();
+      const raw = String(h.msg ?? "").trim();
+      const word = raw.toLowerCase();
       const isCmd = word === "grandmaster" || word in DIFFICULTY_LEVELS;
+      // Feedback channel: any message that STARTS with the word "feedback"
+      // (case-insensitive, followed by whitespace or end-of-string) is
+      // captured to KV. Hardcoded English reply because the closing message
+      // that advertises this channel is itself English-only.
+      const fbMatch = raw.match(/^feedback\b\s*([\s\S]*)$/i);
       let reply = tr("chatReply", m.oppLanguage);
       if (isCmd) {
         if (word === "grandmaster") {
@@ -3182,6 +3374,14 @@ export class BotDriver extends DurableObject<Env> {
         } else {
           m.difficulty = word;
           reply = tr("difficultySet", m.oppLanguage, { level: word, elo: DIFFICULTY_ELO[word] });
+        }
+      } else if (fbMatch) {
+        const body = fbMatch[1].trim();
+        if (body) {
+          await this.persistChatFeedback(tableId, m, body);
+          reply = "Thanks, your feedback was recorded.";
+        } else {
+          reply = "Send your feedback in the same message, e.g. \"feedback the bot played a bad move\".";
         }
       }
       // If the send fails, stop here WITHOUT advancing past this message so it
@@ -3257,6 +3457,24 @@ export class BotDriver extends DurableObject<Env> {
           );
         } else if (Date.now() - m.oppQuitSince >= OPP_QUIT_CONFIRM_MS) {
           const secs = Math.round((Date.now() - m.oppQuitSince) / 1000);
+          // If BGA's HTML already carries the formal "game over, opp lost"
+          // marker (game_result_neutralized=1 or neutralized_player_id set),
+          // the game is decided in our favor server-side. Conceding on top of
+          // that puts BGA in a half-state where the table sits at status=play
+          // indefinitely (observed on table 863414707) and blocks the
+          // realtime invite slot. Claim the win instead: record a `win` row
+          // and call leaveTable to clear the seat.
+          if (parseGameNeutralized(html)) {
+            this.recordError(
+              "oppQuitWin",
+              `${reason} persisted ${secs}s (${isRealtime ? "realtime" : "async"}); BGA finalized server-side, claiming win`,
+              tableId,
+            );
+            await this.claimZombieWin(tableId, m).catch((e) => {
+              this.recordError("oppQuitClaim", e, tableId);
+            });
+            return;
+          }
           this.recordError(
             "oppQuit",
             `${reason} persisted ${secs}s (${isRealtime ? "realtime" : "async"}); conceding — opponent quit, friendly game, no penalty`,
@@ -3738,6 +3956,14 @@ export class BotDriver extends DurableObject<Env> {
       cp: moveCp, mate: moveMate, thinkMs: moveThinkMs,
       captured: isCapture,
       pieceType: movedPiece?.piece_type,
+      // Stash the FEN (and js-chess-engine level for difficulty games) only
+      // when we fell through to a random legal pick. The engineResults entry
+      // already records each engine's UCI + error; pairing it with the FEN
+      // gives a self-contained reproducer for an upstream bug report (e.g.
+      // js-chess-engine returning an illegal capture-promotion).
+      ...(engineSource === "random-fallback"
+        ? { fen, level: useDifficulty ? DIFFICULTY_LEVELS[effectiveDifficulty] : undefined }
+        : {}),
     });
     m.moveCount = (m.moveCount ?? 0) + 1;
     // Tally engine provenance per game so it outlives the capped recentMoves
