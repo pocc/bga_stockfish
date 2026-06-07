@@ -749,23 +749,32 @@ export class BGAClient {
   }
 
   async resolveGameserver(tableId: number | string): Promise<number | null> {
+    return (await this.resolveGameserverWithPage(tableId))?.gs ?? null;
+  }
+
+  /**
+   * Same as resolveGameserver but also returns the page body, so callers that
+   * also want to extract opponent info / language can do it from this one
+   * fetch instead of issuing a follow-up `fetchGamePage`. Saves a full BGA
+   * round-trip on the first live-play tick (greeting path).
+   */
+  async resolveGameserverWithPage(
+    tableId: number | string,
+  ): Promise<{ gs: number; html: string } | null> {
     const resp = await this.request(
       "GET",
       `https://boardgamearena.com/table?table=${tableId}`,
       undefined,
       { accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
     );
-    // 302 Location header — old behavior, kept in case BGA goes back to it.
     const loc = resp.headers.get("location") ?? "";
-    const fromLoc = /\/(\d+)\/chess\?/.exec(loc);
-    if (fromLoc) return Number(fromLoc[1]);
-    // Modern flow: BGA returns 200 with the rendered game page; scrape the
-    // gameserver number from the body. Two reliable signatures.
     const body = await resp.text();
+    const fromLoc = /\/(\d+)\/chess\?/.exec(loc);
+    if (fromLoc) return { gs: Number(fromLoc[1]), html: body };
     const fromPath = /\/(\d+)\/chess\?table/.exec(body);
-    if (fromPath) return Number(fromPath[1]);
+    if (fromPath) return { gs: Number(fromPath[1]), html: body };
     const fromKey = /gameserver["']?\s*[:=]\s*["']?(\d+)/.exec(body);
-    if (fromKey) return Number(fromKey[1]);
+    if (fromKey) return { gs: Number(fromKey[1]), html: body };
     return null;
   }
 

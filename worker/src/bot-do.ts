@@ -27,7 +27,7 @@ import {
   type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
-import { chunkChat, chatPaceDelayMs } from "./chat";
+import { chunkChat, chatPaceDelayMs, CHAT_MIN_SPACING_MS } from "./chat";
 import {
   extractCentrifugeAuth, isVisitorId, channelsFor, probeCentrifuge,
   openCentrifugeSocket, parseFrames,
@@ -202,6 +202,22 @@ const PREMIUM_KICK_DELAY_MS = 30_000;
  *  the polled list). Bounds the fetch so a permanently-missing log can't
  *  re-fetch every tick. */
 const MOVE_CAPTURE_MAX_ATTEMPTS = 6;
+/** How long after the GG message (m.saidGg) we keep polling the table's chat
+ *  for "feedback ..." messages. The GG line itself asks the opponent to start
+ *  their message with "feedback", but async opponents often only see the
+ *  prompt hours later, by which point BGA has dropped the table from
+ *  `myTables` and the memo would otherwise be GC'd. We keep the memo alive
+ *  for this window and run pollAndReplyChat against it (even when the table
+ *  is absent from the snapshot) so a late feedback message still lands in
+ *  KV + Discord. Conceded-by-bot games don't qualify — saidGg is the gate. */
+const FEEDBACK_GRACE_MS = 24 * 60 * 60 * 1000;
+/** Throttle for the off-snapshot feedback chat-poll. The tick runs every few
+ *  seconds; without a per-table cooldown a 24h grace window would drag
+ *  dozens of in-grace finished tables into a chatHistory storm. 60s gives a
+ *  late "feedback ..." message a worst-case ~1-minute pickup delay, which
+ *  is fine for an async-game flow. Does NOT throttle the in-snapshot path
+ *  (handleTable's finished branch already paces with the tick). */
+const FEEDBACK_POLL_INTERVAL_MS = 60 * 1000;
 
 /** djb2 string hash. Used only to detect whether a status blob changed
  *  since its last persist — collisions just cause a redundant write, never
@@ -350,6 +366,12 @@ interface TableMemo {
   /** Wall-clock ms we marked the table finished. Set wherever
    *  `finished = true` is set. */
   finishedAt?: number;
+  /** Wall-clock ms of the last off-snapshot feedback chat-poll (see
+   *  FEEDBACK_GRACE_MS / FEEDBACK_POLL_INTERVAL_MS). Used to throttle the
+   *  post-GG sweep so a 24h grace window doesn't drag every tick into a
+   *  chatHistory storm across dozens of in-grace finished tables. Unset
+   *  for tables that have never been swept. */
+  lastFeedbackPollAt?: number;
   /** True once the archive move log has been captured onto this table's
    *  ResultEntry. Gates the per-tick capture so we stop fetching once we
    *  have the moves. */
@@ -1602,14 +1624,16 @@ export class BotDriver extends DurableObject<Env> {
     for (let i = 0; i < chunks.length; i++) {
       // Pace every send past BGA's anti-flood window. Two failure modes:
       //   - within one message: BGA drops chunks fired back-to-back, which
-      //     truncated long greetings to just the first chunk (needs ~2s).
+      //     truncated long greetings to just the first chunk.
       //   - across messages: a greeting immediately followed by a reply (or
       //     two reaction chats on one tick) tripped "minimum of 1 second
       //     between messages" and silently dropped the second.
-      // chatPaceDelayMs covers the cross-call gap from lastChatSentAt; the
-      // larger inter-chunk gap subsumes it for i>0.
+      // Both modes are BGA's same 1s anti-flood rule. CHAT_MIN_SPACING_MS
+      // (1.1s) is already validated against that rule for the cross-call
+      // case (see chat.ts); using it for the inter-chunk gap too means a
+      // 2-chunk greeting now finishes ~900ms sooner without risking a drop.
       const gap = i > 0
-        ? 2_000
+        ? CHAT_MIN_SPACING_MS
         : chatPaceDelayMs(Date.now(), this.lastChatSentAt);
       if (gap > 0) await new Promise((r) => setTimeout(r, gap));
       try {
@@ -1811,15 +1835,69 @@ export class BotDriver extends DurableObject<Env> {
     // if a presence socket from before the stop is still delivering pushes.
     if (!this.client || !this.uid || this.tickInFlight || !this.status.running) return;
     const m = this.status.tables[tableId];
-    if (!m || m.finished || m.conceded || m.gameserver == null) return;
+    if (!m || m.finished || m.conceded) return;
     this.tickInFlight = true;
     try {
       console.log(`ws:react t=${tableId}`);
-      // Honor a difficulty keyword before reacting: the move path locks the
-      // difficulty window on the bot's first move, so a push-driven game must
-      // process pending chat first or the opponent's level pick is lost.
-      await this.pollAndReplyChat(tableId, m).catch(() => {});
-      await this.maybePlayMove(tableId, m, true);
+      // Resolve gameserver eagerly so the greeting can fire from the FIRST
+      // push (e.g. when the table flips to play and BGA sends the
+      // gamestate-update push). Without this the opener still waited up to a
+      // full 5s poll tick, which was the bulk of the perceived "minute" the
+      // opponent saw between sitting down and the bot saying hi. The same
+      // combined endpoint refreshes oppLanguage so maybeGreet localizes
+      // correctly without its own fetch.
+      if (m.gameserver == null) {
+        const r = await this.client.resolveGameserverWithPage(tableId).catch(() => null);
+        if (!r) return;
+        m.gameserver = r.gs;
+        this.refreshOpponent(m, r.html);
+        if (!m.saidHi) {
+          if (await this.enforcePremiumGate(tableId, m)) {
+            await this.ctx.storage.put("tables", this.status.tables).catch(() => {});
+            return;
+          }
+          await this.maybeGreet(tableId, m, true);
+        }
+      }
+      // Chat poll and move generation both start with a BGA fetch
+      // (chatHistory.html and the game-page HTML respectively). They're
+      // independent reads, so on every push past the bot's first move we
+      // run them in parallel — the chat-history round-trip used to add ~0.3-1s
+      // BEFORE the engine race even started, which was a real chunk of the
+      // "20s per move" the opponent felt. For the FIRST move we keep them
+      // serial so a difficulty keyword the opponent typed BEFORE the bot's
+      // first move can lock the level: maybePlayMove reads m.difficulty up
+      // front, and a parallel pollAndReplyChat could set it just *after*
+      // that read (the bot would play move 1 at grandmaster instead of the
+      // requested level). After move 1 the worst case is one move played at
+      // the previous level if a keyword arrived on the same push as the
+      // opponent's move — acceptable for the latency win.
+      if ((m.moveCount ?? 0) === 0) {
+        await this.pollAndReplyChat(tableId, m).catch(() => {});
+        await this.maybePlayMove(tableId, m, true);
+      } else {
+        await Promise.all([
+          this.pollAndReplyChat(tableId, m).catch(() => {}),
+          this.maybePlayMove(tableId, m, true),
+        ]);
+      }
+      // Push-driven finish: a push that arrives after a checkmate / opponent
+      // resignation flips the table to finished/asyncfinished/archive on
+      // BGA's side, but parseGameHtml returns null (no live gamestate) so
+      // maybePlayMove bails as "no-parse" and we'd otherwise sit waiting up
+      // to a full 5s poll tick before sending GG. When that signal fires
+      // (game-page no longer has live state, and we haven't said GG yet),
+      // pull the per-table snapshot and run the normal handleTable finish
+      // branch from it. That keeps tally / move-log capture / GG send in
+      // ONE code path instead of duplicating the logic.
+      if (
+        !m.saidGg
+        && !m.finished
+        && m.lastMoveAttempt?.result === "no-parse"
+      ) {
+        const ti = await this.client.getTableInfo(tableId).catch(() => null);
+        if (ti) await this.handleTable(ti).catch((e) => this.recordError("pushFinish", e, tableId));
+      }
       await this.ctx.storage.put("tables", this.status.tables).catch(() => {});
     } catch (e) {
       this.recordError("pushReact", e, tableId);
@@ -2032,12 +2110,42 @@ export class BotDriver extends DurableObject<Env> {
       }
     }
     // Garbage-collect memo for finished/conceded tables we no longer see.
+    // EXCEPT: hold finished (not conceded) memos that already sent GG for
+    // FEEDBACK_GRACE_MS so the off-snapshot feedback sweep below can keep
+    // polling chat for late "feedback ..." messages. Conceded games drop
+    // immediately — we never sent the prompt there.
     const liveIds = new Set(tables.map((t) => t.id));
     for (const id of Object.keys(this.status.tables)) {
       const m = this.status.tables[id];
       if (!liveIds.has(id) && (m.finished || m.conceded)) {
+        if (
+          m.finished
+          && !m.conceded
+          && m.saidGg
+          && m.finishedAt != null
+          && Date.now() - m.finishedAt < FEEDBACK_GRACE_MS
+        ) continue;
         delete this.status.tables[id];
       }
+    }
+    // Off-snapshot feedback sweep: poll chat on any finished+in-grace memo
+    // that BGA dropped from `myTables` so a late "feedback ..." message still
+    // reaches persistChatFeedback. pollAndReplyChat is safe to call directly
+    // — it only needs the tableId and a logged-in client. Cheap (one
+    // chatHistory GET per in-grace table) and bounded by FEEDBACK_GRACE_MS.
+    for (const [id, m] of Object.entries(this.status.tables)) {
+      if (liveIds.has(id)) continue;
+      if (!m.finished || m.conceded || !m.saidGg) continue;
+      if (m.finishedAt == null) continue;
+      if (Date.now() - m.finishedAt >= FEEDBACK_GRACE_MS) continue;
+      // Per-table cooldown so 50 in-grace finished tables don't fire 50
+      // chatHistory GETs every tick for the next 24h.
+      if (
+        m.lastFeedbackPollAt != null
+        && Date.now() - m.lastFeedbackPollAt < FEEDBACK_POLL_INTERVAL_MS
+      ) continue;
+      m.lastFeedbackPollAt = Date.now();
+      await this.pollAndReplyChat(id, m).catch(() => {});
     }
     // Sweep no-interaction orphan memos. getMemo() stamps a memo the moment
     // handleTable touches ANY snapshot table, but several handleTable paths
@@ -3062,20 +3170,22 @@ export class BotDriver extends DurableObject<Env> {
       if (m.realtime == null) m.realtime = t.status === "play";
       // Async games never went through the ackedStart branch above.
       if (!m.ackedStart) m.ackedStart = true;
-      // resolve gameserver number once we're live
+      // resolve gameserver number once we're live. Use the combined endpoint
+      // that returns gameserver + the page HTML so we can refresh opponent
+      // language for the greeting in ONE BGA round-trip instead of two
+      // (resolveGameserver + fetchGamePage). Saves ~0.5-1s off greeting
+      // latency, which used to feel close to a minute end-to-end.
       if (m.gameserver == null) {
-        const gs = await this.client.resolveGameserver(t.id).catch(() => null);
-        if (gs != null) m.gameserver = gs;
+        const r = await this.client.resolveGameserverWithPage(t.id).catch(() => null);
+        if (r) {
+          m.gameserver = r.gs;
+          this.refreshOpponent(m, r.html);
+        }
       }
-      // Greet once. Detect the opponent's interface language from the game
-      // page first so the greeting (and every later message) is in their
-      // language. Deferred until gameserver resolves so we can fetch the
-      // page; one extra fetch per game is negligible.
+      // Greet once. Language already came in with the gameserver-resolution
+      // fetch above (oppLanguage is set), so maybeGreet does not need its own
+      // page fetch.
       if (!m.saidHi && m.gameserver != null) {
-        try {
-          const html = await this.client.fetchGamePage(m.gameserver, t.id);
-          this.refreshOpponent(m, html);
-        } catch { /* fall back to English */ }
         // Premium gate runs BEFORE the greeting: a free member bounced off a
         // limited resource gets the upgrade nudge, not a "good luck" opener.
         if (await this.enforcePremiumGate(t.id, m)) return;
@@ -3221,8 +3331,23 @@ export class BotDriver extends DurableObject<Env> {
         );
         m.saidGg = true;
       }
+      // Stamp finishedAt ONCE so the FEEDBACK_GRACE_MS clock starts on first
+      // finished sighting, not whenever this branch most recently ran.
+      if (!m.finished) m.finishedAt = Date.now();
       m.finished = true;
-      m.finishedAt = Date.now();
+      // Late-feedback channel: opponent often types "feedback ..." after the
+      // GG prompt, which used to land in a finished table that handleTable
+      // no longer polled (chat-reply lived only in the in-play branch). Keep
+      // listening for FEEDBACK_GRACE_MS post-finish. Same pollAndReplyChat
+      // path the live branch uses, so feedback hits persistChatFeedback and
+      // the Discord webhook the same way.
+      if (
+        m.saidGg
+        && m.finishedAt != null
+        && Date.now() - m.finishedAt < FEEDBACK_GRACE_MS
+      ) {
+        await this.pollAndReplyChat(t.id, m).catch(() => {});
+      }
       return;
     }
   }
@@ -3726,7 +3851,9 @@ export class BotDriver extends DurableObject<Env> {
       } catch (e) {
         this.recordError("declineDraw", e, tableId);
       }
-      await this.client.wakeup(m.gameserver, tableId).catch(() => {});
+      // Wakeup is a fire-and-forget nudge — see the analogous selectCell+
+      // wakeup pair at the end of maybePlayMove for the rationale.
+      this.ctx.waitUntil(this.client.wakeup(m.gameserver, tableId).catch(() => {}));
       if (declined) {
         // Explain the decline once per offer. Gated on saidDrawDecline
         // (cleared when the game leaves the draw state) so a draw that stays
@@ -3777,7 +3904,8 @@ export class BotDriver extends DurableObject<Env> {
         throw e;
       }
       m.lastTurn = "opp";
-      await this.client.wakeup(m.gameserver, tableId).catch(() => {});
+      // Wakeup is a fire-and-forget nudge — see end of maybePlayMove.
+      this.ctx.waitUntil(this.client.wakeup(m.gameserver, tableId).catch(() => {}));
       m.awaitingOppMove = true;
       m.awaitingOppSince = Date.now();
       m.lastMoveAttempt = {
@@ -4090,7 +4218,11 @@ export class BotDriver extends DurableObject<Env> {
     // the gallery shows "bot to move" until the next tick after the lag
     // closes (often 5-30s).
     m.lastTurn = "opp";
-    await this.client.wakeup(m.gameserver, tableId).catch(() => {});
+    // Fire-and-forget the wakeup nudge: BGA already accepted selectCell, so
+    // we don't need wakeup's ack before returning. Awaiting it added another
+    // BGA round-trip (~300-700ms) to every move; ctx.waitUntil keeps the
+    // request alive past return so Workers doesn't cancel it.
+    this.ctx.waitUntil(this.client.wakeup(m.gameserver, tableId).catch(() => {}));
     m.awaitingOppMove = true;
     m.awaitingOppSince = Date.now();
     m.lastMoveAttempt = {
