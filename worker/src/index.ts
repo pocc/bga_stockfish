@@ -403,6 +403,12 @@ function landingHtml(): string {
   .card { background: var(--code-bg); padding: 10px 12px; border-radius: 6px; }
   .card .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
   .card .val { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  /* Stat cards double as a single-select outcome filter (all/live/win/loss/
+     draw). Clickable cards get a hover lift; the active one gets an accent
+     inset ring so the current filter is obvious at a glance. */
+  .card.clickable { cursor: pointer; transition: background 0.12s ease, box-shadow 0.12s ease; }
+  .card.clickable:hover { background: var(--rule); }
+  .card.sel { background: var(--rule); box-shadow: inset 0 0 0 2px var(--accent); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
@@ -411,6 +417,23 @@ function landingHtml(): string {
   .err { color: var(--err); }
   .draw { color: var(--draw); }
   .muted { color: var(--muted); }
+  /* Difficulty 1-6 gradient (beginner → grandmaster) so the Difficulty / LVL
+     column reads as an ordered strength axis at a glance. Same red→yellow→
+     green vibe as win/loss, just spread across six steps instead of three. */
+  .lvl1 { color: #c0392b; }
+  .lvl2 { color: #d96a3c; }
+  .lvl3 { color: #b88a1a; }
+  .lvl4 { color: #7a9c2e; }
+  .lvl5 { color: #2c7a3a; }
+  .lvl6 { color: #1d5e2a; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    .lvl1 { color: #e87968; }
+    .lvl2 { color: #ea9168; }
+    .lvl3 { color: #e0c64a; }
+    .lvl4 { color: #9fc25e; }
+    .lvl5 { color: #6ec27a; }
+    .lvl6 { color: #4ca85c; font-weight: 600; }
+  }
   .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; background: var(--code-bg); font-size: 11px; }
   .pill.btn { cursor: pointer; user-select: none; border: 1px solid transparent; }
   .pill.btn.on { border-color: var(--accent); color: var(--accent); }
@@ -493,8 +516,15 @@ function landingHtml(): string {
   .pie-legend table { width: 100%; }
   .pie-legend td { padding: 4px 6px; border-bottom: 1px solid var(--rule); vertical-align: middle; }
   .pie-sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
-  .pie-svg path { transition: opacity 0.12s ease; }
-  .pie-svg path:hover { opacity: 0.7; cursor: default; }
+  .pie-svg path, .pie-svg circle { transition: opacity 0.12s ease; cursor: pointer; }
+  .pie-svg path:hover, .pie-svg circle:hover { opacity: 0.75; }
+  .pie-svg.has-active path:not(.active), .pie-svg.has-active circle:not(.active) { opacity: 0.25; }
+  .pie-legend tr.clickable { cursor: pointer; }
+  .pie-legend tr.clickable:hover { background: var(--code-bg); }
+  .pie-legend tr.active td { background: var(--code-bg); font-weight: 600; }
+  .filter-chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 12px; background: var(--code-bg); border: 1px solid var(--rule); font-size: 11px; margin: 0 6px 6px 0; }
+  .filter-chip .x { cursor: pointer; color: var(--muted); font-weight: 600; padding: 0 2px; }
+  .filter-chip .x:hover { color: var(--err); }
   /* 2-col grid for the three summary charts: language spans 2 rows on the
      left (lots of entries), engine + membership stack on the right. Tight
      pie sizing inside the grid so legend + pie still fit side-by-side. */
@@ -530,19 +560,6 @@ function landingHtml(): string {
   </div>
   <p class="sub">Autonomous chess bot on <a href="https://boardgamearena.com" target="_blank" rel="noopener">Board Game Arena</a>. Friendly games only. <span id="ticked" class="muted"></span></p>
 
-  <h2>Stats</h2>
-  <div class="row" id="diff-tabs" style="margin: 0 0 10px; gap: 6px;">
-    <span id="diff-all" class="pill btn" onclick="setDiff('all')">All</span>
-    <span id="diff-grandmaster" class="pill btn on" onclick="setDiff('grandmaster')" title="Default difficulty">Grandmaster*</span>
-    <span id="diff-expert" class="pill btn" onclick="setDiff('expert')">Expert</span>
-    <span id="diff-advanced" class="pill btn" onclick="setDiff('advanced')">Advanced</span>
-    <span id="diff-intermediate" class="pill btn" onclick="setDiff('intermediate')">Intermediate</span>
-    <span id="diff-easy" class="pill btn" onclick="setDiff('easy')">Easy</span>
-    <span id="diff-beginner" class="pill btn" onclick="setDiff('beginner')">Beginner</span>
-  </div>
-  <div class="cards" id="stats"></div>
-  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">* default difficulty — full grandmaster-strength Stockfish (the remote engine race)</p>
-
   <h2>Bot rules</h2>
   <ul style="padding-left: 22px; margin: 0; font-size: 13px;">
     <li>Friendly games only. Ranked invites declined.</li>
@@ -554,26 +571,21 @@ function landingHtml(): string {
     <li>After 3 consecutive errors on a table, sends a polite concession message and resigns.</li>
   </ul>
 
-  <div id="feedback-box" style="margin-top: 14px; padding: 12px 14px; background: var(--code-bg); border-radius: 6px;">
-    <label for="feedback-msg" style="display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px;">Feedback<span id="feedback-count" style="margin-left: 6px;"></span></label>
-    <p class="sub" style="margin: 0 0 8px; font-size: 12px;">Bug? Suggestion? Drop a note. Optional contact field if you'd like a reply.</p>
-    <textarea id="feedback-msg" rows="3" maxlength="2000" placeholder="Your feedback…" style="width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 4px; resize: vertical;"></textarea>
-    <div class="row" style="margin-top: 8px; gap: 8px;">
-      <input id="feedback-contact" type="text" maxlength="200" placeholder="Contact (optional: email, BGA handle, etc.)" style="flex: 1; min-width: 0; padding: 6px 10px; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 4px;">
-      <a href="javascript:submitFeedback()" id="feedback-submit" class="pill btn on">Send</a>
-      <span id="feedback-status" class="muted" style="font-size: 11px;"></span>
-    </div>
+  <h2>Stats</h2>
+  <div class="row" id="diff-tabs" style="margin: 0 0 10px; gap: 6px;">
+    <span id="diff-all" class="pill btn on" onclick="setDiff('all')">All</span>
+    <span id="diff-grandmaster" class="pill btn" onclick="setDiff('grandmaster')">Grandmaster</span>
+    <span id="diff-expert" class="pill btn" onclick="setDiff('expert')">Expert</span>
+    <span id="diff-advanced" class="pill btn" onclick="setDiff('advanced')">Advanced</span>
+    <span id="diff-intermediate" class="pill btn" onclick="setDiff('intermediate')">Intermediate</span>
+    <span id="diff-easy" class="pill btn" onclick="setDiff('easy')">Easy</span>
+    <span id="diff-beginner" class="pill btn" onclick="setDiff('beginner')">Beginner</span>
   </div>
+  <div class="cards" id="stats"></div>
+  <p id="stats-scope" class="sub" style="margin: 6px 0 0; font-size: 11px; color: var(--accent);"></p>
+  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">Default difficulty is grandmaster-strength Stockfish, but players can set a lower difficulty with chat. The selected level filters every section below — stats, games, moves, pies, and past games.</p>
 
-  <h2 style="margin-bottom: 6px;">Active games</h2>
-  <div class="row" style="margin: 0 0 12px;">
-    <span id="gmode-gallery" class="pill btn" onclick="setGamesMode('gallery')">♞ gallery</span>
-    <span id="gmode-table" class="pill btn" onclick="setGamesMode('table')">≡ table</span>
-  </div>
-  <div id="games" class="muted">…</div>
-
-  <h2>Open invites</h2>
-  <div id="invites" class="muted">…</div>
+  <div id="filter-chip" style="margin-top: 12px;"></div>
 
   <div class="chart-grid">
     <section class="cg-tall">
@@ -591,6 +603,16 @@ function landingHtml(): string {
     </section>
   </div>
 
+  <h2 style="margin-bottom: 6px;">Active games</h2>
+  <div class="row" style="margin: 0 0 12px;">
+    <span id="gmode-gallery" class="pill btn" onclick="setGamesMode('gallery')">♞ gallery</span>
+    <span id="gmode-table" class="pill btn" onclick="setGamesMode('table')">≡ table</span>
+  </div>
+  <div id="games" class="muted">…</div>
+
+  <h2>Open invites</h2>
+  <div id="invites" class="muted">…</div>
+
   <h2>Recent moves</h2>
   <p class="sub" style="margin: -2px 0 10px;">Parallel engine race, winner picked by precedence: lichess-cloud-eval · stockfish.online · chess-api.com · rapidapi-stockfish-16 · stockfish-container · js-chess-engine (local DO) · random legal move.</p>
   <div id="moves" class="muted">…</div>
@@ -598,6 +620,17 @@ function landingHtml(): string {
   <h2>Past Games</h2>
   <p class="sub" style="margin: -2px 0 10px;">Before each opponent: <span class="premdot">●</span> BGA Premium member · <span class="freedot">○</span> free member.</p>
   <div id="results" class="muted">…</div>
+
+  <div id="feedback-box" style="margin-top: 24px; padding: 12px 14px; background: var(--code-bg); border-radius: 6px;">
+    <label for="feedback-msg" style="display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px;">Feedback<span id="feedback-count" style="margin-left: 6px;"></span></label>
+    <p class="sub" style="margin: 0 0 8px; font-size: 12px;">Bug? Suggestion? Drop a note. Optional contact field if you'd like a reply.</p>
+    <textarea id="feedback-msg" rows="3" maxlength="2000" placeholder="Your feedback…" style="width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 4px; resize: vertical;"></textarea>
+    <div class="row" style="margin-top: 8px; gap: 8px;">
+      <input id="feedback-contact" type="text" maxlength="200" placeholder="Contact (optional: email, BGA handle, etc.)" style="flex: 1; min-width: 0; padding: 6px 10px; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 4px;">
+      <a href="javascript:submitFeedback()" id="feedback-submit" class="pill btn on">Send</a>
+      <span id="feedback-status" class="muted" style="font-size: 11px;"></span>
+    </div>
+  </div>
 
   <h2>Technical details</h2>
   <details>
@@ -876,33 +909,82 @@ function render(s) {
   document.getElementById("languages").innerHTML = renderLanguages(s.recentResults);
   document.getElementById("premium").innerHTML = renderPremium(s.recentResults);
   document.getElementById("errors").innerHTML = renderErrors(s.recentErrors);
+  document.getElementById("filter-chip").innerHTML = renderFilterChip();
 }
 
-function card(label, val, cls, suffix) {
+// A stat card. When outcomeKey is given the card becomes a clickable
+// outcome filter (setOutcome) and highlights itself when it's the active one.
+function card(label, val, cls, suffix, outcomeKey) {
   const sub = suffix
     ? ' <span class="muted" style="font-size: 13px; font-weight: 400;">' + esc(suffix) + '</span>'
     : '';
-  return '<div class="card"><div class="label">' + esc(label) + '</div><div class="val ' + (cls||'') + '">' + esc(val) + sub + '</div></div>';
+  let attrs = ' class="card"';
+  if (outcomeKey != null) {
+    const sel = selectedOutcome === outcomeKey;
+    const title = outcomeKey === "all"
+      ? "Show all games"
+      : "Filter to " + outcomeKey + " games";
+    attrs = ' class="card clickable' + (sel ? " sel" : "") + '"'
+      + ' role="button" tabindex="0" aria-pressed="' + sel + '"'
+      + ' title="' + esc(title) + '"'
+      + ' onclick="setOutcome(&#39;' + outcomeKey + '&#39;)"';
+  }
+  return '<div' + attrs + '><div class="label">' + esc(label) + '</div><div class="val ' + (cls||'') + '">' + esc(val) + sub + '</div></div>';
 }
 
 // Difficulty filter for the Stats cards. "all" = lifetime aggregate; the
 // rest read per-difficulty counters (stats.byDifficulty) plus live tables
-// whose memo difficulty matches. Default is grandmaster — the bot's name
-// is bot_stockfish, so the full-Stockfish tier is the headline view.
+// whose memo difficulty matches. Default is "all" so the headline view is
+// the lifetime aggregate, not a single tier.
 const DIFF_KEYS = ["all", "grandmaster", "expert", "advanced", "intermediate", "easy", "beginner"];
-let selectedDiff = "grandmaster";
-function setDiff(d) {
-  selectedDiff = DIFF_KEYS.includes(d) ? d : "grandmaster";
-  syncDiffButtons();
-  // The games panel is now difficulty-filtered too (selectedLiveIds), so it
-  // must repaint on a tab change — and the page index may overshoot the
-  // smaller filtered set, so reset to page 1.
-  gamesPage = 1;
-  if (window.__lastStatus) {
-    renderStats(window.__lastStatus);
-    document.getElementById("games").innerHTML = renderGames(window.__lastStatus);
-  }
+let selectedDiff = "all";
+
+// Outcome filter, driven by clicking the Stats cards. Single-select over game
+// state: "live" (currently playing) or a finished tally (win/loss/draw).
+// "all" (the Total games card) clears it. Like the difficulty tab, this is a
+// GLOBAL scope filter — it constrains every section below Stats — as opposed
+// to the per-pie slice chips in activeFilters.
+const OUTCOME_KEYS = ["all", "live", "win", "loss", "draw"];
+let selectedOutcome = "all";
+
+// Repaint every filter-sensitive section from a status snapshot. Shared by
+// the difficulty tab, the outcome cards, and the pie-slice filters so they
+// can't drift out of sync.
+function repaintFiltered(s) {
+  renderStats(s);
+  document.getElementById("games").innerHTML = renderGames(s);
+  document.getElementById("moves").innerHTML = renderMoves(s.recentMoves);
+  document.getElementById("results").innerHTML = renderResults(s.recentResults);
+  const nonEl = document.getElementById("nonresults");
+  if (nonEl) nonEl.innerHTML = renderNonResults(s.recentResults);
+  document.getElementById("engines").innerHTML = renderEngines((s.stats || {}).engineUses);
+  document.getElementById("languages").innerHTML = renderLanguages(s.recentResults);
+  document.getElementById("premium").innerHTML = renderPremium(s.recentResults);
+  const chip = document.getElementById("filter-chip");
+  if (chip) chip.innerHTML = renderFilterChip();
 }
+
+function setDiff(d) {
+  selectedDiff = DIFF_KEYS.includes(d) ? d : "all";
+  syncDiffButtons();
+  // The diff tab is a master filter — every section below Stats is
+  // difficulty-filtered. Reset page indexes for paginated sections because
+  // the smaller filtered set will likely overshoot the current page.
+  gamesPage = 1; movesPage = 1; resultsPage = 1; nonResultsPage = 1;
+  const s = window.__lastStatus;
+  if (s) repaintFiltered(s);
+}
+
+// Toggle the outcome filter from a Stats card. Re-clicking the active card
+// (other than the "all"/Total reset) clears back to "all".
+function setOutcome(o) {
+  o = OUTCOME_KEYS.includes(o) ? o : "all";
+  selectedOutcome = (o === selectedOutcome && o !== "all") ? "all" : o;
+  gamesPage = 1; movesPage = 1; resultsPage = 1; nonResultsPage = 1;
+  const s = window.__lastStatus;
+  if (s) repaintFiltered(s);
+}
+
 function syncDiffButtons() {
   for (const k of DIFF_KEYS) {
     const el = document.getElementById("diff-" + k);
@@ -917,16 +999,82 @@ function liveDifficulty(memo, id) {
   return m.effectiveDifficulty || m.difficulty || "grandmaster";
 }
 
+// Per-row difficulty for the master diff tab filter. Recent moves carry
+// the difficulty field directly; finished games default unrecorded entries
+// to "grandmaster" (matches the Past Games "Difficulty" column). Returns
+// true when no filter is active.
+function moveMatchesDiff(m) {
+  if (selectedDiff === "all") return true;
+  return (m.difficulty || "grandmaster") === selectedDiff;
+}
+function resultMatchesDiff(r) {
+  if (selectedDiff === "all") return true;
+  return (r.difficulty || "grandmaster") === selectedDiff;
+}
+
+// Outcome filter (Stats cards). A finished result matches its own tally; it
+// is never "live". A move matches via the per-table lookup: "live" when its
+// game is currently being played, otherwise the finished tally of its game.
+function resultMatchesOutcome(r) {
+  if (selectedOutcome === "all") return true;
+  if (selectedOutcome === "live") return false;
+  return r.tally === selectedOutcome;
+}
+function moveMatchesOutcome(m, lookup) {
+  if (selectedOutcome === "all") return true;
+  const info = lookup[m.tableId] || {};
+  if (selectedOutcome === "live") return !!info.live;
+  return info.tally === selectedOutcome;
+}
+// Empty-state label for a section the outcome filter just emptied.
+function outcomeEmptyLabel() {
+  if (selectedOutcome === "live") return "no finished games (viewing live)";
+  const noun = selectedOutcome === "win" ? "wins"
+    : selectedOutcome === "loss" ? "losses"
+    : selectedOutcome === "draw" ? "draws" : "games";
+  return "no " + noun + (selectedDiff !== "all" ? " at this difficulty" : "");
+}
+
+// Win/loss/draw for the Stats cards when a pie filter (language / engine /
+// membership) is active. BGA keeps lifetime tallies only by difficulty
+// (byDifficulty), so for those dims there is no server aggregate to read —
+// recompute from the SAME recentResults window Past Games + the pies use, so
+// every number on screen agrees. Difficulty + the pie chips are applied;
+// outcome (the cards themselves) is intentionally NOT, so all four W/L/D/Live
+// cards stay visible toggles rather than self-zeroing when one is selected.
+function filteredScoredTally(s) {
+  const lookup = buildTableLookup(s);
+  const t = { wins: 0, losses: 0, draws: 0 };
+  for (const r of s.recentResults || []) {
+    if (!isScored(r)) continue;
+    if (selectedDiff !== "all" && !resultMatchesDiff(r)) continue;
+    if (!resultMatchesFilter(r, lookup)) continue;
+    if (r.tally === "win") t.wins++;
+    else if (r.tally === "loss") t.losses++;
+    else if (r.tally === "draw") t.draws++;
+  }
+  return t;
+}
+
 function renderStats(s) {
   const st = s.stats || { wins: 0, losses: 0, draws: 0, concedes: 0, engineUses: {}, byDifficulty: {} };
-  // "Live" uses the SAME difficulty-filtered set the gallery/table renders
+  // "Live" uses the SAME fully-filtered set the gallery/table renders
   // (selectedLiveIds), so the "Live games" count can never disagree with the
   // number of cards shown below it. "Total" = BGA-scored games (wins+losses+
   // draws) plus those live tables. Concedes are excluded (mostly error/
-  // abandoned states). "all" is the lifetime aggregate.
+  // abandoned states).
   const { live: liveIds } = selectedLiveIds(s);
+  // Source of the W/L/D counts, widest-aggregate first:
+  //   • a pie filter active → recompute from the recent window (no lifetime
+  //     aggregate exists for language/engine/membership);
+  //   • else a difficulty tab → lifetime byDifficulty counter;
+  //   • else → lifetime aggregate.
+  const recompute = hasAnyFilter();
   let wins, losses, draws;
-  if (selectedDiff === "all") {
+  if (recompute) {
+    const t = filteredScoredTally(s);
+    wins = t.wins; losses = t.losses; draws = t.draws;
+  } else if (selectedDiff === "all") {
     wins = st.wins || 0; losses = st.losses || 0; draws = st.draws || 0;
   } else {
     const bd = (st.byDifficulty || {})[selectedDiff] || { wins: 0, losses: 0, draws: 0 };
@@ -935,14 +1083,21 @@ function renderStats(s) {
   const liveTables = liveIds.length;
   const pastGames = wins + losses + draws;
   const totalGames = pastGames + liveTables;
-  const winPct = pastGames > 0 ? "(" + Math.round(wins * 100 / pastGames) + "%)" : null;
+  const pct = n => pastGames > 0 ? "(" + Math.round(n * 100 / pastGames) + "%)" : null;
   document.getElementById("stats").innerHTML = [
-    card("Total games", totalGames),
-    card("Live games", liveTables),
-    card("Wins", wins, "ok", winPct),
-    card("Losses", losses, "err"),
-    card("Draws", draws, "draw"),
+    card("Total games", totalGames, "", null, "all"),
+    card("Live games", liveTables, "", null, "live"),
+    card("Wins", wins, "ok", pct(wins), "win"),
+    card("Losses", losses, "err", pct(losses), "loss"),
+    card("Draws", draws, "draw", pct(draws), "draw"),
   ].join("");
+  // Flag the scope shift so the headline numbers aren't misread as lifetime.
+  const scope = document.getElementById("stats-scope");
+  if (scope) {
+    scope.innerHTML = recompute
+      ? "Counts above are over the filtered recent-games window. BGA keeps lifetime tallies only by difficulty, not by language / engine / membership."
+      : "";
+  }
   syncDiffButtons();
 }
 
@@ -1039,17 +1194,67 @@ function liveGameIds(s) {
   return { live, memo, seen };
 }
 
-// Live game ids honoring the active difficulty tab. Both the Stats "Live
-// games" card and the gallery/table render from THIS set so the count and the
-// cards always agree (the bug where Stats showed 5 grandmaster games while the
-// gallery rendered all 9). "all" returns every live game; a specific tier
-// returns only games being played at that tier. The "hidden" count is how
-// many live games the current filter is suppressing, so the panel can hint.
+// Whether a live game passes the outcome filter (Stats cards). A live game has
+// no finished win/loss/draw tally, so it belongs only to the "all" and "live"
+// outcomes — selecting Wins/Losses/Draws empties the live panel, mirroring how
+// those same cards empty Past Games of its rows. Independent of the table id.
+function liveMatchesOutcome() {
+  return selectedOutcome === "all" || selectedOutcome === "live";
+}
+
+// Whether a live game passes the pie-slice chips (language / engine / premium),
+// AND across dims. Language + membership come from the table memo, engine from
+// the recorded moves — both surfaced through the shared per-table lookup, the
+// same source Past Games uses (resultMatchesFilter), so a live game and a
+// finished game match a given chip on identical criteria.
+function liveMatchesFilter(id, lookup) {
+  if (!hasAnyFilter()) return true;
+  const info = lookup[id] || {};
+  for (const dim of Object.keys(activeFilters)) {
+    const key = activeFilters[dim];
+    if (dim === "engine") {
+      if (!info.engines || !info.engines.has(key)) return false;
+    } else if (dim === "language") {
+      if (info.oppLanguage !== key) return false;
+    } else if (dim === "premium") {
+      const want = key === "Premium" ? true : key === "Free" ? false : null;
+      if (info.oppPremium !== want) return false;
+    }
+  }
+  return true;
+}
+
+// Live game ids honoring the FULL filter stack — difficulty tab, outcome cards,
+// and pie-slice chips — so the Active-games panel is filtered by any
+// combination, exactly like Past Games. Both the Stats "Live games" card and
+// the gallery/table render from THIS set so the count and the cards always
+// agree (the bug where Stats showed 5 grandmaster games while the gallery
+// rendered all 9). The "hidden" count is how many live games the active
+// filters are suppressing, so the panel can hint.
 function selectedLiveIds(s) {
   const { live, memo, seen } = liveGameIds(s);
-  if (selectedDiff === "all") return { live, memo, seen, hidden: 0 };
-  const filtered = live.filter(id => liveDifficulty(memo, id) === selectedDiff);
+  if (selectedDiff === "all" && selectedOutcome === "all" && !hasAnyFilter()) {
+    return { live, memo, seen, hidden: 0 };
+  }
+  const lookup = hasAnyFilter() ? buildTableLookup(s) : {};
+  const filtered = live.filter(id =>
+    (selectedDiff === "all" || liveDifficulty(memo, id) === selectedDiff)
+    && liveMatchesOutcome()
+    && liveMatchesFilter(id, lookup),
+  );
   return { live: filtered, memo, seen, hidden: live.length - filtered.length };
+}
+
+// Live ids for the pie INDEX: difficulty-filtered only, never narrowed by the
+// pie-slice chips (so each pie stays the full set you click to filter from),
+// matching scopedResults for finished games. Used when the "live" outcome card
+// sources the language / membership pies from live memos.
+function scopedLiveIds(s) {
+  const { live, memo } = liveGameIds(s);
+  const filtered = selectedDiff === "all"
+    ? live
+    : live.filter(id => liveDifficulty(memo, id) === selectedDiff);
+  return { live: filtered, memo };
 }
 
 // Page size by view: gallery is image-heavy so fewer per page; table is
@@ -1061,6 +1266,174 @@ const RESULTS_PAGE_SIZE = 10;
 const NONRESULTS_PAGE_SIZE = 10;
 const MOVES_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 let gamesPage = 1, movesPage = 1, errorsPage = 1, resultsPage = 1, nonResultsPage = 1;
+
+// Click-to-filter on the summary pies. Filters stack across dimensions —
+// one key per dim ("language", "engine", "premium") held simultaneously.
+// Clicking the same slice in a dim clears that dim's filter; clicking a
+// different slice in the same dim replaces it; clicking a slice in another
+// dim adds to the active set. A row passes only if EVERY active dim matches
+// (AND across dims). The pies themselves are not filtered (they stay as the
+// index so you can switch slices) but each pie highlights its own active
+// slice and dims the rest.
+let activeFilters = {};
+function hasAnyFilter() { return Object.keys(activeFilters).length > 0; }
+
+// Build a setFilter(...) call as JS source safe to drop inside a
+// double-quoted HTML attribute. Backslashes and single quotes in the key
+// get JS-escaped; HTML-special chars in the resulting JS source get
+// entity-escaped so the attribute parser doesn't see them.
+function filterCall(dim, key) {
+  const k = String(key).replace(/\\\\/g, "\\\\\\\\").replace(/'/g, "\\\\'");
+  return "setFilter(&#39;" + dim + "&#39;,&#39;" + k.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;") + "&#39;)";
+}
+function setFilter(dim, key) {
+  if (activeFilters[dim] === key) {
+    delete activeFilters[dim];
+  } else {
+    activeFilters[dim] = key;
+  }
+  movesPage = 1; resultsPage = 1; nonResultsPage = 1;
+  const s = window.__lastStatus;
+  if (s) repaintFiltered(s);
+}
+function clearAllFilters() {
+  if (selectedDiff === "all" && selectedOutcome === "all" && !hasAnyFilter()) return;
+  selectedDiff = "all";
+  selectedOutcome = "all";
+  activeFilters = {};
+  gamesPage = 1; movesPage = 1; resultsPage = 1; nonResultsPage = 1;
+  syncDiffButtons();
+  const s = window.__lastStatus;
+  if (s) repaintFiltered(s);
+}
+function filterKeyLabelHtml(dim, key) {
+  if (dim === "language") return LANG_DISPLAY[key] || ('🏳️ ' + esc(key));
+  if (dim === "engine") return engineNameHtml(key);
+  if (dim === "premium") return '<span class="' + (key === "Premium" ? "ok" : "muted") + '">' + esc(key) + '</span>';
+  return esc(key);
+}
+function dimLabel(dim) {
+  return dim === "language" ? "language" : dim === "engine" ? "engine" : "membership";
+}
+// Human noun for an outcome key, used in the unified filter chip.
+function outcomeChipLabel(o) {
+  return o === "live" ? "live" : o === "win" ? "wins"
+    : o === "loss" ? "losses" : o === "draw" ? "draws" : o;
+}
+// One removable filter chip: "<dim> = <value> ✕". clearJs is the JS (already
+// HTML-attribute-escaped) the ✕ runs to clear just this one dimension.
+function filterChip(dimText, valueHtml, clearJs) {
+  return '<span class="filter-chip">'
+    + esc(dimText) + ' = ' + valueHtml
+    + ' <span class="x" onclick="' + clearJs + '" title="clear this filter">✕</span>'
+    + '</span>';
+}
+// The unified filter bar. EVERY active filter — the difficulty tab, the outcome
+// card, and each pie-slice chip — renders as one consistent, removable chip, so
+// the page has a single place that shows (and clears) what's constraining the
+// sections below. The tabs/cards/pies remain the click-to-add entry points and
+// keep their own highlight; this bar is the at-a-glance summary + per-dim ✕.
+function renderFilterChip() {
+  const chips = [];
+  if (selectedDiff !== "all") {
+    chips.push(filterChip("difficulty",
+      '<span class="mono ' + difficultyClass(selectedDiff) + '">' + esc(selectedDiff) + '</span>',
+      "setDiff(&#39;all&#39;)"));
+  }
+  if (selectedOutcome !== "all") {
+    chips.push(filterChip("showing", esc(outcomeChipLabel(selectedOutcome)),
+      "setOutcome(&#39;" + esc(selectedOutcome) + "&#39;)"));
+  }
+  for (const dim of Object.keys(activeFilters)) {
+    const key = activeFilters[dim];
+    chips.push(filterChip(dimLabel(dim), filterKeyLabelHtml(dim, key), filterCall(dim, key)));
+  }
+  if (chips.length === 0) return "";
+  const clearAll = chips.length > 1
+    ? ' <span class="filter-chip" style="cursor:pointer" onclick="clearAllFilters()" title="clear all filters">clear all</span>'
+    : '';
+  return chips.join("") + clearAll;
+}
+
+// Map tableId -> { oppLanguage, oppPremium, engines:Set, tally, live } from
+// finished games (recentResults), live game memos (s.tables), and recentMoves
+// (for engines). Lets moves and games be cross-filtered by any pie slice or by
+// the outcome cards, regardless of which data source they came from.
+function buildTableLookup(s) {
+  const lookup = {};
+  for (const r of s.recentResults || []) {
+    if (!r.tableId) continue;
+    const entry = lookup[r.tableId] || (lookup[r.tableId] = {});
+    if (r.oppLanguage != null) entry.oppLanguage = r.oppLanguage;
+    if (r.oppPremium != null) entry.oppPremium = r.oppPremium;
+    if (r.tally != null) entry.tally = r.tally;
+  }
+  const tables = s.tables || {};
+  for (const id of Object.keys(tables)) {
+    const m = tables[id] || {};
+    const entry = lookup[id] || (lookup[id] = {});
+    if (entry.oppLanguage == null && m.oppLanguage != null) entry.oppLanguage = m.oppLanguage;
+    if (entry.oppPremium == null && m.oppPremium != null) entry.oppPremium = m.oppPremium;
+  }
+  for (const mv of s.recentMoves || []) {
+    if (!mv.tableId || !mv.engine) continue;
+    const entry = lookup[mv.tableId] || (lookup[mv.tableId] = {});
+    (entry.engines || (entry.engines = new Set())).add(mv.engine);
+  }
+  // Flag currently-live tables so the "Live games" card can filter moves to
+  // games that are still being played.
+  for (const id of liveGameIds(s).live) {
+    (lookup[id] || (lookup[id] = {})).live = true;
+  }
+  return lookup;
+}
+
+// Whether a move row passes the active pie filters, AND across dims, skipping
+// exceptDim (pass null to apply all). exceptDim powers faceting: the engine pie
+// counts moves passing every OTHER dim while leaving engine free, so it stays
+// the index for its own dimension. Engine: exact match on the chosen engine
+// (cache:X counts as cache:X). Language/premium: via the tableId lookup; moves
+// whose game lacks the required dim are dropped.
+function moveMatchesFilterExcept(m, lookup, exceptDim) {
+  const info = lookup[m.tableId] || {};
+  for (const dim of Object.keys(activeFilters)) {
+    if (dim === exceptDim) continue;
+    const key = activeFilters[dim];
+    if (dim === "engine") {
+      if (m.engine !== key) return false;
+    } else if (dim === "language") {
+      if (info.oppLanguage !== key) return false;
+    } else if (dim === "premium") {
+      const want = key === "Premium" ? true : key === "Free" ? false : null;
+      if (info.oppPremium !== want) return false;
+    }
+  }
+  return true;
+}
+function moveMatchesFilter(m, lookup) { return moveMatchesFilterExcept(m, lookup, null); }
+
+// Same, for a finished-game row. exceptDim lets the language / membership pies
+// facet by every OTHER active filter while leaving their own dimension free.
+function resultMatchesFilterExcept(r, lookup, exceptDim) {
+  for (const dim of Object.keys(activeFilters)) {
+    if (dim === exceptDim) continue;
+    const key = activeFilters[dim];
+    if (dim === "language") {
+      if (r.oppLanguage !== key) return false;
+    } else if (dim === "premium") {
+      const want = key === "Premium" ? true : key === "Free" ? false : null;
+      if (r.oppPremium !== want) return false;
+    } else if (dim === "engine") {
+      // Engine is recorded per move, not per game. A game matches if any
+      // of its recorded moves used that engine.
+      const info = lookup[r.tableId];
+      if (!info || !info.engines || !info.engines.has(key)) return false;
+    }
+  }
+  return true;
+}
+function resultMatchesFilter(r, lookup) { return resultMatchesFilterExcept(r, lookup, null); }
+
 function setGamesPage(p) {
   gamesPage = Math.max(1, p | 0);
   if (window.__lastStatus) document.getElementById("games").innerHTML = renderGames(window.__lastStatus);
@@ -1120,15 +1493,15 @@ function paginate(arr, perPage, curPage) {
   return arr.slice(start, start + perPage);
 }
 
-// Banner shown above the games panel when a difficulty tab is hiding live
-// games played at other tiers, so a small "Live games: 5" next to 9 running
-// boards reads as a filter, not a bug. Click jumps to the "all" tab.
+// Banner shown above the games panel when active filters are hiding live
+// games, so a small "Live games: 5" next to 9 running boards reads as a filter,
+// not a bug. Covers any combination of difficulty / outcome / pie chips —
+// hidden is nonzero only when something is filtering. Click clears every filter.
 function liveFilterHint(hidden) {
-  if (selectedDiff === "all" || !hidden) return "";
+  if (!hidden) return "";
   return '<div class="muted" style="margin-bottom: 10px; font-size: 12px;">'
-    + 'showing <b>' + esc(selectedDiff) + '</b> games · '
-    + hidden + ' more live at other difficulties · '
-    + '<a href="javascript:setDiff(&#39;all&#39;)" class="pill">show all</a>'
+    + hidden + ' live game' + (hidden === 1 ? '' : 's') + ' hidden by active filters · '
+    + '<a href="javascript:clearAllFilters()" class="pill">clear filters</a>'
     + '</div>';
 }
 
@@ -1136,7 +1509,7 @@ function renderGamesTable(s) {
   const { live: all, memo, seen, hidden } = selectedLiveIds(s);
   if (all.length === 0) {
     return hidden
-      ? liveFilterHint(hidden) + "<span class='muted'>no live games at this difficulty</span>"
+      ? liveFilterHint(hidden) + "<span class='muted'>no live games match the active filters</span>"
       : "<span class='muted'>no live games</span>";
   }
   const perPage = GAMES_PAGE_SIZE.table;
@@ -1185,7 +1558,7 @@ function renderGamesGallery(s) {
   const { live: all, memo, seen, hidden } = selectedLiveIds(s);
   if (all.length === 0) {
     return hidden
-      ? liveFilterHint(hidden) + "<span class='muted'>no live games at this difficulty</span>"
+      ? liveFilterHint(hidden) + "<span class='muted'>no live games match the active filters</span>"
       : "<span class='muted'>no live games</span>";
   }
   const perPage = GAMES_PAGE_SIZE.gallery;
@@ -1499,13 +1872,30 @@ function difficultyLvl(diff) {
   if (diff == null) return "?";
   return DIFFICULTY_LVL[diff] != null ? String(DIFFICULTY_LVL[diff]) : "?";
 }
+/** CSS class name for color-coding a difficulty value 1-6. Returns "" for
+ *  unknown/legacy entries so they render in the default text color. */
+function difficultyClass(diff) {
+  if (diff == null) return "";
+  const n = DIFFICULTY_LVL[diff];
+  return n ? "lvl" + n : "";
+}
 
 function renderMoves(moves) {
   if (!moves || moves.length === 0) return "<span class='muted'>no moves yet</span>";
   // Drop moves older than 24h; keep newest first.
   const cutoff = Date.now() - MOVES_MAX_AGE_MS;
-  const all = moves.slice().reverse().filter(m => (m.ts || 0) >= cutoff);
+  let all = moves.slice().reverse().filter(m => (m.ts || 0) >= cutoff);
   if (all.length === 0) return "<span class='muted'>no moves in the last 24h</span>";
+  if (selectedDiff !== "all") {
+    all = all.filter(moveMatchesDiff);
+    if (all.length === 0) return "<span class='muted'>no moves at this difficulty in the last 24h</span>";
+  }
+  if (selectedOutcome !== "all" || hasAnyFilter()) {
+    const lookup = buildTableLookup(window.__lastStatus || {});
+    if (selectedOutcome !== "all") all = all.filter(m => moveMatchesOutcome(m, lookup));
+    if (hasAnyFilter()) all = all.filter(m => moveMatchesFilter(m, lookup));
+    if (all.length === 0) return "<span class='muted'>no moves match the active filters</span>";
+  }
   const recent = paginate(all, MOVES_PAGE_SIZE, movesPage);
   // Track which engines actually appeared in this window (from a live race
   // or as a cache-hit source) so dormant engines can stay hidden.
@@ -1575,12 +1965,13 @@ function renderMoves(moves) {
     // operator can see "expert" vs "advanced" without memorizing the scale.
     const lvl = difficultyLvl(m.difficulty);
     const lvlTitle = m.difficulty ? esc(m.difficulty) : "unknown (entry predates difficulty capture)";
+    const lvlClass = difficultyClass(m.difficulty);
     return '<tr>'
       + '<td class="muted">' + fmtTime(m.ts) + '</td>'
       + '<td>' + tableLink(m.tableId) + '</td>'
       + '<td class="mono">' + esc(m.from) + ' → ' + esc(m.to) + movePill + '</td>'
       + cells.join("")
-      + '<td class="mono" title="' + lvlTitle + '">' + esc(lvl) + '</td>'
+      + '<td class="mono ' + lvlClass + '" title="' + lvlTitle + '">' + esc(lvl) + '</td>'
       + '</tr>';
   }).join("");
   return legend
@@ -1623,9 +2014,22 @@ function renderResults(results) {
   // Only clean win/loss/draw games belong in Past Games; non-scored games
   // live in the "Non-scored games" troubleshooting table under Technical
   // details so they don't muddy the win-rate view.
-  const all = (results || []).filter(isScored).reverse();
+  let all = (results || []).filter(isScored).reverse();
   if (all.length === 0) {
     return "<span class='muted'>no finished games yet</span>";
+  }
+  if (selectedDiff !== "all") {
+    all = all.filter(resultMatchesDiff);
+    if (all.length === 0) return "<span class='muted'>no finished games at this difficulty yet</span>";
+  }
+  if (selectedOutcome !== "all") {
+    all = all.filter(resultMatchesOutcome);
+    if (all.length === 0) return "<span class='muted'>" + outcomeEmptyLabel() + "</span>";
+  }
+  if (hasAnyFilter()) {
+    const lookup = buildTableLookup(window.__lastStatus || {});
+    all = all.filter(r => resultMatchesFilter(r, lookup));
+    if (all.length === 0) return "<span class='muted'>no games match the active filters</span>";
   }
   // Newest first, paginated.
   const page = paginate(all, RESULTS_PAGE_SIZE, resultsPage);
@@ -1651,7 +2055,8 @@ function renderResults(results) {
     const lang = r.oppLanguage ? (LANG_DISPLAY[r.oppLanguage] || ('🏳️ ' + esc(r.oppLanguage))) : dash;
     const color = r.botColor ? '<span class="mono muted">' + esc(r.botColor) + '</span>' : dash;
     // Entries predating the difficulty feature are grandmaster by default.
-    const diff = '<span class="mono">' + esc(r.difficulty || "grandmaster") + '</span>';
+    const diffName = r.difficulty || "grandmaster";
+    const diff = '<span class="mono ' + difficultyClass(diffName) + '">' + esc(diffName) + '</span>';
     const moves = r.moveCount == null ? dash : '<span class="mono">' + esc(r.moveCount) + '</span>';
     const dur = r.durationMs == null ? dash : '<span class="mono">' + esc(fmtClock(r.durationMs / 1000)) + '</span>';
     // Live = realtime game (orange dot); blank for turn-based; dash if the
@@ -1666,14 +2071,14 @@ function renderResults(results) {
       + '<td>' + opp + '</td>'
       + '<td>' + lang + '</td>'
       + '<td>' + color + '</td>'
-      + '<td>' + diff + '</td>'
       + '<td>' + moves + '</td>'
       + '<td>' + dur + '</td>'
       + '<td>' + tallyLabel + '</td>'
+      + '<td>' + diff + '</td>'
       + '</tr>';
   }).join("");
   return '<table><thead><tr>'
-    + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Lang</th><th>Color</th><th>Difficulty</th><th>Moves</th><th>Duration</th><th>Tally</th>'
+    + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Lang</th><th>Color</th><th>Moves</th><th>Duration</th><th>Tally</th><th>Difficulty</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, RESULTS_PAGE_SIZE, resultsPage, "setResultsPage", "games");
 }
@@ -1715,9 +2120,22 @@ function nonResultReason(r) {
 // finishes. Kept out of Past Games (and the win-rate stats) but logged here so
 // odd terminations are auditable.
 function renderNonResults(results) {
-  const all = (results || []).filter(r => !isScored(r)).reverse();
+  let all = (results || []).filter(r => !isScored(r)).reverse();
   if (all.length === 0) {
     return "<span class='muted'>no non-scored games — every finished game was a clean win/loss/draw</span>";
+  }
+  if (selectedDiff !== "all") {
+    all = all.filter(resultMatchesDiff);
+    if (all.length === 0) return "<span class='muted'>no non-scored games at this difficulty</span>";
+  }
+  if (selectedOutcome !== "all") {
+    all = all.filter(resultMatchesOutcome);
+    if (all.length === 0) return "<span class='muted'>no non-scored games match this filter</span>";
+  }
+  if (hasAnyFilter()) {
+    const lookup = buildTableLookup(window.__lastStatus || {});
+    all = all.filter(r => resultMatchesFilter(r, lookup));
+    if (all.length === 0) return "<span class='muted'>no non-scored games match the active filters</span>";
   }
   const page = paginate(all, NONRESULTS_PAGE_SIZE, nonResultsPage);
   const dash = '<span class="muted">—</span>';
@@ -1729,7 +2147,8 @@ function renderNonResults(results) {
         : esc(oppNameDec))
       : dash;
     const reason = '<span class="pill warn" title="' + esc('status: ' + (r.status || "?")) + '">' + esc(nonResultReason(r)) + '</span>';
-    const diff = '<span class="mono">' + esc(r.difficulty || "grandmaster") + '</span>';
+    const diffName = r.difficulty || "grandmaster";
+    const diff = '<span class="mono ' + difficultyClass(diffName) + '">' + esc(diffName) + '</span>';
     const moves = r.moveCount == null ? dash : '<span class="mono">' + esc(r.moveCount) + '</span>';
     const dur = r.durationMs == null ? dash : '<span class="mono">' + esc(fmtClock(r.durationMs / 1000)) + '</span>';
     const live = r.realtime === true
@@ -1741,13 +2160,13 @@ function renderNonResults(results) {
       + '<td style="text-align:center">' + live + '</td>'
       + '<td>' + opp + '</td>'
       + '<td>' + reason + '</td>'
-      + '<td>' + diff + '</td>'
       + '<td>' + moves + '</td>'
       + '<td>' + dur + '</td>'
+      + '<td>' + diff + '</td>'
       + '</tr>';
   }).join("");
   return '<table><thead><tr>'
-    + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Reason</th><th>Difficulty</th><th>Moves</th><th>Duration</th>'
+    + '<th>When</th><th>Table</th><th title="Orange = realtime game">Live</th><th>Opponent</th><th>Reason</th><th>Moves</th><th>Duration</th><th>Difficulty</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>'
     + pager(all.length, NONRESULTS_PAGE_SIZE, nonResultsPage, "setNonResultsPage", "nonresults");
 }
@@ -1782,11 +2201,16 @@ const PIE_COLORS = [
 //   label(key)  -> legend-cell HTML for the slice (default: mono span)
 //   ariaLabel   -> SVG aria-label
 //   unit/unit1  -> plural / singular count noun (default "moves"/"move")
+//   dim         -> filter dimension name; when set, slices + legend rows become
+//                  clickable and call setFilter(dim, key) to toggle a global
+//                  filter that the moves/games tables read from.
 // Slices are sorted by count desc and coloured from PIE_COLORS.
 function pieChart(entries, opts) {
   opts = opts || {};
   const label = opts.label || (k => '<span class="mono">' + esc(k) + '</span>');
   const unit = opts.unit || "moves", unit1 = opts.unit1 || "move";
+  const dim = opts.dim || null;
+  const activeKey = dim && activeFilters[dim] != null ? activeFilters[dim] : null;
   const sorted = entries.slice().sort((a, b) => b[1] - a[1]);
   const total = sorted.reduce((s, [, n]) => s + n, 0);
   if (total === 0) return null;
@@ -1799,9 +2223,12 @@ function pieChart(entries, opts) {
     angle = a1;
     const color = PIE_COLORS[i % PIE_COLORS.length];
     const pct = (100 * frac).toFixed(1);
+    const isActive = k === activeKey;
+    const cls = isActive ? ' class="active"' : "";
+    const handler = dim ? ' onclick="' + filterCall(dim, k) + '"' : "";
     // Edge case: single 100% slice can't be drawn as an arc — use a circle.
     if (frac >= 0.9999) {
-      return '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '"><title>' + esc(k) + ' · ' + n + ' · 100%</title></circle>';
+      return '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + color + '"' + cls + handler + '><title>' + esc(k) + ' · ' + n + ' · 100%</title></circle>';
     }
     const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
     const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
@@ -1810,28 +2237,57 @@ function pieChart(entries, opts) {
       + " L " + x0.toFixed(2) + " " + y0.toFixed(2)
       + " A " + r + " " + r + " 0 " + largeArc + " 1 " + x1.toFixed(2) + " " + y1.toFixed(2)
       + " Z";
-    return '<path d="' + d + '" fill="' + color + '"><title>' + esc(k) + ' · ' + n + ' · ' + pct + '%</title></path>';
+    return '<path d="' + d + '" fill="' + color + '"' + cls + handler + '><title>' + esc(k) + ' · ' + n + ' · ' + pct + '%</title></path>';
   }).join("");
   const legend = sorted.map(([k, n], i) => {
     const pct = (100 * n / total).toFixed(1);
     const count = n === 1 ? "1 " + unit1 : esc(n) + " " + unit;
-    return '<tr>'
+    const isActive = k === activeKey;
+    const trCls = dim ? (isActive ? ' class="clickable active"' : ' class="clickable"') : "";
+    const handler = dim ? ' onclick="' + filterCall(dim, k) + '"' : "";
+    return '<tr' + trCls + handler + '>'
       + '<td><span class="pie-sw" style="background:' + PIE_COLORS[i % PIE_COLORS.length] + '"></span>' + label(k) + '</td>'
       + '<td class="right">' + count + '</td>'
       + '<td class="right muted">' + pct + '%</td>'
       + '</tr>';
   }).join("");
+  const svgCls = activeKey != null ? 'pie-svg has-active' : 'pie-svg';
   return '<div class="pie-wrap">'
-    + '<svg class="pie-svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="' + esc(opts.ariaLabel || "pie chart") + '">' + paths + '</svg>'
+    + '<svg class="' + svgCls + '" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="' + esc(opts.ariaLabel || "pie chart") + '">' + paths + '</svg>'
     + '<div class="pie-legend"><table><tbody>' + legend + '</tbody></table></div>'
     + '</div>';
 }
 
 function renderEngines(uses) {
-  const chart = pieChart(Object.entries(uses || {}), {
+  // The lifetime engineUses tally is keyed for "all". When difficulty, outcome,
+  // or a non-engine pie filter (language / membership) is active we re-count
+  // from recentMoves instead, since byDifficulty carries no engine breakdown and
+  // engineUses isn't sliced by outcome / language / membership. The pie facets
+  // by every OTHER filter but leaves its own engine dim free, so it stays the
+  // index. Cost is one pass of a small array.
+  const otherDimsActive = Object.keys(activeFilters).some(d => d !== "engine");
+  let entries;
+  if (selectedDiff === "all" && selectedOutcome === "all" && !otherDimsActive) {
+    entries = Object.entries(uses || {});
+  } else {
+    const counts = {};
+    const s = window.__lastStatus || {};
+    const moves = s.recentMoves || [];
+    const lookup = buildTableLookup(s);
+    for (const m of moves) {
+      if (!m.engine) continue;
+      if (!moveMatchesDiff(m)) continue;
+      if (selectedOutcome !== "all" && !moveMatchesOutcome(m, lookup)) continue;
+      if (!moveMatchesFilterExcept(m, lookup, "engine")) continue;
+      counts[m.engine] = (counts[m.engine] || 0) + 1;
+    }
+    entries = Object.entries(counts);
+  }
+  const chart = pieChart(entries, {
     label: k => engineNameHtml(k),
     ariaLabel: "engine usage pie chart",
     unit: "moves", unit1: "move",
+    dim: "engine",
   });
   return chart || "<span class='muted'>no engine calls yet</span>";
 }
@@ -1848,11 +2304,52 @@ function countResults(results, keyOf) {
   return Object.entries(counts);
 }
 
+// Apply the global scope filters (difficulty tab + outcome cards) to a results
+// list before counting. Keeps the result-derived pies (language, membership)
+// in sync with stats. The pie-slice chips in activeFilters are NOT applied
+// here; faceting (each pie by every OTHER active dim) is layered on top in
+// facetedPieRecords, so a pie still shows every slice within its own dimension.
+function scopedResults(results) {
+  let arr = results || [];
+  if (selectedDiff !== "all") arr = arr.filter(resultMatchesDiff);
+  if (selectedOutcome !== "all") arr = arr.filter(resultMatchesOutcome);
+  return arr;
+}
+
+// Records feeding the opponent language/membership pies. Normally the scoped
+// finished-results set. But the "live" outcome card has no finished results,
+// so source opponent language/membership from the live game memos (which carry
+// oppLanguage/oppPremium), still honoring the difficulty filter via
+// scopedLiveIds (difficulty-only, so the pie stays the full index — not
+// narrowed by its own active slice). Each pie reads oppLanguage / oppPremium
+// off these records, and memos expose the same field names, so no shimming.
+function opponentPieRecords(results) {
+  if (selectedOutcome === "live") {
+    const s = window.__lastStatus || {};
+    const { live, memo } = scopedLiveIds(s);
+    // Carry the table id so the engine facet can look its moves up.
+    return live.map(id => Object.assign({ tableId: id }, memo[id] || {}));
+  }
+  return scopedResults(results);
+}
+
+// Opponent-pie records faceted by every active pie filter EXCEPT this pie's own
+// dimension, so the language pie reflects the active membership/engine filters
+// (and vice-versa) while still showing every slice within its own dimension to
+// switch between. Difficulty + outcome are already applied by opponentPieRecords.
+function facetedPieRecords(results, exceptDim) {
+  const recs = opponentPieRecords(results);
+  if (!hasAnyFilter()) return recs;
+  const lookup = buildTableLookup(window.__lastStatus || {});
+  return recs.filter(r => resultMatchesFilterExcept(r, lookup, exceptDim));
+}
+
 function renderLanguages(results) {
-  const chart = pieChart(countResults(results, r => r.oppLanguage), {
+  const chart = pieChart(countResults(facetedPieRecords(results, "language"), r => r.oppLanguage), {
     label: k => '<span>' + (LANG_DISPLAY[k] || ('🏳️ ' + esc(k))) + '</span>',
     ariaLabel: "opponents by language pie chart",
     unit: "games", unit1: "game",
+    dim: "language",
   });
   return chart || "<span class='muted'>no opponent languages recorded yet</span>";
 }
@@ -1861,12 +2358,13 @@ function renderPremium(results) {
   // oppPremium is boolean | undefined; bucket the two known states and ignore
   // games where membership wasn't detected.
   const chart = pieChart(
-    countResults(results, r => r.oppPremium === true ? "Premium"
+    countResults(facetedPieRecords(results, "premium"), r => r.oppPremium === true ? "Premium"
       : r.oppPremium === false ? "Free" : null),
     {
       label: k => '<span class="' + (k === "Premium" ? "ok" : "muted") + '">' + esc(k) + '</span>',
       ariaLabel: "opponents by membership pie chart",
       unit: "games", unit1: "game",
+      dim: "premium",
     },
   );
   return chart || "<span class='muted'>no opponent membership recorded yet</span>";

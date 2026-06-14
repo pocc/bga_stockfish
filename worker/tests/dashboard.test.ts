@@ -45,6 +45,52 @@ function extractServedScripts(src: string): string[] {
   return scripts;
 }
 
+// Boot the served dashboard script in a vm sandbox with DOM / timer stubs, then
+// return the sandbox so render*/filter helpers can be driven directly. The noop
+// proxy is self-chaining (el.classList.toggle(...) resolves to a no-op) so
+// DOM-touching helpers like syncDiffButtons don't throw. Filter state (the
+// script-scoped selectedDiff / selectedOutcome / activeFilters lets) is mutated
+// through the script's own setDiff / setOutcome / setFilter; with no
+// window.__lastStatus set, those skip their repaint side effects.
+function bootDashboard(code: string): any {
+  const noop: any = new Proxy(function () {}, { get: () => noop, apply: () => undefined });
+  const dummyEl = new Proxy({}, { get: () => noop, set: () => true });
+  const sandbox: any = {
+    document: { getElementById: () => dummyEl },
+    setInterval: () => 0,
+    fetch: () => Promise.resolve({ ok: false, json: () => Promise.resolve({}) }),
+    localStorage: { getItem: () => null, setItem: () => {} },
+    window: {},
+    console,
+  };
+  sandbox.window = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  return sandbox;
+}
+
+// Three live games for the filter tests: A = Italian / Premium, B = French /
+// Free, C = Italian / Free. Only A has a recorded move (chess-api.com). All
+// three are being played (play / asyncplay) and carry no difficulty, so they
+// fall back to grandmaster.
+function liveStatus() {
+  const now = Date.now();
+  return {
+    tables: {
+      A: { oppLanguage: "it", oppPremium: true, startedAt: now - 3, botColor: "white" },
+      B: { oppLanguage: "fr", oppPremium: false, startedAt: now - 2, botColor: "white" },
+      C: { oppLanguage: "it", oppPremium: false, startedAt: now - 1, botColor: "white" },
+    },
+    lastTablesSeen: [
+      { id: "A", status: "play" },
+      { id: "B", status: "play" },
+      { id: "C", status: "asyncplay" },
+    ],
+    recentMoves: [{ tableId: "A", engine: "chess-api.com", from: "e2", to: "e4", ts: now }],
+    recentResults: [],
+  };
+}
+
 describe("dashboard inline scripts", () => {
   const scripts = extractServedScripts(indexSrc);
 
@@ -215,5 +261,174 @@ describe("dashboard inline scripts", () => {
     expect(nonScored).toContain("Opponent quit");
     // The real win stays out of the non-scored table.
     expect(nonScored).not.toContain("?table=10");
+  });
+
+  const lastScript = () => scripts[scripts.length - 1];
+  const sortedLive = (sb: any, s: any) => sb.selectedLiveIds(s).live.slice().sort();
+
+  test("live games: no filter shows every live game", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    expect(sortedLive(sb, s)).toEqual(["A", "B", "C"]);
+    expect(sb.selectedLiveIds(s).hidden).toBe(0);
+  });
+
+  test("live games honor the language pie filter", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setFilter("language", "it");
+    expect(sortedLive(sb, s)).toEqual(["A", "C"]);
+    expect(sb.selectedLiveIds(s).hidden).toBe(1);
+  });
+
+  test("live games honor the membership pie filter", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setFilter("premium", "Premium");
+    expect(sortedLive(sb, s)).toEqual(["A"]);
+  });
+
+  test("live games honor the engine pie filter (via recorded moves)", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setFilter("engine", "chess-api.com");
+    expect(sortedLive(sb, s)).toEqual(["A"]);
+  });
+
+  test("live games honor the difficulty tab", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setDiff("expert"); // memos default to grandmaster → nothing matches
+    expect(sortedLive(sb, s)).toEqual([]);
+    sb.setDiff("grandmaster");
+    expect(sortedLive(sb, s)).toEqual(["A", "B", "C"]);
+  });
+
+  test("a finished-outcome card empties the live panel; the Live card keeps it", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setOutcome("win"); // a live game has no win tally
+    expect(sortedLive(sb, s)).toEqual([]);
+    expect(sb.selectedLiveIds(s).hidden).toBe(3);
+    sb.setOutcome("live"); // toggles win off, selects live
+    expect(sortedLive(sb, s)).toEqual(["A", "B", "C"]);
+  });
+
+  test("live filters combine (AND) across dimensions", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setFilter("language", "it");
+    sb.setFilter("premium", "Free"); // Italian AND Free → only C
+    expect(sortedLive(sb, s)).toEqual(["C"]);
+  });
+
+  test("empty live panel under a filter explains itself and offers a clear", () => {
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.setOutcome("win");
+    const html: string = sb.renderGamesTable(s);
+    expect(html).toContain("no live games match the active filters");
+    expect(html).toContain("3 live games hidden by active filters");
+    expect(html).toContain("clearAllFilters()");
+  });
+
+  test("the live-outcome language pie stays the full index, not narrowed by its own slice", () => {
+    // Picking the Live card sources the language pie from live memos; clicking
+    // an Italian slice must NOT collapse that pie to Italian only (it's the
+    // index you switch slices from), even though the games panel narrows.
+    const sb = bootDashboard(lastScript());
+    const s = liveStatus();
+    sb.window.__lastStatus = s;
+    sb.setOutcome("live");
+    sb.setFilter("language", "it");
+    const pie: string = sb.renderLanguages(s.recentResults);
+    expect(pie).toContain("Italian");
+    expect(pie).toContain("French"); // French still present despite the it filter
+    // …while the games panel is narrowed to the Italian live games.
+    expect(sortedLive(sb, s)).toEqual(["A", "C"]);
+  });
+
+  test("the unified chip bar shows every active dimension and clear-all resets them", () => {
+    const sb = bootDashboard(lastScript());
+    sb.setDiff("expert");
+    sb.setOutcome("win");
+    sb.setFilter("language", "it");
+    const chip: string = sb.renderFilterChip();
+    expect(chip).toContain("difficulty = ");
+    expect(chip).toContain("expert");
+    expect(chip).toContain("showing = ");
+    expect(chip).toContain("wins");
+    expect(chip).toContain("language = ");
+    expect(chip).toContain("Italian");
+    expect(chip).toContain("clear all");
+    // Clearing wipes all three dimensions at once → empty bar.
+    sb.clearAllFilters();
+    expect(sb.renderFilterChip()).toBe("");
+  });
+
+  // A status whose lifetime aggregate (stats.wins/losses/draws) deliberately
+  // disagrees with the recent window, so a test can tell which source the
+  // Stats cards read from.
+  function tallyStatus() {
+    return {
+      stats: { wins: 100, losses: 50, draws: 10, byDifficulty: {}, engineUses: { "chess-api.com": 99 } },
+      recentResults: [
+        { tableId: "1", tally: "win", oppLanguage: "it", oppPremium: true, moveCount: 20 },
+        { tableId: "2", tally: "loss", oppLanguage: "it", oppPremium: false, moveCount: 20 },
+        { tableId: "3", tally: "win", oppLanguage: "fr", oppPremium: false, moveCount: 20 },
+        { tableId: "4", tally: "draw", oppLanguage: "it", oppPremium: true, moveCount: 20 },
+      ],
+      tables: {}, lastTablesSeen: [], recentMoves: [],
+    };
+  }
+
+  test("Stats cards recompute W/L/D from the recent window under a pie filter", () => {
+    const sb = bootDashboard(lastScript());
+    const s = tallyStatus();
+    sb.window.__lastStatus = s;
+    // No pie filter → cards stay on the lifetime aggregate (recompute off).
+    expect(sb.hasAnyFilter()).toBe(false);
+    // language=it → recompute from the recent window: it games are 1W/1L/1D
+    // (the French win is excluded), NOT the lifetime 100/50/10.
+    sb.setFilter("language", "it");
+    expect(sb.filteredScoredTally(s)).toEqual({ wins: 1, losses: 1, draws: 1 });
+    // membership=Premium → it/prem win + it/prem draw → 1W/0L/1D.
+    sb.setFilter("language", "it"); // toggle off
+    sb.setFilter("premium", "Premium");
+    expect(sb.filteredScoredTally(s)).toEqual({ wins: 1, losses: 0, draws: 1 });
+  });
+
+  test("pies are faceted: each reflects the OTHER active filters but stays full on its own dim", () => {
+    const sb = bootDashboard(lastScript());
+    const s = tallyStatus();
+    sb.window.__lastStatus = s;
+    sb.setFilter("language", "it");
+    // Membership pie facets BY language → only the 3 Italian games feed it.
+    const mem = sb.facetedPieRecords(s.recentResults, "premium").map((r: any) => r.tableId).sort();
+    expect(mem).toEqual(["1", "2", "4"]);
+    // Language pie leaves its OWN dim free → all 4 games, so you can switch slices.
+    expect(sb.facetedPieRecords(s.recentResults, "language").length).toBe(4);
+  });
+
+  test("the engine pie facets by a language filter (counts only that language's moves)", () => {
+    const s = {
+      stats: { wins: 0, losses: 0, draws: 0, byDifficulty: {}, engineUses: { "chess-api.com": 99 } },
+      recentResults: [
+        { tableId: "1", tally: "win", oppLanguage: "it", oppPremium: true, moveCount: 20 },
+        { tableId: "2", tally: "win", oppLanguage: "fr", oppPremium: true, moveCount: 20 },
+      ],
+      tables: {}, lastTablesSeen: [],
+      recentMoves: [
+        { tableId: "1", engine: "chess-api.com", from: "e2", to: "e4", ts: Date.now() },
+        { tableId: "2", engine: "stockfish.online", from: "d2", to: "d4", ts: Date.now() },
+      ],
+    };
+    const sb = bootDashboard(lastScript());
+    sb.window.__lastStatus = s;
+    sb.setFilter("language", "it");
+    const html: string = sb.renderEngines(s.stats.engineUses);
+    // Only the Italian table's engine survives the facet.
+    expect(html).toContain("chess-api");
+    expect(html).not.toContain("stockfish");
   });
 });
