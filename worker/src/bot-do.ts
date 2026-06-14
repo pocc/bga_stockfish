@@ -3325,10 +3325,12 @@ export class BotDriver extends DurableObject<Env> {
         // English-only by design: the appended feedback prompt asks the
         // opponent to type "feedback ..." and we only want to read English
         // submissions, so the surrounding line stays English regardless of
-        // m.oppLanguage.
+        // m.oppLanguage. Phrased as feedback ABOUT the bot (it reaches the
+        // operator) so it doesn't read as the bot offering to critique the
+        // opponent's play.
         await this.sendChat(
           t.id,
-          "Good game! For bot feedback, start your message with the word \"feedback\".",
+          "Good game! To leave feedback about this bot, start your message with the word \"feedback\".",
         );
         m.saidGg = true;
       }

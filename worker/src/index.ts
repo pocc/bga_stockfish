@@ -117,7 +117,7 @@ export async function notifyFeedbackWebhook(
   if (entry.ip) fields.push({ name: "IP", value: trunc(entry.ip, 1024), inline: true });
   const payload = {
     embeds: [{
-      title: `Feedback via ${entry.source}`,
+      title: `Feedback for the bot (via ${entry.source})`,
       description: trunc(entry.message, 4000),
       color: 0xb85c38, // matches dashboard accent
       fields,
