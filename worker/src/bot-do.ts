@@ -1843,9 +1843,9 @@ export class BotDriver extends DurableObject<Env> {
       // push (e.g. when the table flips to play and BGA sends the
       // gamestate-update push). Without this the opener still waited up to a
       // full 5s poll tick, which was the bulk of the perceived "minute" the
-      // opponent saw between sitting down and the bot saying hi. The same
-      // combined endpoint refreshes oppLanguage so maybeGreet localizes
-      // correctly without its own fetch.
+      // opponent saw between sitting down and the bot saying hi. The combined
+      // endpoint returns the real game-page HTML, so refreshOpponent picks up
+      // oppLanguage and maybeGreet localizes the opener correctly.
       if (m.gameserver == null) {
         const r = await this.client.resolveGameserverWithPage(tableId).catch(() => null);
         if (!r) return;
@@ -3171,10 +3171,11 @@ export class BotDriver extends DurableObject<Env> {
       // Async games never went through the ackedStart branch above.
       if (!m.ackedStart) m.ackedStart = true;
       // resolve gameserver number once we're live. Use the combined endpoint
-      // that returns gameserver + the page HTML so we can refresh opponent
-      // language for the greeting in ONE BGA round-trip instead of two
-      // (resolveGameserver + fetchGamePage). Saves ~0.5-1s off greeting
-      // latency, which used to feel close to a minute end-to-end.
+      // that returns gameserver + the game-page HTML so we can refresh the
+      // opponent's language for the greeting (it fetches the real game page,
+      // not the redirect stub, so parseOpponent actually finds the language).
+      // The big win is eager resolution here vs waiting for the next 5s poll
+      // tick, which used to make the opener feel close to a minute away.
       if (m.gameserver == null) {
         const r = await this.client.resolveGameserverWithPage(t.id).catch(() => null);
         if (r) {

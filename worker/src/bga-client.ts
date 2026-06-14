@@ -749,18 +749,44 @@ export class BGAClient {
   }
 
   async resolveGameserver(tableId: number | string): Promise<number | null> {
-    return (await this.resolveGameserverWithPage(tableId))?.gs ?? null;
+    return (await this.probeTablePage(tableId))?.gs ?? null;
   }
 
   /**
-   * Same as resolveGameserver but also returns the page body, so callers that
-   * also want to extract opponent info / language can do it from this one
-   * fetch instead of issuing a follow-up `fetchGamePage`. Saves a full BGA
-   * round-trip on the first live-play tick (greeting path).
+   * Same as resolveGameserver but also returns the GAME-PAGE body, so callers
+   * that also want to extract opponent info / language can do it without a
+   * separate `fetchGamePage`.
+   *
+   * `/table?table=` 302-redirects an in-play game to `/<gs>/chess?table=`.
+   * Because `request` uses redirect:"manual", the redirect response body is an
+   * empty stub with no player blocks — parsing opponent/language off it yields
+   * nothing (this caused the bot to greet only in English). So when the probe
+   * resolved the gameserver from the redirect Location header, follow up with a
+   * real game-page fetch and return THAT html. The pre-launch table page (no
+   * redirect, status 200) already carries the player blocks, so return its
+   * body directly — saving the follow-up fetch in the non-redirect case.
    */
   async resolveGameserverWithPage(
     tableId: number | string,
   ): Promise<{ gs: number; html: string } | null> {
+    const probe = await this.probeTablePage(tableId);
+    if (!probe) return null;
+    const { gs, body, redirected } = probe;
+    // Redirect body is a stub; fetch the actual game page for player blocks.
+    const html = redirected
+      ? await this.fetchGamePage(gs, tableId).catch(() => body)
+      : body;
+    return { gs, html };
+  }
+
+  /**
+   * Hit `/table?table=` and recover the gameserver number. `redirected` is true
+   * when it came from the 302 Location header (body is an empty stub), false
+   * when parsed out of a 200 table-page body (which carries player blocks).
+   */
+  private async probeTablePage(
+    tableId: number | string,
+  ): Promise<{ gs: number; body: string; redirected: boolean } | null> {
     const resp = await this.request(
       "GET",
       `https://boardgamearena.com/table?table=${tableId}`,
@@ -770,11 +796,11 @@ export class BGAClient {
     const loc = resp.headers.get("location") ?? "";
     const body = await resp.text();
     const fromLoc = /\/(\d+)\/chess\?/.exec(loc);
-    if (fromLoc) return { gs: Number(fromLoc[1]), html: body };
+    if (fromLoc) return { gs: Number(fromLoc[1]), body, redirected: true };
     const fromPath = /\/(\d+)\/chess\?table/.exec(body);
-    if (fromPath) return { gs: Number(fromPath[1]), html: body };
+    if (fromPath) return { gs: Number(fromPath[1]), body, redirected: false };
     const fromKey = /gameserver["']?\s*[:=]\s*["']?(\d+)/.exec(body);
-    if (fromKey) return { gs: Number(fromKey[1]), html: body };
+    if (fromKey) return { gs: Number(fromKey[1]), body, redirected: false };
     return null;
   }
 
