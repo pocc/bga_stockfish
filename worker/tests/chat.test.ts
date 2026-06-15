@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { chunkChat, chatPaceDelayMs, CHAT_MIN_SPACING_MS } from "../src/chat";
+import { chunkChat, chatPaceDelayMs, CHAT_MIN_SPACING_MS, enqueueChat } from "../src/chat";
 
 const GREETING =
   "Hi! I'm bot_stockfish, a chess bot on Board Game Arena https://stockfish.ross.gg/ \n" +
@@ -59,7 +59,7 @@ describe("chatPaceDelayMs", () => {
 
   test("waits the remaining gap when the last send was too recent", () => {
     const now = 1_000_000;
-    // last send 300ms ago → wait the rest of the 1100ms window.
+    // last send 300ms ago → wait the rest of the spacing window.
     expect(chatPaceDelayMs(now, now - 300)).toBe(CHAT_MIN_SPACING_MS - 300);
   });
 
@@ -81,5 +81,57 @@ describe("chatPaceDelayMs", () => {
 
   test("honors a custom spacing argument", () => {
     expect(chatPaceDelayMs(1_000, 600, 1_000)).toBe(600);
+  });
+});
+
+/**
+ * Regression: 28 production "minimum of 1 second between messages" rejections
+ * in 24h, every one on a greeting that ran concurrently with another chat
+ * path (poll-tick greeting overlapping a push-tick reaction). chatPaceDelayMs
+ * is correct, but two concurrent callers read the same stale lastChatSentAt
+ * before either updated it, computed the same gap, and both fired. enqueueChat
+ * serializes them so the second observes the first's update.
+ */
+describe("enqueueChat", () => {
+  test("two concurrent enqueues run serially, not in parallel", async () => {
+    const events: string[] = [];
+    const slow = async (label: string, ms: number) => {
+      events.push(`${label}:start`);
+      await new Promise((r) => setTimeout(r, ms));
+      events.push(`${label}:end`);
+      return label;
+    };
+    let queue: Promise<unknown> = Promise.resolve();
+    const a = enqueueChat(queue, () => slow("A", 30));
+    queue = a.chain;
+    const b = enqueueChat(queue, () => slow("B", 10));
+    queue = b.chain;
+    const [ra, rb] = await Promise.all([a.result, b.result]);
+    expect(ra).toBe("A");
+    expect(rb).toBe("B");
+    // A must fully finish before B starts — that's the whole point.
+    expect(events).toEqual(["A:start", "A:end", "B:start", "B:end"]);
+  });
+
+  test("a rejected task does not poison the chain", async () => {
+    const ran: string[] = [];
+    let queue: Promise<unknown> = Promise.resolve();
+    const a = enqueueChat(queue, async () => { ran.push("A"); throw new Error("boom"); });
+    queue = a.chain;
+    const b = enqueueChat(queue, async () => { ran.push("B"); return "B"; });
+    queue = b.chain;
+    await expect(a.result).rejects.toThrow("boom");
+    await expect(b.result).resolves.toBe("B");
+    expect(ran).toEqual(["A", "B"]);
+  });
+
+  test("each caller sees its own task's result, not the previous one", async () => {
+    let queue: Promise<unknown> = Promise.resolve();
+    const a = enqueueChat(queue, async () => 1);
+    queue = a.chain;
+    const b = enqueueChat(queue, async () => 2);
+    queue = b.chain;
+    expect(await a.result).toBe(1);
+    expect(await b.result).toBe(2);
   });
 });

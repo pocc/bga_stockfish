@@ -40,9 +40,11 @@ export function chunkChat(msg: string, limit = 220): string[] {
  * the second with "There is a minimum of 1 second between messages". Separate
  * sendChat() calls fired close together (e.g. a greeting immediately followed
  * by a difficulty-keyword reply, or two reaction chats on the same tick)
- * tripped this and dropped the second message. We use 1.1s of headroom over
- * BGA's 1s so clock skew can't shave us under the limit. */
-export const CHAT_MIN_SPACING_MS = 1_100;
+ * tripped this and dropped the second message. 1.1s of headroom proved too
+ * tight in production — BGA still rejected ~40% of multi-part greetings — so
+ * we run 1.5s, well clear of BGA's 1s window even with round-trip + clock
+ * skew. */
+export const CHAT_MIN_SPACING_MS = 1_500;
 
 /**
  * How long to wait before the next chat send so it clears BGA's anti-flood
@@ -60,6 +62,26 @@ export function chatPaceDelayMs(
   // window even if the clock jumped backwards (lastSentAt > now), so a clock
   // skew can't wedge the bot into a multi-second/longer chat stall.
   return Math.min(minSpacing, Math.max(0, minSpacing - (now - lastSentAt)));
+}
+
+/**
+ * Chain `task` onto `prior` so two callers handing work to the same queue see
+ * sequential execution: the second await observes the first task's writes
+ * (e.g. an updated lastChatSentAt) before computing its own pacing. The
+ * `.catch(() => undefined)` on the link keeps a thrown task from poisoning
+ * the chain — subsequent tasks still run.
+ *
+ * Returns `{ chain, result }`. `chain` is the new queue tail (always
+ * resolved, for the next caller to await). `result` is `task`'s real
+ * promise, so the caller still sees its actual value or rejection.
+ */
+export function enqueueChat<T>(
+  prior: Promise<unknown>,
+  task: () => Promise<T>,
+): { chain: Promise<unknown>; result: Promise<T> } {
+  const result = prior.catch(() => undefined).then(task);
+  const chain = result.catch(() => undefined);
+  return { chain, result };
 }
 
 /** Split an over-long line into <=limit pieces at sentence then word breaks. */

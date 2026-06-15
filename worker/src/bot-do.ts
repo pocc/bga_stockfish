@@ -27,7 +27,7 @@ import {
   type Destination, type MoveCandidate,
 } from "./bot-move";
 import { t as tr } from "./i18n";
-import { chunkChat, chatPaceDelayMs, CHAT_MIN_SPACING_MS } from "./chat";
+import { chunkChat, chatPaceDelayMs, CHAT_MIN_SPACING_MS, enqueueChat } from "./chat";
 import {
   extractCentrifugeAuth, isVisitorId, channelsFor, probeCentrifuge,
   openCentrifugeSocket, parseFrames,
@@ -164,6 +164,18 @@ const RECONCILE_MISS_LIMIT = 3;
  *  Bounded parallelism keeps a large backlog draining in a few seconds
  *  without flooding BGA. */
 const RECONCILE_CONCURRENCY = 6;
+/** Max concurrent handleTable() calls per tick. The per-tick loop iterates
+ *  every live table the bot tracks; each call is bounded by ~1-3 BGA
+ *  round-trips (getTableInfo + game-page fetch + maybe a chat or move),
+ *  so a sequential loop over ~30 active games took ~30-50s of wall time.
+ *  That dwarfed the 5s TICK_MS target, so a freshly-joined realtime invite
+ *  could sit ~30-50s before the host called startgame.html and the game
+ *  launched. Bounded parallelism keeps the tick under ~10s for typical
+ *  loads. Per-table state (`this.status.tables[t.id]`) is touched by only
+ *  one task per batch, and cross-cutting shared state (`sendChat` queue,
+ *  `lastChatSentAt`, `tickInFlight`) is already serialized. Mirrors
+ *  RECONCILE_CONCURRENCY for symmetry. */
+const HANDLE_TABLE_CONCURRENCY = 6;
 /** A memo that reached `acceptedSeat`/`ackedStart` but never `saidHi` never
  *  entered live play (saidHi is set the moment gameserver resolves, i.e. the
  *  game started). If such a memo is also absent from every open/finished
@@ -779,6 +791,14 @@ export class BotDriver extends DurableObject<Env> {
    *  chats on one tick) don't collide. In-memory is fine — chat pacing only
    *  needs to hold within a burst, and a DO restart resets it to "send now". */
   private lastChatSentAt = 0;
+  /** Serializes every sendChat() call across the DO so two concurrent
+   *  invocations (poll-path greeting + push-path reaction, two reactions on
+   *  one tick) can't both observe the same stale lastChatSentAt, fire
+   *  simultaneously, and trip BGA's 1s anti-flood rule. Without this the
+   *  pacing math is correct but racy — every new game showed
+   *  "minimum of 1 second between messages" rejections on the greeting.
+   *  In-memory: a DO restart resets it along with lastChatSentAt. */
+  private chatQueue: Promise<unknown> = Promise.resolve();
   /** Re-entrancy guard for tick(). DO fetch handlers run concurrently, so
    *  the 1-min cron's POST /tick can overlap an in-flight alarm-driven tick.
    *  Two ticks both seeing "our turn" and racing selectCell is one of the
@@ -1616,7 +1636,17 @@ export class BotDriver extends DurableObject<Env> {
    * sequentially so order is preserved. Returns true only if every chunk was
    * accepted. Short messages send as a single chunk (unchanged behaviour).
    */
-  private async sendChat(tableId: string, msg: string): Promise<boolean> {
+  private sendChat(tableId: string, msg: string): Promise<boolean> {
+    // Queue behind any in-flight sendChat so two concurrent callers (poll-path
+    // greeting overlapping a push-path reaction, two reactions on one tick)
+    // can't both read a stale lastChatSentAt and fire near-simultaneously,
+    // which would trip BGA's 1s anti-flood rule.
+    const { chain, result } = enqueueChat(this.chatQueue, () => this.sendChatLocked(tableId, msg));
+    this.chatQueue = chain;
+    return result;
+  }
+
+  private async sendChatLocked(tableId: string, msg: string): Promise<boolean> {
     if (!this.client) return false;
     // Split at sentence/line boundaries (not mid-sentence) under BGA's cap.
     const chunks = chunkChat(msg, 220);
@@ -1629,9 +1659,10 @@ export class BotDriver extends DurableObject<Env> {
       //     two reaction chats on one tick) tripped "minimum of 1 second
       //     between messages" and silently dropped the second.
       // Both modes are BGA's same 1s anti-flood rule. CHAT_MIN_SPACING_MS
-      // (1.1s) is already validated against that rule for the cross-call
-      // case (see chat.ts); using it for the inter-chunk gap too means a
-      // 2-chunk greeting now finishes ~900ms sooner without risking a drop.
+      // (1.5s) is tuned against that rule for the cross-call case (see
+      // chat.ts); we reuse it for the inter-chunk gap too. The greeting
+      // itself is now a single chunk (see i18n "greeting"), so this gap only
+      // bites multi-chunk concede/timeout messages and back-to-back sends.
       const gap = i > 0
         ? CHAT_MIN_SPACING_MS
         : chatPaceDelayMs(Date.now(), this.lastChatSentAt);
@@ -2086,28 +2117,34 @@ export class BotDriver extends DurableObject<Env> {
     }
     this.status.lastTablesSeen = merged;
 
-    for (const t of tables) {
-      const skip = this.shouldSkip(t);
-      if (skip) continue;
-      try {
-        await this.handleTable(t);
-        // Successful step — clear the table's error count.
-        const m = this.status.tables[t.id];
-        if (m && m.errorCount) m.errorCount = 0;
-      } catch (e) {
-        this.recordError("handleTable", e, t.id);
-        const m = this.getMemo(t.id);
-        m.errorCount = (m.errorCount ?? 0) + 1;
-        if (
-          !m.conceded &&
-          m.errorCount >= MAX_TABLE_ERRORS &&
-          isLivePlayStatus(t.status)
-        ) {
-          await this.concedeTable(t.id, m, "errors").catch((ce) => {
-            this.recordError("concede", ce, t.id);
-          });
+    // Process tables in bounded-parallel batches. Each task owns its own
+    // memo (this.status.tables[t.id]) and shared state is already
+    // serialized: sendChat enqueues onto this.chatQueue, tickInFlight
+    // gates the whole tick so push reactions can't interleave, and the
+    // storage write below runs once after all batches complete.
+    const tablesToProcess = tables.filter((t) => !this.shouldSkip(t));
+    for (let i = 0; i < tablesToProcess.length; i += HANDLE_TABLE_CONCURRENCY) {
+      const batch = tablesToProcess.slice(i, i + HANDLE_TABLE_CONCURRENCY);
+      await Promise.all(batch.map(async (t) => {
+        try {
+          await this.handleTable(t);
+          const m = this.status.tables[t.id];
+          if (m && m.errorCount) m.errorCount = 0;
+        } catch (e) {
+          this.recordError("handleTable", e, t.id);
+          const m = this.getMemo(t.id);
+          m.errorCount = (m.errorCount ?? 0) + 1;
+          if (
+            !m.conceded &&
+            m.errorCount >= MAX_TABLE_ERRORS &&
+            isLivePlayStatus(t.status)
+          ) {
+            await this.concedeTable(t.id, m, "errors").catch((ce) => {
+              this.recordError("concede", ce, t.id);
+            });
+          }
         }
-      }
+      }));
     }
     // Garbage-collect memo for finished/conceded tables we no longer see.
     // EXCEPT: hold finished (not conceded) memos that already sent GG for
@@ -3557,11 +3594,19 @@ export class BotDriver extends DurableObject<Env> {
       } else if (fbMatch) {
         const body = fbMatch[1].trim();
         if (body) {
+          // Persist BEFORE advancing the cursor — but the persist is the
+          // load-bearing, non-idempotent action (writes KV + fires Discord
+          // webhook), so advance immediately after it succeeds. If we left
+          // the retry-on-sendChat-failure path covering this case, a rejected
+          // "Thanks" reply (e.g. BGA's 1s anti-flood briefly dropping the
+          // chat right after a "Good game!" send) would re-enter this branch
+          // next tick and double-post the feedback to Discord/KV.
           await this.persistChatFeedback(tableId, m, body);
-          reply = "Thanks, your feedback was recorded.";
-        } else {
-          reply = "Send your feedback in the same message, e.g. \"feedback the bot played a bad move\".";
+          m.lastSeenChatId = Number(h.id);
+          await this.sendChat(tableId, "Thanks, your feedback was recorded.");
+          continue;
         }
+        reply = "Send your feedback in the same message, e.g. \"feedback the bot played a bad move\".";
       }
       // If the send fails, stop here WITHOUT advancing past this message so it
       // (and only messages from here on) is retried next tick. Advancing the
