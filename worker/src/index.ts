@@ -2,8 +2,14 @@ import { StockfishEngine } from "./stockfish-do";
 import { BotDriver } from "./bot-do";
 import { StockfishContainer } from "./container-do";
 import { BGA_PREMIUM_URL } from "./premium";
+import { feedbackKey, toPublicFeedback, type FeedbackEntry } from "./feedback";
 
 export { StockfishEngine, BotDriver, StockfishContainer };
+// Re-export the feedback helpers so existing importers (bot-do.ts) and the
+// public shape stay reachable from ./index. Definitions live in ./feedback,
+// which is free of Cloudflare imports and therefore unit-testable in Node.
+export { feedbackKey, toPublicFeedback } from "./feedback";
+export type { FeedbackEntry, PublicFeedbackEntry } from "./feedback";
 
 export interface Env {
   ENGINE: DurableObjectNamespace;
@@ -65,28 +71,6 @@ function isAdmin(req: Request, env: Env): boolean {
 
 function unauthorized(): Response {
   return Response.json({ error: "unauthorized" }, { status: 401 });
-}
-
-/** Per-entry KV key. ISO timestamp sorts lexically + a short random suffix
- *  guards against same-ms collisions. Shared by web + chat feedback paths. */
-export function feedbackKey(ts: number): string {
-  const iso = new Date(ts).toISOString();
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `feedback:${iso}:${rand}`;
-}
-
-/** Shared shape used for the Discord notification. Both feedback paths
- *  (web POST and in-game chat) build one of these. */
-export interface FeedbackEntry {
-  ts: number;
-  source: "web" | "chat";
-  message: string;
-  contact?: string;
-  ip?: string;
-  tableId?: string;
-  oppId?: string;
-  oppName?: string;
-  oppLanguage?: string;
 }
 
 /** Best-effort Discord webhook notification on a new feedback entry. Silent
@@ -272,6 +256,39 @@ export default {
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
       return Response.json({ count: total });
+    }
+
+    // Public, sanitized list of feedback entries for the landing page's
+    // "past feedback" collapsible. Returns ONLY {ts, source, message} —
+    // never contact/ip/opp* (PII stays behind the admin /bot/feedback route).
+    // Keys embed an ISO timestamp, so sorting key names descending yields
+    // newest-first without reading every value; we then fetch just the top N.
+    if (url.pathname === "/feedback/list" && req.method === "GET") {
+      const PUBLIC_LIMIT = 50;
+      const names: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page: KVNamespaceListResult<unknown> = await env.FEEDBACK.list({
+          prefix: "feedback:", cursor,
+        });
+        for (const k of page.keys) names.push(k.name);
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+      names.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0)).splice(PUBLIC_LIMIT);
+      const entries = await Promise.all(
+        names.map(async (name) => {
+          const raw = await env.FEEDBACK.get(name);
+          if (!raw) return null;
+          try {
+            return toPublicFeedback(JSON.parse(raw) as FeedbackEntry);
+          } catch { return null; }
+        }),
+      );
+      return Response.json({
+        entries: entries
+          .filter((e): e is NonNullable<typeof e> => e != null)
+          .sort((a, b) => b.ts - a.ts),
+      });
     }
 
     // Admin: list feedback entries from KV. Newest first.
@@ -540,6 +557,19 @@ function landingHtml(): string {
     .chart-grid { grid-template-columns: 1fr; }
     .chart-grid .cg-tall { grid-column: auto; grid-row: auto; }
   }
+  /* Cumulative games-over-time line chart. */
+  .got-wrap { position: relative; }
+  .got-svg { width: 100%; height: auto; display: block; }
+  .got-line { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; }
+  .got-area { fill: var(--accent); opacity: 0.1; }
+  .got-est { color: var(--muted); }
+  .got-grid { stroke: var(--rule); stroke-width: 1; }
+  .got-dot { fill: var(--accent); }
+  .got-axis { fill: var(--muted); font-size: 10px; }
+  .got-cursor { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0; pointer-events: none; }
+  .got-cursor-dot { fill: var(--accent); stroke: var(--bg); stroke-width: 1.5; opacity: 0; pointer-events: none; }
+  .got-tip { position: absolute; display: none; pointer-events: none; transform: translateX(-50%); background: var(--code-bg); border: 1px solid var(--rule); border-radius: 4px; padding: 3px 7px; font-size: 11px; color: var(--fg); white-space: nowrap; z-index: 5; box-shadow: 0 1px 4px rgba(0,0,0,0.25); }
+  .got-tip b { color: var(--accent); font-weight: 600; }
   /* Recent moves table — winner / fell-through indicators. */
   .winner { color: var(--ok); font-weight: 600; }
   .rejected { color: var(--muted); text-decoration: line-through; opacity: 0.7; }
@@ -562,13 +592,10 @@ function landingHtml(): string {
 
   <h2>Bot rules</h2>
   <ul style="padding-left: 22px; margin: 0; font-size: 13px;">
-    <li>Friendly games only. Ranked invites declined.</li>
+    <li>Friendly games only. Ranked invites declined. Always accepts collective-abandon proposals. Concedes after 3 consecutive bot errors.</li>
     <li>Maintains one open invite per gamemode (realtime + turn-based).</li>
-    <li>Always accepts draw offers and collective-abandon proposals.</li>
-    <li>Default strength is full <span class="mono">grandmaster</span> Stockfish for both realtime and turn-based games. Send one word at any time — <span class="mono">beginner</span> / <span class="mono">easy</span> / <span class="mono">intermediate</span> / <span class="mono">advanced</span> / <span class="mono">expert</span> / <span class="mono">grandmaster</span> — to set my level.</li>
-    <li>Replies <span class="mono">"I'm not sure."</span> to every opponent chat message except those exact difficulty keywords (chat otherwise treated as untrusted). One exception: messages starting with the word <span class="mono">feedback</span> are captured and reach the bot operator.</li>
-    <li>Speaks to each opponent in their BGA interface language (41 supported, English fallback).</li>
-    <li>After 3 consecutive errors on a table, sends a polite concession message and resigns.</li>
+    <li>Default strength is <span class="mono">grandmaster</span> Stockfish, and can be set to <span class="mono">beginner</span>, <span class="mono">easy</span>, <span class="mono">intermediate</span>, <span class="mono">advanced</span>, <span class="mono">expert</span> by chatting that word.</li>
+    <li>Sends messages in user's language. Defaults to <span class="mono">"I'm not sure"</span> for messages that are not changing difficulty or sending feedback.</li>
   </ul>
 
   <h2>Stats</h2>
@@ -583,7 +610,10 @@ function landingHtml(): string {
   </div>
   <div class="cards" id="stats"></div>
   <p id="stats-scope" class="sub" style="margin: 6px 0 0; font-size: 11px; color: var(--accent);"></p>
-  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">Default difficulty is grandmaster-strength Stockfish, but players can set a lower difficulty with chat. The selected level filters every section below — stats, games, moves, pies, and past games.</p>
+  <p class="sub" style="margin: 6px 0 0; font-size: 11px;">Default difficulty is grandmaster-strength Stockfish, but players can set a lower difficulty with chat.</p>
+
+  <h2 style="margin-bottom: 6px;">Games over time</h2>
+  <div id="games-over-time" class="muted">…</div>
 
   <div id="filter-chip" style="margin-top: 12px;"></div>
 
@@ -630,6 +660,10 @@ function landingHtml(): string {
       <a href="javascript:submitFeedback()" id="feedback-submit" class="pill btn on">Send</a>
       <span id="feedback-status" class="muted" style="font-size: 11px;"></span>
     </div>
+    <details id="feedback-past" style="margin-top: 12px;">
+      <summary style="cursor: pointer; color: var(--accent); font-size: 12px;">Past feedback<span id="feedback-past-count" style="margin-left: 6px;" class="muted"></span></summary>
+      <div id="feedback-list" class="muted" style="margin-top: 10px; font-size: 13px;">…</div>
+    </details>
   </div>
 
   <h2>Technical details</h2>
@@ -889,6 +923,7 @@ function render(s) {
   renderStats(s);
 
   document.getElementById("invites").innerHTML = renderInvites(s);
+  document.getElementById("games-over-time").innerHTML = renderGamesOverTime(s);
   // Only repaint the games section if the new snapshot would render
   // something. If a tick momentarily yields no live games (BGA flake,
   // reconcile miss) we leave the prior gallery in place rather than
@@ -952,6 +987,7 @@ let selectedOutcome = "all";
 // can't drift out of sync.
 function repaintFiltered(s) {
   renderStats(s);
+  document.getElementById("games-over-time").innerHTML = renderGamesOverTime(s);
   document.getElementById("games").innerHTML = renderGames(s);
   document.getElementById("moves").innerHTML = renderMoves(s.recentMoves);
   document.getElementById("results").innerHTML = renderResults(s.recentResults);
@@ -1174,6 +1210,230 @@ function renderInvites(s) {
     return '<tr><td>' + mode + '</td>' + inviteStateCells(v, seen, s) + '</tr>';
   }).join("");
   return '<table><thead><tr><th>Mode</th><th>Table</th><th>Created</th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+// The bot's public launch date. The games-over-time chart's x-axis starts here
+// and a straight (dashed) line extrapolates from zero up to the first logged
+// game, covering the early stretch that predates the durable per-game log.
+const PROJECT_START_MS = Date.UTC(2026, 4, 8); // 2026-05-08
+
+// Lifetime count of scored games for the active scope, used to anchor the
+// cumulative chart's peak to the same number the Stats cards show. BGA keeps
+// lifetime tallies only by difficulty / outcome — there's no aggregate for
+// language / membership / engine — so a pie filter (or the "live" card) returns
+// null and the chart falls back to the in-window count.
+function lifetimeScoredTotal(s) {
+  if (hasAnyFilter() || selectedOutcome === "live") return null;
+  const st = s.stats || {};
+  const bd = selectedDiff === "all" ? st : (st.byDifficulty || {})[selectedDiff] || {};
+  const wins = bd.wins || 0, losses = bd.losses || 0, draws = bd.draws || 0;
+  if (selectedOutcome === "win") return wins;
+  if (selectedOutcome === "loss") return losses;
+  if (selectedOutcome === "draw") return draws;
+  return wins + losses + draws;
+}
+
+// Per-game increment events feeding the cumulative chart for the active scope:
+// { ts } for each scored game, ascending, so the line steps at each game's
+// actual time. Prefer the durable per-game series (s.gamesTimeline, served from
+// the DO's SQLite games table) so the curve spans the retained history. Fall
+// back to the recentResults window when a pie filter is active (the timeline
+// carries no language / membership / engine breakdown) or it's absent.
+function gamesChartEvents(s) {
+  if (!hasAnyFilter() && Array.isArray(s.gamesTimeline) && s.gamesTimeline.length) {
+    if (selectedOutcome !== "live") {
+      const pts = [];
+      for (const g of s.gamesTimeline) {
+        if (selectedDiff !== "all" && (g.difficulty || "grandmaster") !== selectedDiff) continue;
+        if (selectedOutcome === "win" && g.tally !== "win") continue;
+        if (selectedOutcome === "loss" && g.tally !== "loss") continue;
+        if (selectedOutcome === "draw" && g.tally !== "draw") continue;
+        pts.push({ ts: g.ts });
+      }
+      if (pts.length) return pts; // already ascending from the server
+    }
+  }
+  // Window fallback: one game per scored result in the recent window.
+  let all = (s.recentResults || []).filter(isScored);
+  if (selectedDiff !== "all") all = all.filter(resultMatchesDiff);
+  if (selectedOutcome !== "all") all = all.filter(resultMatchesOutcome);
+  if (hasAnyFilter()) {
+    const lookup = buildTableLookup(s);
+    all = all.filter(r => resultMatchesFilter(r, lookup));
+  }
+  return all.filter(r => r.ts != null).sort((a, b) => a.ts - b.ts)
+    .map(r => ({ ts: r.ts }));
+}
+
+// Cumulative finished games (clean win/loss/draw) plotted against time, as a
+// solid line that rises one step per game at the game's actual timestamp and
+// holds flat out to now. Honors the same global filters as Past Games
+// (difficulty tab, outcome cards, pie-slice chips) so the curve matches the
+// selected scope.
+//
+// The peak is anchored to the lifetime total (lifetimeScoredTotal); the logged
+// run counts down from it and the stretch before the log is a straight line
+// back to the launch date, so the curve's top matches the Total-games card.
+function renderGamesOverTime(s) {
+  const events = gamesChartEvents(s);
+  const recorded = events.length;
+  if (recorded === 0) return "<span class='muted'>no finished games yet</span>";
+
+  // Anchor the peak to the lifetime total when known; otherwise the recorded
+  // run is all we can show. base = games before the logged run began.
+  const lifetime = lifetimeScoredTotal(s);
+  const total = (lifetime != null && lifetime >= recorded) ? lifetime : recorded;
+  const base = total - recorded;
+
+  const dataStart = events[0].ts;                              // first logged game
+  const t1 = Math.max(events[events.length - 1].ts, Date.now()); // out to "now"
+
+  // When we have a lifetime anchor whose floor predates the log AND launch came
+  // before the first logged game, start the curve at 0 on launch day and draw a
+  // straight line up to the floor at dataStart (the stretch we have no per-game
+  // records for). Otherwise the floor is all we can honestly show, so the line
+  // just starts there.
+  const extrapolated = lifetime != null && base > 0 && PROJECT_START_MS < dataStart;
+  const tStart = extrapolated ? PROJECT_START_MS : dataStart;
+  const yFloor = extrapolated ? 0 : base;        // cumulative at tStart
+  const span = Math.max(1, t1 - tStart);
+
+  // viewBox geometry; the SVG scales to its container width via CSS.
+  const W = 680, H = 220, padL = 40, padR = 16, padT = 14, padB = 28;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const baseY = padT + plotH;
+  const xOf = ts => padL + ((ts - tStart) / span) * plotW;
+  // y spans [yFloor .. total] over the plot height.
+  const yOf = n => baseY - ((n - yFloor) / (total - yFloor)) * plotH;
+  const f = x => x.toFixed(1);
+
+  // Logged run: a diagonal polyline connecting the cumulative total after each
+  // game at its actual timestamp (one +1 per game), then flat out to "now". Not
+  // a stair-step, so a busy day reads as a smooth rise rather than a block.
+  // steps[] records the cumulative AFTER each game for the hover handler.
+  const steps = [];
+  let cum = base;
+  let segs = "";
+  events.forEach(e => {
+    cum += 1;
+    segs += " L " + f(xOf(e.ts)) + " " + f(yOf(cum));
+    steps.push({ ts: e.ts, cum });
+  });
+  segs += " L " + f(xOf(t1)) + " " + f(yOf(total));
+  // One continuous solid line: launch → (straight extrapolation up to the floor
+  // at the first logged game) → the logged polyline. The extrapolated segment is
+  // the same width/style as the rest; the hover marks it "(est.)".
+  const dLine = "M " + f(xOf(tStart)) + " " + f(yOf(yFloor))
+    + " L " + f(xOf(dataStart)) + " " + f(yOf(base)) + segs;
+  // Area under the whole curve: baseline at launch → up the left edge (diagonal
+  // when extrapolating, vertical otherwise) → the logged top edge → down to now.
+  const area = "M " + f(xOf(tStart)) + " " + f(baseY)
+    + " L " + f(xOf(dataStart)) + " " + f(yOf(base)) + segs
+    + " L " + f(xOf(t1)) + " " + f(baseY) + " Z";
+
+  // X ticks: 10 evenly spaced across [launch .. now]. First is the launch date,
+  // last is "now"; the rest are labeled with their M/D date. Formatted in UTC to
+  // match the day-bucket boundaries (ts / 86_400_000) and the launch constant,
+  // so the first tick reads the launch date rather than slipping a day.
+  const md = ts => { const dt = new Date(ts); return (dt.getUTCMonth() + 1) + "/" + dt.getUTCDate(); };
+  const tk = (x, label, anchor) =>
+    '<line class="got-grid" x1="' + f(x) + '" y1="' + baseY + '" x2="' + f(x) + '" y2="' + (baseY + 4) + '"/>'
+    + '<text class="got-axis" x="' + f(x) + '" y="' + (H - 8) + '" text-anchor="' + anchor + '">' + esc(label) + '</text>';
+  const TICKS = 10;
+  let ticks = "";
+  for (let i = 0; i < TICKS; i++) {
+    const frac = i / (TICKS - 1);
+    const x = padL + frac * plotW;
+    const last = i === TICKS - 1;
+    const label = last ? "now" : md(tStart + frac * span);
+    ticks += tk(x, label, i === 0 ? "start" : last ? "end" : "middle");
+  }
+
+  // Stash geometry + the cumulative steps so the hover handler can snap a cursor
+  // x to a day and read that day's end-of-day cumulative total.
+  window.__gotChart = {
+    W, H, padL, padR, plotW, plotH, baseY, tStart, dataStart, t1, span,
+    base, total, recorded, yFloor, extrapolated, steps,
+  };
+
+  const endX = xOf(t1), endY = yOf(total);
+  return '<div class="got-wrap">'
+    + '<svg class="got-svg" viewBox="0 0 ' + W + ' ' + H + '" role="img"'
+    + ' aria-label="cumulative games over time"'
+    + ' onmousemove="gotMove(event)" onmouseleave="gotLeave(event)">'
+    + '<title>' + total + ' finished games, ending ' + esc(md(t1)) + '</title>'
+    + '<line class="got-grid" x1="' + padL + '" y1="' + baseY + '" x2="' + (W - padR) + '" y2="' + baseY + '"/>'
+    + '<line class="got-grid" x1="' + padL + '" y1="' + padT + '" x2="' + (W - padR) + '" y2="' + padT + '"/>'
+    + ticks
+    + '<path class="got-area" d="' + area + '"/>'
+    + '<path class="got-line" d="' + dLine + '"/>'
+    + '<line class="got-cursor" x1="' + padL + '" y1="' + padT + '" x2="' + padL + '" y2="' + baseY + '"/>'
+    + '<circle class="got-dot" cx="' + f(endX) + '" cy="' + f(endY) + '" r="3"><title>'
+    + total + ' games</title></circle>'
+    + '<circle class="got-cursor-dot" cx="' + padL + '" cy="' + baseY + '" r="3.5"/>'
+    + '<text class="got-axis" x="' + (padL - 5) + '" y="' + (padT + 4) + '" text-anchor="end">' + total + '</text>'
+    + '<text class="got-axis" x="' + (padL - 5) + '" y="' + (baseY + 3) + '" text-anchor="end">' + yFloor + '</text>'
+    + '</svg>'
+    + '<div class="got-tip"></div>'
+    + '</div>';
+}
+
+// Hover readout for the games-over-time chart. Snaps the cursor to the hovered
+// UTC day and reads that day's END-OF-DAY cumulative total — e.g. anywhere over
+// May 31 shows "May 31 · <total through the end of May 31>". The guideline, dot,
+// and tooltip park at that day boundary. State lives in window.__gotChart,
+// refreshed on every render, so it survives the periodic innerHTML repaints.
+function gotMove(ev) {
+  const c = window.__gotChart;
+  const svg = ev.currentTarget;
+  if (!c || !svg) return;
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width) return;
+  const DAY = 86400000;
+  let curX = (ev.clientX - rect.left) / rect.width * c.W;
+  curX = Math.max(c.padL, Math.min(c.W - c.padR, curX));
+  const hoveredTs = c.tStart + ((curX - c.padL) / c.plotW) * c.span;
+  const dayStart = Math.floor(hoveredTs / DAY) * DAY;
+  // Snap to end of the hovered day (next midnight), but never past "now".
+  const snapTs = Math.min(dayStart + DAY, c.t1);
+  // Cumulative through end of day. Before the log began it's the straight-line
+  // estimate; otherwise it's the count of logged games up to that boundary.
+  let cum, est = false;
+  if (c.extrapolated && snapTs < c.dataStart) {
+    const frac = (snapTs - c.tStart) / Math.max(1, c.dataStart - c.tStart);
+    cum = Math.round(c.base * Math.max(0, Math.min(1, frac)));
+    est = true;
+  } else {
+    cum = c.base;
+    for (const st of c.steps) { if (st.ts <= snapTs) cum = st.cum; else break; }
+  }
+  const vbX = c.padL + ((snapTs - c.tStart) / c.span) * c.plotW;
+  const y = c.baseY - ((cum - c.yFloor) / (c.total - c.yFloor)) * c.plotH;
+  const line = svg.querySelector(".got-cursor");
+  const dot = svg.querySelector(".got-cursor-dot");
+  if (line) { line.setAttribute("x1", vbX); line.setAttribute("x2", vbX); line.style.opacity = "1"; }
+  if (dot) { dot.setAttribute("cx", vbX); dot.setAttribute("cy", y); dot.style.opacity = "1"; }
+  const tip = svg.parentNode.querySelector(".got-tip");
+  if (tip) {
+    const dt = new Date(dayStart).toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "short", day: "numeric" });
+    tip.innerHTML = esc(dt) + ' · <b>' + cum + "</b> games" + (est ? " <span class='got-est'>(est.)</span>" : "");
+    tip.style.display = "block";
+    const pxX = (vbX / c.W) * rect.width;
+    const pxY = (y / c.H) * rect.height;
+    tip.style.left = Math.max(4, Math.min(rect.width - 4, pxX)) + "px";
+    tip.style.top = Math.max(0, pxY - 34) + "px";
+  }
+}
+
+function gotLeave(ev) {
+  const svg = ev.currentTarget;
+  if (!svg) return;
+  const line = svg.querySelector(".got-cursor");
+  const dot = svg.querySelector(".got-cursor-dot");
+  if (line) line.style.opacity = "0";
+  if (dot) dot.style.opacity = "0";
+  const tip = svg.parentNode.querySelector(".got-tip");
+  if (tip) tip.style.display = "none";
 }
 
 function liveGameIds(s) {
@@ -2408,6 +2668,33 @@ async function loadFeedbackCount() {
   } catch (e) { /* non-fatal */ }
 }
 
+async function loadFeedbackList() {
+  const el = document.getElementById("feedback-list");
+  const countEl = document.getElementById("feedback-past-count");
+  if (!el) return;
+  try {
+    const r = await fetch("/feedback/list", { cache: "no-store" });
+    if (!r.ok) return;
+    const { entries } = await r.json();
+    if (!Array.isArray(entries) || entries.length === 0) {
+      el.innerHTML = "<span class='muted'>No feedback yet.</span>";
+      if (countEl) countEl.textContent = "";
+      return;
+    }
+    if (countEl) countEl.textContent = "(" + entries.length + ")";
+    // Server already sorts newest-first; render each escaped to keep the
+    // untrusted message text as data, never markup.
+    el.innerHTML = entries.map(e => {
+      const tag = e.source === "chat" ? "in-game" : "web";
+      return "<div style='padding: 8px 0; border-top: 1px solid var(--rule);'>"
+        + "<div class='muted' style='font-size: 11px; margin-bottom: 2px;'>"
+        + fmtUtc(e.ts) + " · " + esc(tag) + "</div>"
+        + "<div style='white-space: pre-wrap; word-break: break-word;'>" + esc(e.message) + "</div>"
+        + "</div>";
+    }).join("");
+  } catch (e) { /* non-fatal */ }
+}
+
 async function submitFeedback() {
   const msgEl = document.getElementById("feedback-msg");
   const contactEl = document.getElementById("feedback-contact");
@@ -2436,6 +2723,7 @@ async function submitFeedback() {
     statusEl.textContent = "Thanks, received.";
     statusEl.className = "ok";
     loadFeedbackCount();
+    loadFeedbackList();
   } catch (e) {
     statusEl.textContent = "Send failed: " + String(e);
     statusEl.className = "err";
@@ -2447,6 +2735,7 @@ async function submitFeedback() {
 
 load();
 loadFeedbackCount();
+loadFeedbackList();
 setInterval(load, 10000);
 setInterval(tickCountups, 1000);
 </script>

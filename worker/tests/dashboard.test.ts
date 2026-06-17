@@ -431,4 +431,131 @@ describe("dashboard inline scripts", () => {
     expect(html).toContain("chess-api");
     expect(html).not.toContain("stockfish");
   });
+
+  test("games-over-time plots cumulative scored games and honors the difficulty filter", () => {
+    const sb = bootDashboard(lastScript());
+    const now = Date.now();
+    const s = {
+      recentResults: [
+        { ts: now - 30000, tableId: "1", tally: "win", moveCount: 20, difficulty: "grandmaster" },
+        { ts: now - 20000, tableId: "2", tally: "loss", moveCount: 20, difficulty: "expert" },
+        { ts: now - 10000, tableId: "3", tally: "draw", moveCount: 20, difficulty: "grandmaster" },
+        // Too short (< MIN_BOT_MOVES_FOR_SCORED) → not scored → not on the curve.
+        { ts: now - 5000, tableId: "4", tally: "win", moveCount: 2, difficulty: "grandmaster" },
+      ],
+      tables: {}, lastTablesSeen: [], recentMoves: [],
+    };
+    sb.window.__lastStatus = s;
+
+    // Unfiltered: 3 scored games → SVG with a y-max + end-dot reading 3.
+    const all: string = sb.renderGamesOverTime(s);
+    expect(all).toContain("<svg");
+    expect(all).toContain('class="got-line"');
+    expect(all).toContain(">3 games</title>");
+    expect(all).toMatch(/class="got-axis"[^>]*>3<\/text>/);
+
+    // Difficulty tab narrows the curve to the 2 grandmaster scored games.
+    sb.setDiff("grandmaster");
+    expect(sb.renderGamesOverTime(s)).toContain(">2 games</title>");
+
+    // A difficulty with no scored games shows the empty state, not an SVG.
+    sb.setDiff("beginner");
+    const none: string = sb.renderGamesOverTime(s);
+    expect(none).not.toContain("<svg");
+    expect(none).toContain("no finished games");
+  });
+
+  test("games-over-time anchors the peak to the lifetime total, not the window size", () => {
+    // recentResults is capped, so the in-window count undercounts lifetime play.
+    // The curve's peak must track the Stats lifetime total (here 1100), with the
+    // earlier in-window games counting down from it (floor = 1100 - 3 = 1097).
+    const sb = bootDashboard(lastScript());
+    const now = Date.now();
+    const s = {
+      stats: {
+        wins: 1000, losses: 60, draws: 40,
+        byDifficulty: { expert: { wins: 20, losses: 5, draws: 5 } },
+      },
+      recentResults: [
+        { ts: now - 30000, tableId: "1", tally: "win", moveCount: 20, difficulty: "grandmaster" },
+        { ts: now - 20000, tableId: "2", tally: "win", moveCount: 20, difficulty: "expert" },
+        { ts: now - 10000, tableId: "3", tally: "loss", moveCount: 20, difficulty: "expert" },
+      ],
+      tables: {}, lastTablesSeen: [], recentMoves: [],
+    };
+    sb.window.__lastStatus = s;
+
+    const html: string = sb.renderGamesOverTime(s);
+    // Peak label + end-dot read the lifetime total, not the window's 3.
+    expect(html).toContain(">1100 games</title>");
+    expect(html).toMatch(/class="got-axis"[^>]*>1100<\/text>/);
+    // The logged games (base 1097) post-date launch, so the curve extrapolates a
+    // straight line back to 0 at launch — the axis floor is 0, not 1097.
+    expect(html).toMatch(/class="got-axis"[^>]*>0<\/text>/);
+    // Hover state is stashed so the cursor handler can map x → date/total.
+    expect(sb.window.__gotChart).toMatchObject({
+      total: 1100, base: 1097, recorded: 3, extrapolated: true, yFloor: 0,
+    });
+    // The x-axis origin (launch) sits before the first logged game.
+    expect(sb.window.__gotChart.tStart).toBeLessThan(sb.window.__gotChart.dataStart);
+
+    // A per-difficulty filter re-anchors to that difficulty's lifetime tally
+    // (expert: 20+5+5 = 30), over its 2 in-window expert games (floor 28).
+    sb.setDiff("expert");
+    const expert: string = sb.renderGamesOverTime(s);
+    expect(expert).toContain(">30 games</title>");
+    expect(sb.window.__gotChart).toMatchObject({ total: 30, base: 28, recorded: 2 });
+  });
+
+  test("games-over-time prefers the durable per-game timeline over the capped window", () => {
+    // gamesTimeline (from the DO's SQLite games table) carries one row per game,
+    // so the chart steps at each game's actual timestamp and filters by
+    // difficulty / outcome over those rows.
+    const sb = bootDashboard(lastScript());
+    const day = 86_400_000;
+    const D = 20000 * day; // an arbitrary base time (well before the window)
+    const s = {
+      stats: {
+        wins: 50, losses: 0, draws: 0,
+        byDifficulty: { grandmaster: { wins: 40, losses: 0, draws: 0 }, expert: { wins: 10, losses: 0, draws: 0 } },
+      },
+      // Only a sliver survives in the window, but the timeline reaches back.
+      recentResults: [
+        { ts: D + 5 * day, tableId: "z", tally: "win", moveCount: 20, difficulty: "grandmaster", oppLanguage: "it" },
+      ],
+      // 5 logged games: 4 grandmaster wins + 1 expert win, at distinct times.
+      gamesTimeline: [
+        { ts: D + 1 * day, difficulty: "grandmaster", tally: "win" },
+        { ts: D + 2 * day, difficulty: "grandmaster", tally: "win" },
+        { ts: D + 2 * day + 3600000, difficulty: "expert", tally: "win" },
+        { ts: D + 4 * day, difficulty: "grandmaster", tally: "win" },
+        { ts: D + 5 * day, difficulty: "grandmaster", tally: "win" },
+      ],
+      tables: {}, lastTablesSeen: [], recentMoves: [],
+    };
+    sb.window.__lastStatus = s;
+
+    // Unfiltered: recorded = 5 games; anchored to the lifetime total of 50
+    // (floor 45). One step per game proves it reads the per-game timeline, not
+    // the single-game window.
+    sb.renderGamesOverTime(s);
+    expect(sb.window.__gotChart).toMatchObject({ total: 50, recorded: 5, base: 45 });
+    // These mock times predate the launch constant, so no extrapolation: the
+    // solid series starts at the first logged game.
+    expect(sb.window.__gotChart.dataStart).toBe(D + 1 * day);
+    expect(sb.window.__gotChart.steps.length).toBe(5); // one step per game
+
+    // Difficulty filter keeps only that difficulty's games: 4 grandmaster wins,
+    // anchored to byDifficulty.grandmaster = 40.
+    sb.setDiff("grandmaster");
+    sb.renderGamesOverTime(s);
+    expect(sb.window.__gotChart).toMatchObject({ total: 40, recorded: 4 });
+
+    // A pie filter has no timeline breakdown, so the chart falls back to the
+    // single-game recentResults window (recorded = 1).
+    sb.setDiff("all");
+    sb.setFilter("language", "it");
+    sb.renderGamesOverTime(s);
+    expect(sb.window.__gotChart.recorded).toBe(1);
+  });
 });
