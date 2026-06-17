@@ -8,8 +8,11 @@ import {
   GAMEMODES,
   isBenignCreateTableError,
   shouldFinalizeSeatlessTerminal,
+  shouldClearStuckConcede,
   needsFinishScoreRefetch,
   inviteSetupAgeMs,
+  shouldReapSetupInvite,
+  SETUP_TIMEOUT_MS,
 } from "../src/bot-status";
 
 /**
@@ -178,6 +181,52 @@ describe("shouldFinalizeSeatlessTerminal", () => {
 });
 
 /**
+ * Regression: a realtime opponent-inactivity concede fired (memo conceded), but
+ * BGA accepted the resign and no-opped server-side, leaving the table at
+ * status=play. handleTable early-returned on `m.conceded`, so the concede was
+ * never retried; the wedged row held the single realtime slot and
+ * maybeCreateOpenInvite suppressed every new realtime invite indefinitely
+ * (production: table 869186458, realtime dark ~3h). shouldClearStuckConcede is
+ * the gate for the self-healing retry.
+ */
+describe("shouldClearStuckConcede", () => {
+  const RETRY_MS = 5 * 60 * 1000;
+  const NOW = 10_000_000;
+  const base = { conceded: true, status: "play", lastAttemptAt: null, now: NOW, retryMs: RETRY_MS };
+
+  test("fires the first time for a conceded table still wedged at play", () => {
+    expect(shouldClearStuckConcede(base)).toBe(true);
+  });
+
+  test("also heals a wedged async concede (asyncplay)", () => {
+    expect(shouldClearStuckConcede({ ...base, status: "asyncplay" })).toBe(true);
+  });
+
+  test("never fires for a table we did not concede", () => {
+    expect(shouldClearStuckConcede({ ...base, conceded: false })).toBe(false);
+    expect(shouldClearStuckConcede({ ...base, conceded: undefined })).toBe(false);
+  });
+
+  test("does nothing once BGA actually flipped the row off play", () => {
+    // finished/archive = the resign took; GC drops the memo, no clear needed.
+    expect(shouldClearStuckConcede({ ...base, status: "finished" })).toBe(false);
+    expect(shouldClearStuckConcede({ ...base, status: "archive" })).toBe(false);
+    expect(shouldClearStuckConcede({ ...base, status: "open" })).toBe(false);
+  });
+
+  test("paces retries by the cooldown, then fires again", () => {
+    const last = NOW - 1_000; // 1s ago — well inside the cooldown
+    expect(shouldClearStuckConcede({ ...base, lastAttemptAt: last })).toBe(false);
+    expect(
+      shouldClearStuckConcede({ ...base, lastAttemptAt: NOW - RETRY_MS + 1 }),
+    ).toBe(false);
+    expect(
+      shouldClearStuckConcede({ ...base, lastAttemptAt: NOW - RETRY_MS }),
+    ).toBe(true);
+  });
+});
+
+/**
  * Regression: the live finish handler used to only re-fetch getTableInfo for
  * the friendly-draw 0/0 quirk (`score===0 && oppScore==null`). When BGA shipped
  * a seated-but-scoreless finished row (`meSeat.score` null), the guard never
@@ -246,5 +295,52 @@ describe("inviteSetupAgeMs", () => {
 
   test("both null → age 0 (no anchor yet, don't reap)", () => {
     expect(inviteSetupAgeMs(now, null, undefined)).toBe(0);
+  });
+});
+
+/**
+ * The setup-timeout reaper frees the single realtime slot when an opp-seated
+ * invite wedges in setup/init (human joined then ghosted before accepting the
+ * game start). Shortened 15m → 5m so the slot reopens ~3x faster; these lock in
+ * the new threshold and the strict-`>` boundary so a future edit can't silently
+ * lengthen or invert it.
+ */
+describe("shouldReapSetupInvite", () => {
+  const min = 60_000;
+
+  test("SETUP_TIMEOUT_MS is 5 minutes (down from the old 15m)", () => {
+    expect(SETUP_TIMEOUT_MS).toBe(5 * min);
+  });
+
+  test("keeps a fresh setup table (well under the limit)", () => {
+    expect(shouldReapSetupInvite(0)).toBe(false);
+    expect(shouldReapSetupInvite(30_000)).toBe(false);
+    expect(shouldReapSetupInvite(4 * min)).toBe(false);
+  });
+
+  test("reaps once aged past the 5m limit", () => {
+    expect(shouldReapSetupInvite(6 * min)).toBe(true);
+    expect(shouldReapSetupInvite(15 * min)).toBe(true);
+  });
+
+  test("exactly at the limit waits one more tick (strict >)", () => {
+    expect(shouldReapSetupInvite(SETUP_TIMEOUT_MS)).toBe(false);
+    expect(shouldReapSetupInvite(SETUP_TIMEOUT_MS + 1)).toBe(true);
+  });
+
+  test("the old 15m grace would NOT have reaped a 6m wedge; 5m does", () => {
+    const sixMin = 6 * min;
+    expect(shouldReapSetupInvite(sixMin, 15 * min)).toBe(false);
+    expect(shouldReapSetupInvite(sixMin)).toBe(true);
+  });
+
+  test("composes with inviteSetupAgeMs on the real anchor inputs", () => {
+    const t = 1_000_000_000;
+    // Slot clock reset to now, but the memo shows the table is 7m old.
+    const age = inviteSetupAgeMs(t, t, t - 7 * min);
+    expect(shouldReapSetupInvite(age)).toBe(true);
+    // Same table at 3m old is still within grace.
+    const young = inviteSetupAgeMs(t, t, t - 3 * min);
+    expect(shouldReapSetupInvite(young)).toBe(false);
   });
 });

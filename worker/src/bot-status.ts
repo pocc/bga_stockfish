@@ -58,6 +58,33 @@ export function shouldFinalizeSeatlessTerminal(opts: {
 }
 
 /**
+ * Should we re-issue a forceful clear-seat (concedeMenu + leaveTable) for a
+ * table we already CONCEDED but BGA still reports at a live play status?
+ *
+ * concedeTable() resigns and marks the memo conceded, yet BGA sometimes
+ * accepts the resign and no-ops server-side, leaving the row at `play` /
+ * `asyncplay` (observed: realtime tables stuck for hours after a single
+ * concede). A wedged realtime table holds the single realtime slot, so no new
+ * realtime invite can ever open. The fix is to keep re-issuing the forceful
+ * leave, paced by a cooldown, until BGA flips the row off play.
+ *
+ * Returns true only when the memo is conceded, BGA still reports a live play
+ * status, and the retry cooldown has elapsed (or no attempt has run yet). Pure
+ * so it's unit-testable; the orchestration lives in retryStuckConcede.
+ */
+export function shouldClearStuckConcede(opts: {
+  conceded: boolean | undefined;
+  status: string;
+  lastAttemptAt: number | null | undefined;
+  now: number;
+  retryMs: number;
+}): boolean {
+  if (!opts.conceded) return false;
+  if (!isLivePlayStatus(opts.status)) return false;
+  return opts.lastAttemptAt == null || opts.now - opts.lastAttemptAt >= opts.retryMs;
+}
+
+/**
  * Should the finish handler re-fetch authoritative per-table info (one
  * getTableInfo) before tallying, because the polled snapshot is missing a
  * score we need to classify the result correctly?
@@ -117,8 +144,8 @@ export function inviteSlotModeOf(status: string): Gamemode | null {
 /**
  * True age of a bot-owned invite table for the setup-timeout reaper.
  *
- * The reaper compares this against OPEN_INVITE_SETUP_TIMEOUT_MS (15m) to leave
- * a wedged setup/init table that's holding the realtime slot. It used to read
+ * The reaper compares this against SETUP_TIMEOUT_MS (see shouldReapSetupInvite)
+ * to leave a wedged setup/init table that's holding the realtime slot. It used to read
  * the age straight off `slot.createdAt` — but the invite-adoption pass resets
  * `slot.createdAt = now` every time an empty slot re-adopts a table, and a
  * table that briefly drops out of `myTables` (a routine BGA flake) nulls the
@@ -139,6 +166,35 @@ export function inviteSetupAgeMs(
 ): number {
   const anchor = Math.min(slotCreatedAt ?? now, memoStartedAt ?? now);
   return now - anchor;
+}
+
+/**
+ * Grace before reaping a bot-owned realtime invite that BGA still reports in
+ * setup/init — a human seated but the launch handshake never reached `play`.
+ *
+ * Was 15m. A present human accepts the game-start within seconds (the launch
+ * handshake polls every tick and reaches `play` in ~5-15s), so anything past a
+ * few minutes is a ghost: the player joined, then closed the tab without
+ * accepting. BGA's own accept window is ~1 min, so reaping at 5m never kills a
+ * game BGA still considers launchable. Because BGA caps the bot at one realtime
+ * table at a time, every wedged setup blocks all new realtime invites for this
+ * long, so cutting 15m → 5m frees the slot ~3x faster (the dominant recurring
+ * setupTimeout:realtime operational stall).
+ */
+export const SETUP_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * True once a wedged opp-seated realtime setup table has aged past `limit` and
+ * should be reaped to free the realtime slot. `ageMs` is the table's true age
+ * from inviteSetupAgeMs. Strict `>` so a table exactly at the limit waits one
+ * more tick (symmetry with the old inline `age <= limit ? keep` check). Pure so
+ * the reaping threshold is unit-testable without driving a full tick.
+ */
+export function shouldReapSetupInvite(
+  ageMs: number,
+  limit: number = SETUP_TIMEOUT_MS,
+): boolean {
+  return ageMs > limit;
 }
 
 export interface ReconcileMissDecision {

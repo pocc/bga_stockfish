@@ -36,7 +36,9 @@ import {
   isJoinableStatus, isLivePlayStatus, isFinishedStatus,
   gamemodeOf, inviteSlotModeOf, GAMEMODES, decideReconcileMiss,
   isBenignCreateTableError, shouldFinalizeSeatlessTerminal,
-  needsFinishScoreRefetch, inviteSetupAgeMs,
+  shouldClearStuckConcede,
+  needsFinishScoreRefetch, inviteSetupAgeMs, shouldReapSetupInvite,
+  SETUP_TIMEOUT_MS,
   type Gamemode,
 } from "./bot-status";
 import { enginePrecedenceRank, isCacheableEngine } from "./stockfish-do";
@@ -116,6 +118,14 @@ const OPP_QUIT_CONFIRM_MS = 60 * 1000;
  *  retries are paced (no per-tick log spam) but the realtime slot reopens
  *  within minutes, not hours. */
 const ZOMBIE_CLEAR_RETRY_MS = 5 * 60 * 1000;
+/** Same BGA no-op quirk as ZOMBIE_CLEAR_RETRY_MS, but for the CONCEDE side.
+ *  concedeTable() resigns and marks the memo conceded, yet BGA sometimes
+ *  accepts the resign and leaves the table at status=play server-side (e.g. an
+ *  opponent-inactivity concede where the ghosted opponent is still "seated").
+ *  A wedged realtime table holds the one realtime slot, so maybeCreateOpenInvite
+ *  never opens a new realtime invite. We re-issue concedeMenu + leaveTable on
+ *  this cooldown until BGA flips the row and the per-tick memo GC drops us. */
+const STUCK_CONCEDE_RETRY_MS = 5 * 60 * 1000;
 /** Force-clear awaitingOppMove after this long. Guards against the case
  *  where the opponent replies in between two of our 5s ticks: we never
  *  observe activePlayer=opp, so the original "clear when ourTurn flips"
@@ -143,12 +153,12 @@ const OPEN_INVITE_RETRY_MS = 60_000;
  *  open invite gone. Without this grace, a tick that races ahead of
  *  tableinfos clears openInviteId and a duplicate table gets created. */
 const OPEN_INVITE_GRACE_MS = 45_000;
-/** A realtime table briefly reports `setup` after createTable while BGA
- *  promotes it to `open`. Normally that takes 2-3 ticks. If it's still
- *  in init/setup this long, the opponent never clicked through (or BGA
- *  wedged the table). Leave it and let the next tick recreate so the
- *  slot doesn't sit dead. */
-const OPEN_INVITE_SETUP_TIMEOUT_MS = 15 * 60 * 1000;
+// A realtime table briefly reports `setup` after createTable while BGA
+// promotes it to `open`. If it's still in init/setup past SETUP_TIMEOUT_MS,
+// the opponent never clicked through (or BGA wedged the table); the reaper
+// (shouldReapSetupInvite) leaves it so the slot doesn't sit dead. Both live in
+// bot-status.ts alongside inviteSetupAgeMs so the threshold and its pure
+// decision/age helpers are unit-tested together.
 /** Concede a game after this many consecutive errors on a single table. */
 const MAX_TABLE_ERRORS = 3;
 /** Consecutive reconcile-by-id misses before we mark a stale active-game
@@ -192,6 +202,11 @@ const RECENT_MOVES_CAP = 500;
  *  tally so we can audit which raw score BGA reported per game without
  *  spelunking the GC'd memo. Used to diagnose "draws stayed 0" bugs. */
 const RECENT_RESULTS_CAP = 500;
+/** Cap on the per-game games-over-time series shipped in /status. The chart
+ *  needs at most a few thousand recent points for a smooth line; anything older
+ *  is folded into its launch-anchored straight-line extrapolation, so this
+ *  bounds the payload without losing the curve. */
+const GAMES_TIMELINE_CAP = 3000;
 /** Minimum bot move count for a BGA-scored game to count toward W/L/D and
  *  appear in Past Games. The bot only tracks its own moves, so combined
  *  plies ≈ 2 × moveCount; this threshold approximates "≥ 8 combined plies".
@@ -336,6 +351,14 @@ interface TableMemo {
    *  surface "the slot is stuck" without re-parsing recentErrors, and to
    *  bound retry logging. */
   zombieClearAttempts?: number;
+  /** Wall-clock ms of the last force-clear (concedeMenu + leaveTable) on a
+   *  table we already CONCEDED but BGA still reports at a live play status —
+   *  the concede-side twin of zombieClearAt. Cooldown so the retry doesn't
+   *  spam BGA every 5s tick. null/unset = retry immediately. See
+   *  STUCK_CONCEDE_RETRY_MS / retryStuckConcede. */
+  stuckConcedeAt?: number | null;
+  /** Telemetry: number of force-clear attempts on a wedged conceded table. */
+  stuckConcedeAttempts?: number;
   /** Wall-clock ms we first created the memo for this table (i.e. first
    *  tick where we saw it). Used for "started" column in the dashboard. */
   startedAt?: number;
@@ -671,6 +694,20 @@ interface ResultEntry {
 }
 
 /**
+ * One scored game in the durable games-over-time series: its finish timestamp,
+ * difficulty, and tally. Read from the `games` SQLite table (see
+ * buildGamesTimeline) and attached to the /status response so the dashboard's
+ * cumulative chart can step at each game's actual time. Capped to the most
+ * recent GAMES_TIMELINE_CAP games — older history is summarized by the chart's
+ * launch-anchored extrapolation, so the payload stays bounded.
+ */
+interface GameTimelinePoint {
+  ts: number;
+  difficulty: string;
+  tally: "win" | "loss" | "draw";
+}
+
+/**
  * One "upgrade to BGA Premium" nudge the bot sent a free member after
  * bouncing them off a limited resource (a realtime game, or a 2nd
  * concurrent async game). Captured so we can show BGA, with data, that the
@@ -833,7 +870,10 @@ export class BotDriver extends DurableObject<Env> {
     }
     if (url.pathname === "/status") {
       await this.boot();
-      return Response.json(this.status);
+      // gamesTimeline is computed fresh from SQL on each request (not stored on
+      // this.status), so the dashboard's cumulative chart can read the full
+      // retained history without the per-game payload.
+      return Response.json({ ...this.status, gamesTimeline: this.buildGamesTimeline() });
     }
     if (url.pathname === "/premium-click") {
       // The worker's /go/premium endpoint logs a click here before 302ing
@@ -1392,6 +1432,10 @@ export class BotDriver extends DurableObject<Env> {
     results[idx] = after;
     await this.ctx.storage.put("recentResults", results);
     await this.ctx.storage.put("stats", this.status.stats);
+    // Keep the durable games series aligned: a scored re-tally upserts the row,
+    // a demotion to "none" removes it (mirrors how the counters move above).
+    if (next === "win" || next === "loss" || next === "draw") this.recordGameRow(after);
+    else this.deleteGameRow(tableId);
     console.log(`bot:fixResult t=${tableId} ${prev.tally} -> ${next}`);
     return { ok: true, before: prev, after, stats: this.status.stats };
   }
@@ -1766,6 +1810,11 @@ export class BotDriver extends DurableObject<Env> {
       (await storage.get<MoveEntry[]>("recentMoves")) ?? [];
     this.status.recentResults =
       (await storage.get<ResultEntry[]>("recentResults")) ?? [];
+    // Durable, uncapped games-over-time series (SQLite). Create the table and
+    // seed it once from the retained recentResults window so the chart has
+    // history on first deploy; every scored finish appends from here on.
+    this.ensureGamesTable();
+    await this.backfillGamesTable();
     this.status.premiumNudges =
       (await storage.get<PremiumNudge[]>("premiumNudges")) ?? [];
     this.status.premiumClicks =
@@ -2515,6 +2564,49 @@ export class BotDriver extends DurableObject<Env> {
     );
   }
 
+  /**
+   * Self-heal a wedged concede. concedeTable() resigns and marks the memo
+   * conceded, but BGA sometimes accepts the resign and no-ops server-side,
+   * leaving the table at a live play status (observed: realtime tables stuck for
+   * hours). A wedged realtime table holds the one realtime slot, so
+   * maybeCreateOpenInvite never opens a new realtime invite — the bot goes dark
+   * on realtime until the row clears. This is the concede-side twin of
+   * claimZombieWin's clear-seat retry: re-issue concedeMenu + leaveTable
+   * (quitgame → neutralized, the same calls /unstick makes), paced to
+   * STUCK_CONCEDE_RETRY_MS so a permanently-wedged table can't tight-loop BGA.
+   * Terminates on its own — once BGA flips the row off play the table leaves the
+   * live snapshot and the per-tick memo GC drops it.
+   */
+  private async retryStuckConcede(tableId: string, m: TableMemo, status: string): Promise<void> {
+    if (!this.client) return;
+    const now = Date.now();
+    if (!shouldClearStuckConcede({
+      conceded: m.conceded, status, lastAttemptAt: m.stuckConcedeAt,
+      now, retryMs: STUCK_CONCEDE_RETRY_MS,
+    })) return;
+    m.stuckConcedeAt = now;
+    m.stuckConcedeAttempts = (m.stuckConcedeAttempts ?? 0) + 1;
+    // Surface the wedge ONCE (first attempt) so the operator sees the slot was
+    // auto-recovered rather than silently sitting blocked; later retries only
+    // console.log so a permanently-stuck table can't flood recentErrors.
+    if (m.stuckConcedeAttempts === 1) {
+      this.recordError(
+        "stuckConcede",
+        `conceded table still at ${status}; BGA no-opped our resign — re-issuing concede+leave to free the slot`,
+        tableId,
+      );
+    }
+    await this.client.concedeMenu(tableId).catch((e) => {
+      this.recordError("stuckConcedeClear", e, tableId);
+    });
+    await this.client.leaveTable(tableId).catch((e) => {
+      this.recordError("stuckConcedeClear", e, tableId);
+    });
+    console.log(
+      `bot:retryStuckConcede clearSeat attempt=${m.stuckConcedeAttempts} status=${status} t=${tableId}`,
+    );
+  }
+
   private async concedeTable(
     tableId: string,
     m: TableMemo,
@@ -2886,12 +2978,12 @@ export class BotDriver extends DurableObject<Env> {
             // Anchor the age on the memo's stable startedAt as well as the
             // slot timestamp: slot.createdAt is reset to `now` whenever an
             // empty slot re-adopts this table, so a table that flickers out of
-            // myTables and back kept restarting the 15-min clock and sat
-            // 28-59m before reaping. inviteSetupAgeMs takes the earlier anchor.
+            // myTables and back kept restarting the clock and sat far past the
+            // limit before reaping. inviteSetupAgeMs takes the earlier anchor.
             const age = inviteSetupAgeMs(
               now, slot.createdAt, this.status.tables[slot.id]?.startedAt,
             );
-            if (age <= OPEN_INVITE_SETUP_TIMEOUT_MS) continue;
+            if (!shouldReapSetupInvite(age, SETUP_TIMEOUT_MS)) continue;
             this.recordError(
               `setupTimeout:${mode}`,
               `table stuck in ${t.status} for ${Math.round(age / 60_000)}m${oppSeated ? " (opp seated)" : ""}`,
@@ -3031,7 +3123,17 @@ export class BotDriver extends DurableObject<Env> {
   private async handleTable(t: RawTableInfo): Promise<void> {
     if (!this.client || !this.uid) return;
     const m = this.getMemo(t.id);
-    if (m.conceded) return;
+    if (m.conceded) {
+      // A conceded table is normally a no-op. But if BGA STILL reports it at a
+      // live play status, our resign no-opped server-side (the same quirk
+      // claimZombieWin handles for wins): the table is wedged and, for realtime,
+      // holds the single realtime slot so no new realtime invite can open.
+      // retryStuckConcede re-issues the forceful concede+leave (and is itself a
+      // no-op unless the status is still live-play), then we stop here either
+      // way — we never re-greet/move/tally a conceded game.
+      await this.retryStuckConcede(t.id, m, t.status);
+      return;
+    }
     // A premium-blocked table was already nudged; never greet/move/tally it.
     // The void is deferred so the member can read the nudge, so keep driving
     // the kick each tick — it fires once the read-grace window passes, then
@@ -3404,6 +3506,106 @@ export class BotDriver extends DurableObject<Env> {
    * draw sometimes comes back as 0 for *both* players instead of 0.5/0.5
    * (observed on table 854888520), so a mutual 0 is scored a draw, not a loss.
    */
+  // --- durable games-over-time series (SQLite-backed DO) ---
+  //
+  // recentResults is a capped (RECENT_RESULTS_CAP) rolling window — fine for the
+  // detail tables, but it means the cumulative chart could only ever reach back
+  // ~500 games before older entries rolled off. BotDriver is a SQLite-backed DO
+  // (see wrangler new_sqlite_classes), so we keep an uncapped `games` table with
+  // one row per scored finished game and serve a compact per-day aggregate. The
+  // chart reads that instead, so its left edge stays put as history grows.
+  // SQL failures are swallowed everywhere here: chart bookkeeping must never
+  // break the scoring path.
+
+  /** Create the games table if it doesn't exist. Idempotent; called on boot. */
+  private ensureGamesTable(): void {
+    try {
+      this.ctx.storage.sql.exec(
+        `CREATE TABLE IF NOT EXISTS games (
+           tableId TEXT PRIMARY KEY,
+           ts INTEGER NOT NULL,
+           tally TEXT NOT NULL,
+           difficulty TEXT NOT NULL,
+           realtime INTEGER
+         )`,
+      );
+      this.ctx.storage.sql.exec(
+        `CREATE INDEX IF NOT EXISTS games_ts ON games (ts)`,
+      );
+    } catch (e) {
+      console.log(`bot:ensureGamesTable failed: ${String(e)}`);
+    }
+  }
+
+  /** Upsert one scored game (win/loss/draw). No-op for non-scored tallies.
+   *  Keyed by tableId so re-recording the same game (backfill, retally) is
+   *  idempotent. Callers gate on the MIN_BOT_MOVES_FOR_SCORED bar. */
+  private recordGameRow(entry: ResultEntry): void {
+    if (entry.tally !== "win" && entry.tally !== "loss" && entry.tally !== "draw") return;
+    try {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO games (tableId, ts, tally, difficulty, realtime)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(tableId) DO UPDATE SET
+           ts = excluded.ts, tally = excluded.tally,
+           difficulty = excluded.difficulty, realtime = excluded.realtime`,
+        entry.tableId,
+        entry.ts,
+        entry.tally,
+        entry.difficulty || "grandmaster",
+        entry.realtime === true ? 1 : entry.realtime === false ? 0 : null,
+      );
+    } catch (e) {
+      console.log(`bot:recordGameRow failed t=${entry.tableId}: ${String(e)}`);
+    }
+  }
+
+  /** Drop a game row (used when a retally demotes a game to non-scored). */
+  private deleteGameRow(tableId: string): void {
+    try {
+      this.ctx.storage.sql.exec(`DELETE FROM games WHERE tableId = ?`, tableId);
+    } catch (e) {
+      console.log(`bot:deleteGameRow failed t=${tableId}: ${String(e)}`);
+    }
+  }
+
+  /** One-time seed of the games table from the retained recentResults window so
+   *  the chart has history immediately on first deploy. Idempotent via the
+   *  tableId primary key; guarded by a stored flag so it only scans once.
+   *  Games that already rolled off recentResults are unrecoverable — they live
+   *  on only as the lifetime-total floor the chart anchors to. */
+  private async backfillGamesTable(): Promise<void> {
+    if (await this.ctx.storage.get<boolean>("gamesBackfilled")) return;
+    for (const r of this.status.recentResults || []) {
+      if (r.tally !== "win" && r.tally !== "loss" && r.tally !== "draw") continue;
+      if ((r.moveCount ?? 0) < MIN_BOT_MOVES_FOR_SCORED) continue;
+      this.recordGameRow(r);
+    }
+    await this.ctx.storage.put("gamesBackfilled", true);
+  }
+
+  /** The most recent GAMES_TIMELINE_CAP scored games, ascending by time, each
+   *  with its finish timestamp / difficulty / tally so the chart can step at the
+   *  game's actual moment. Empty on any SQL error. */
+  private buildGamesTimeline(): GameTimelinePoint[] {
+    try {
+      const cursor = this.ctx.storage.sql.exec<{ ts: number; difficulty: string; tally: string }>(
+        `SELECT ts, difficulty, tally FROM games ORDER BY ts DESC LIMIT ?`,
+        GAMES_TIMELINE_CAP,
+      );
+      // exec returns newest-first (so the LIMIT keeps recent games); flip to
+      // ascending for the cumulative walk.
+      return cursor.toArray().reverse().map((r) => ({
+        ts: r.ts,
+        difficulty: r.difficulty,
+        tally: r.tally as GameTimelinePoint["tally"],
+      }));
+    } catch (e) {
+      console.log(`bot:buildGamesTimeline failed: ${String(e)}`);
+      return [];
+    }
+  }
+
   private recordFinishedResult(
     t: RawTableInfo,
     m: TableMemo,
@@ -3470,6 +3672,8 @@ export class BotDriver extends DurableObject<Env> {
         0, this.status.recentResults.length - RECENT_RESULTS_CAP,
       );
     }
+    // Mirror scored games into the durable, uncapped series for the chart.
+    if (countable) this.recordGameRow(entry);
     console.log(
       `t=${t.id} finished status=${t.status} rawScore=${rawScore ?? "null"} `
       + `oppRawScore=${oppRawScore ?? "null"} parsed=${parsed ?? "null"} tally=${tally}`,
